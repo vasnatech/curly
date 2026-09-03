@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = ["crates/curly-core", "crates/curly-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/mfguven/curly"
+
+[workspace.dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "multipart"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+thiserror = "1"

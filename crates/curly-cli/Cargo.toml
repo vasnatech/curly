@@ -1,0 +1,17 @@
+[package]
+name = "curly-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "curly"
+path = "src/main.rs"
+
+[dependencies]
+curly-core = { path = "../curly-core" }
+reqwest = { workspace = true }
+tokio = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }

@@ -9,16 +9,25 @@ Both ship as native, single-binary executables for Linux, macOS, and Windows.
 
 ## Status
 
-Pre-implementation. See [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) and [docs/DESIGN.md](docs/DESIGN.md).
+M1 (core + CLI one-shot mode) is implemented. GUI and saved collections/environments are not built yet. See [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) and [docs/DESIGN.md](docs/DESIGN.md) for scope and roadmap.
 
-## Layout (planned)
+## Using the CLI
+
+See [docs/CLI.md](docs/CLI.md) for the full user guide (install/build steps, every flag explained, examples).
+
+```sh
+cargo build --release
+./target/release/curly https://httpbin.org/get
+```
+
+## Layout
 
 ```
 curly/
 ├── crates/
 │   ├── curly-core/   # shared HTTP client, data model, storage
-│   ├── curly-cli/    # CLI binary
-│   └── curly-gui/    # GUI binary
+│   ├── curly-cli/    # CLI binary ("curly")
+│   └── curly-gui/    # GUI binary (not yet started)
 ├── docs/
 └── Cargo.toml         # workspace root
 ```

@@ -10,3 +10,6 @@ reqwest = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+wiremock = "0.6"

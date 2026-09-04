@@ -6,7 +6,7 @@ members = ["crates/curly-core", "crates/curly-cli"]
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/mfguven/curly"
+repository = "https://github.com/vasnatech/curly"
 
 [workspace.dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "multipart"] }

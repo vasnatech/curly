@@ -11,7 +11,7 @@ Curly isn't published to a package registry yet. For now, build it from source.
 **Requirements:** [Rust and Cargo](https://www.rust-lang.org/tools/install) (any recent stable toolchain).
 
 ```sh
-git clone <this-repo-url> curly
+git clone git@github.com:vasnatech/curly.git
 cd curly
 cargo build --release
 ```

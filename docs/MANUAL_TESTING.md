@@ -1,8 +1,14 @@
 # Curly CLI — Manual Testing Scenarios
 
-Hand-run scenarios for exercising `curly` the way an end user would, on top of the automated unit tests (`cargo test -p curly-cli`) and integration tests (`cargo test -p curly-core`). Run these after any change that touches `crates/curly-cli/src/main.rs` or `crates/curly-core/src/exec.rs`, and before tagging a release.
+Hand-run scenarios for exercising `curly` the way an end user would, on top of the automated unit tests (`cargo test -p curly-cli`) and integration tests (`cargo test -p curly-core`). Run these after any change that touches `crates/curly-cli/src/` or `crates/curly-core/src/`, and before tagging a release.
 
 Uses [httpbin.org](https://httpbin.org) as the target — a public HTTP-echo service, no setup required. If it's unreachable, most scenarios also work against `https://postman-echo.com` with minor path adjustments, or a locally-run `python3 -m http.server`/httpbin Docker image for offline testing.
+
+Sections 10–13 (saved requests/collections/environments/history) read and write real files under your user data directory (`~/.local/share/curly` on Linux by default). Set `XDG_DATA_HOME` to a scratch directory first so these scenarios don't touch or get confused with real data:
+```sh
+export XDG_DATA_HOME=/tmp/curly-manual-test-data
+rm -rf "$XDG_DATA_HOME"   # start clean
+```
 
 Build first:
 ```sh
@@ -18,7 +24,8 @@ alias curly=./target/release/curly   # or use cargo run -- ... directly
 | 1.2 | `curly -i https://httpbin.org/get` | Status line + response headers printed above the body. |
 | 1.3 | `curly -X DELETE https://httpbin.org/delete` | Body echoes back the request as a DELETE; no error. |
 | 1.4 | `curly not-a-real-host.invalid` | Fails with a network/DNS error, exit code 1. |
-| 1.5 | `curly` (no URL) | Fails with clap's "required argument" usage message, exit code 2 (clap's own exit code for arg-parsing errors — not `--fail`-related). |
+| 1.5 | `curly` (no URL, no subcommand) | Fails with "a URL is required (or use a subcommand: ...)", exit code **1** (URL is optional at the clap level so subcommands can coexist with it — this is our own runtime check, not clap's arg-parsing error). |
+| 1.6 | `curly --bogus-flag https://example.com` | Fails with clap's own "unexpected argument" usage message, exit code **2** (clap's parse-error exit code — different from 1.5's runtime check). |
 
 ## 2. Query parameters
 
@@ -93,16 +100,67 @@ alias curly=./target/release/curly   # or use cargo run -- ... directly
 | 8.2 | `curly --fail https://httpbin.org/status/500; echo $?` | Exit code **1**. |
 | 8.3 | `curly --fail https://httpbin.org/status/200; echo $?` | Exit code **0**. |
 
-## 9. Cross-platform sanity (when releasing)
+## 9. Environments — `curly env`
 
 | # | Steps | Expected |
 |---|---|---|
-| 9.1 | `cargo build --release` on Linux, macOS, and Windows | Each produces a working binary with no OS-specific build errors. |
-| 9.2 | Run scenario 1.1 and 4.1 on each OS | Same output shape on all three (path separators in `-o`/`--data-binary`/`--cacert` examples are the main thing to sanity-check on Windows). |
+| 9.1 | `curly env list` (clean state) | "no environments yet — create one with: ..." |
+| 9.2 | `curly env set dev HOST=dev.example.com` | "set HOST in environment \"dev\""; creates the environment. |
+| 9.3 | `curly env set dev TOKEN=secret123 --secret` then `curly env show dev` | Output shows `HOST=dev.example.com` and `TOKEN=***` (masked). |
+| 9.4 | `curly env set dev HOST=other.example.com` then `curly env show dev` | `HOST` is now `other.example.com` — `set` overwrites an existing key rather than duplicating it. |
+| 9.5 | `curly env unset dev HOST` then `curly env show dev` | Only `TOKEN=***` remains. |
+| 9.6 | `curly env unset dev NOPE` | Fails with "has no variable named \"NOPE\"". |
+| 9.7 | `curly env delete dev` then `curly env show dev` | Delete succeeds; show then fails with "no environment named \"dev\"". |
+| 9.8 | `curly env set "my env" X=1` then `curly env show "My Env"` | Same result both ways — names are slugified (`my-env`) for storage, so lookup is case/spacing-insensitive. |
 
-## 10. Regression checklist for new flags
+## 10. Collections — `curly collections`
 
-When adding a new flag, add at minimum:
-- A unit test in `crates/curly-cli/src/main.rs`'s `#[cfg(test)] mod tests` covering the pure parsing/building logic.
-- One row in the relevant table above exercising it against a real server.
-- A corresponding entry in [CLI.md](CLI.md) (§3 example + §4 reference entry).
+| # | Steps | Expected |
+|---|---|---|
+| 10.1 | `curly collections list` (clean state) | "no collections yet — create one with: ..." |
+| 10.2 | `curly collections create "My API"` then `curly collections create "My API"` again | First succeeds; second fails with "already exists". |
+| 10.3 | `curly collections add-request "My API" get-user "https://httpbin.org/get" -Q "id=42"` | "saved \"get-user\" in collection \"My API\"" — also auto-creates a collection that doesn't exist yet if you skip step 10.2. |
+| 10.4 | `curly collections add-request "My API" get-user "https://httpbin.org/get"` again (same name) | Fails with "already has a request named \"get-user\"". |
+| 10.5 | `curly collections show "My API"` | Lists `GET     get-user   https://httpbin.org/get`. |
+| 10.6 | Inspect `$XDG_DATA_HOME/curly/collections/my-api.json` directly | Human-readable JSON; the `-Q "id=42"` from 10.3 appears as a `query_params` entry with `"enabled": true`. |
+| 10.7 | `curly collections remove-request "My API" get-user` then `show` | "removed ..."; show then says "has no requests yet". |
+| 10.8 | `curly collections remove-request "My API" nope` | Fails with "has no request named \"nope\"". |
+| 10.9 | `curly collections delete "My API"` then `list` | Delete succeeds; list back to "no collections yet". |
+| 10.10 | `curly collections add-request "My API" login https://httpbin.org/post -d '{"u":"a"}' -H "Content-Type: application/json"` | Saves a POST with a JSON body — same body/header flags as one-shot mode. |
+
+## 11. Running a saved request — `curly run`
+
+| # | Steps | Expected |
+|---|---|---|
+| 11.1 | `curly env set global HOST=httpbin.org` and `curly env set dev USER_ID=99`, then `curly collections add-request "My API" get-user "https://{{HOST}}/get" -Q "id={{USER_ID}}"`, then `curly run "My API/get-user" --env dev` | `args.id == "99"` in the response — confirms `global` (HOST) and `dev` (USER_ID) merge together. |
+| 11.2 | `curly run "My API/get-user" --env dev --var USER_ID=777` | `args.id == "777"` — `--var` overrides the environment's value. |
+| 11.3 | `curly run "My API/get-user"` (no `--env`) | Fails with "undefined variable(s): USER_ID" — `HOST` resolves from `global` alone, but `USER_ID` was only ever set in `dev`. |
+| 11.4 | `curly run "My API/get-user" --env dev -i -v` | `-i`/`-v` behave identically to one-shot mode (status/headers printed, trace on stderr). |
+| 11.5 | `curly run "My API/no-such-request" --env dev` | Fails with "collection \"My API\" has no request named \"no-such-request\"". |
+| 11.6 | `curly run "No Such Collection/x"` | Fails with "no collection named \"No Such Collection\"". |
+| 11.7 | `curly run "no-slash-in-target"` | Fails with "invalid run target (expected \"collection/request-name\")" — before touching storage or the network. |
+| 11.8 | After 11.1/11.2/11.4 (3 successful sends), `curly history --limit 3` | All three appear, most recent first. 11.3's failure (undefined variable, never reached execute) does *not* appear. |
+
+## 12. History — `curly history`
+
+| # | Steps | Expected |
+|---|---|---|
+| 12.1 | `curly history` (clean state) | "no history yet" |
+| 12.2 | `curly https://httpbin.org/get`, then `curly -X POST -d '{}' -H "Content-Type: application/json" https://httpbin.org/post`, then `curly history` | Both appear, most recent (POST) first, with correct method/status/URL/elapsed_ms. |
+| 12.3 | `curly history --limit 1` | Only the most recent entry. |
+| 12.4 | `curly -H "Authorization: Bearer sekrit" https://httpbin.org/get`, then inspect `$XDG_DATA_HOME/curly/history/*.jsonl` directly | The stored `request_headers` entry for `Authorization` reads `"***redacted***"`, not the real token — confirms NFR-4 redaction independent of what `curly history`'s own summary view shows (it doesn't print headers at all). |
+
+## 13. Cross-platform sanity (when releasing)
+
+| # | Steps | Expected |
+|---|---|---|
+| 13.1 | `cargo build --release` on Linux, macOS, and Windows | Each produces a working binary with no OS-specific build errors. |
+| 13.2 | Run scenario 1.1 and 4.1 on each OS | Same output shape on all three (path separators in `-o`/`--data-binary`/`--cacert` examples are the main thing to sanity-check on Windows). |
+| 13.3 | Run scenario 10.6 (inspect the collection JSON file) on each OS | Confirms the data directory resolves correctly per-OS (`~/.local/share/curly`, `~/Library/Application Support/curly`, `%APPDATA%\curly`). |
+
+## 14. Regression checklist for new flags/subcommands
+
+When adding a new flag or subcommand, add at minimum:
+- A unit test covering the pure parsing/building logic — `crates/curly-cli/src/one_shot.rs`, `args.rs`, or `commands/*.rs`'s `#[cfg(test)] mod tests` depending on where the logic lives, plus `crates/curly-core/tests/` for anything storage- or substitution-related.
+- One row in the relevant table above exercising it against a real server (or a real temp storage directory for env/collections/history).
+- A corresponding entry in [CLI.md](CLI.md) (an example in the relevant section + a reference entry).

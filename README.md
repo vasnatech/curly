@@ -9,7 +9,7 @@ Both ship as native, single-binary executables for Linux, macOS, and Windows.
 
 ## Status
 
-M1 (core + CLI one-shot mode) is implemented. GUI and saved collections/environments are not built yet. See [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) and [docs/DESIGN.md](docs/DESIGN.md) for scope and roadmap.
+M1 (core + CLI one-shot mode) and M2 (local storage — saved requests, collections, environments, `{{variable}}` substitution, history) are implemented. Postman/curl import and the GUI are not built yet. See [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) and [docs/DESIGN.md](docs/DESIGN.md) for scope and roadmap.
 
 ## Using the CLI
 

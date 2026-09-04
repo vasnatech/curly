@@ -2,7 +2,7 @@
 
 `curly` is the command-line face of the Curly project: a curl-like tool for sending HTTP requests from a terminal. This guide covers everything the CLI currently supports. If you already know curl, the flags will feel familiar on purpose.
 
-> Status: this guide documents the CLI's **one-shot mode** (send a single request, see the response). Saved requests, collections, environments, and OAuth2 are planned but not implemented yet — see [DESIGN.md](DESIGN.md) for the roadmap.
+> Status: §1–5 cover one-shot mode (send a single request, see the response). §6–7 cover saved requests, collections, environments, and history. Postman/curl import and OAuth2 are planned but not implemented yet — see [DESIGN.md](DESIGN.md) for the roadmap.
 
 ## 1. Installing / Running
 
@@ -348,18 +348,92 @@ Prints the installed `curly` version and exits.
 | Code | Meaning |
 |---|---|
 | `0` | Request completed and, if `--fail` was given, the response status was under 400. |
-| `1` | Something went wrong: a network/connection error, an invalid argument (e.g. malformed header/query/form value, conflicting body flags, bad method, `--cert` without `--key`, unwritable output path), or — if `--fail` was passed — an HTTP status of 400 or higher. |
+| `1` | Something went wrong: a network/connection error, an invalid argument (e.g. malformed header/query/form value, conflicting body flags, bad method, `--cert` without `--key`, unwritable output path), a bare `curly` with no URL and no subcommand, or — if `--fail` was passed — an HTTP status of 400 or higher. |
+| `2` | clap couldn't parse the command line at all (unknown flag, missing value for a flag that requires one). |
 
 Errors are printed to stderr with an `Error:` prefix.
 
-## 6. What's Not Here Yet
+## 6. Saved Requests, Collections, and Environments
+
+Beyond one-shot mode, `curly` can save requests into named **collections**, parameterize them with `{{variable}}` tokens, and resolve those against named **environments** — all stored as plain JSON under your user data directory (`~/.local/share/curly` on Linux, `~/Library/Application Support/curly` on macOS, `%APPDATA%\curly` on Windows), so `curly env list`/`curly collections list` etc. work identically regardless of which project directory you're in.
+
+### Environments — `curly env`
+
+An environment is a named set of key/value variables. `{{variable}}` tokens in a saved request's URL, header values, query values, or body are substituted against the active environment when you `run` it (see below).
+
+There's one special environment name: **`global`**. If it exists, its variables are always merged in underneath whichever environment you select with `--env` — so put anything shared across all your environments (e.g. an API version) in `global`, and per-environment values (host, credentials) in `dev`/`staging`/`prod`/etc.
+
+```sh
+curly env set global API_VERSION=v2
+curly env set dev HOST=dev.example.com
+curly env set dev TOKEN=dev-secret-token --secret
+curly env list                  # dev
+curly env show dev              # HOST=dev.example.com \n TOKEN=***
+curly env unset dev HOST
+curly env delete dev
+```
+
+- `curly env list` — list environment names.
+- `curly env show <name>` — print its variables; values marked `--secret` show as `***` rather than their real value.
+- `curly env set <name> KEY=VALUE [--secret]` — create the environment if it doesn't exist yet, then set (or overwrite) one variable. `--secret` masks it in `show` — it's still stored as plain JSON on disk, though, so treat the whole storage directory as sensitive if you keep real credentials in it (there's no OS-keychain integration yet, see DESIGN.md §2).
+- `curly env unset <name> KEY` — remove one variable.
+- `curly env delete <name>` — delete the environment entirely.
+
+### Collections — `curly collections`
+
+A collection is a named, ordered group of saved requests, stored as one JSON file (`curly collections show <name>` to see what's in it; the file itself lives at `<data dir>/curly/collections/<slug>.json` if you want to inspect or hand-edit it, or check it into a project's git repo).
+
+```sh
+curly collections create "My API"
+curly collections add-request "My API" get-user "https://{{HOST}}/users/{{USER_ID}}" \
+  -H "Authorization: Bearer {{TOKEN}}"
+curly collections show "My API"
+curly collections remove-request "My API" get-user
+curly collections delete "My API"
+```
+
+- `curly collections list` — list collection names.
+- `curly collections create <name>` — create an empty collection. Errors if one with that name already exists.
+- `curly collections delete <name>` — delete a collection and everything saved in it.
+- `curly collections show <name>` — list its saved requests (method, name, URL).
+- `curly collections add-request <collection> <request-name> <url> [flags...]` — save a request. Creates the collection first if it doesn't exist yet. The flags are **exactly the same body/header/auth flags as one-shot mode** (`-X`, `-H`, `-Q`, `-d`, `--data-urlencode`, `--data-binary`, `-F`, `-u`, `--bearer`) — so the easiest workflow is: get a request working with plain `curly <url> ...`, then re-run the same flags under `collections add-request <collection> <name> <url> ...` to save it. `{{variable}}` tokens are stored literally — they're not resolved until `run`. Errors if the collection already has a request with that name (remove it first).
+- `curly collections remove-request <collection> <request-name>` — delete one saved request from a collection.
+
+### Running a saved request — `curly run`
+
+```sh
+curly run "My API/get-user" --env dev
+curly run "My API/get-user" --env dev --var USER_ID=42
+```
+
+`curly run <collection>/<request-name>` resolves `{{variable}}` tokens against the merged variable scope (`global` + `--env`'s environment + any `--var key=value` overrides, in that precedence order — later wins) and sends the result. **Any variable left unresolved is a hard error** naming every undefined variable found, not a silently-sent literal `{{var}}` — that's a deliberate difference from Postman's GUI behavior, since a CLI/CI tool sending garbage to a server is almost always a bug worth catching immediately.
+
+`run` accepts the same connection/output flags as one-shot mode — `-i`, `-v`, `-k`, `--fail`, `-o`, `--json`, `-p`, `-L`, `--max-redirects`, `--max-time`, `-x`, `--cacert`, `--cert`, `--key` — everything from [§4](#4-argument-reference) except the request-building flags (those come from the saved request, not the command line).
+
+```sh
+curly run "My API/get-user" --env dev -i -v --fail
+```
+
+## 7. History — `curly history`
+
+Every request sent by either one-shot mode or `run` is automatically recorded — no separate opt-in. `curly history [--limit N]` lists the most recent ones (default 20), newest first:
+
+```sh
+curly history
+curly history --limit 5
+```
+
+Each line shows timestamp, method, status, URL, and elapsed time. Recorded entries redact `Authorization`/`X-Api-Key`/`Cookie` header values and cap the stored response body at 8KB — see [DESIGN.md](DESIGN.md) §4 for the exact format if you want to read the underlying JSONL files directly (`<data dir>/curly/history/<yyyy-mm-dd>.jsonl`). There's no `curly history show <id>`/re-run-from-history yet — see §8.
+
+## 8. What's Not Here Yet
 
 These are on the roadmap (see [DESIGN.md](DESIGN.md) §9) but don't exist in the CLI yet — using them will just fail as an unrecognized flag or bare argument for now:
 
-- Saved/named requests and collections (`curly run <name>`)
-- Environments and `{{variable}}` substitution
 - OAuth2 authorization-code/client-credentials auth helpers
-- Request history (`curly history`)
-- Importing curl commands or Postman collections
+- Importing curl commands or Postman collections; exporting collections in Postman's format
+- Re-running or viewing the full detail of a single history entry (only the summary list exists)
+- Folder nesting within a collection (collections are a flat, ordered list of requests)
+- Editing a saved request in place (currently: remove-request, then add-request again)
 - Colorized output when connected to a TTY
 - Pretty-printing for non-JSON bodies (XML/HTML)
+- OS-keychain storage for `--secret` environment variables (currently plain JSON on disk)

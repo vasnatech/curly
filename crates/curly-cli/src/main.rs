@@ -24,6 +24,11 @@ enum Command {
         #[command(subcommand)]
         action: commands::env::EnvCommand,
     },
+    /// Manage collections and their saved requests
+    Collections {
+        #[command(subcommand)]
+        action: commands::collections::CollectionsCommand,
+    },
 }
 
 #[tokio::main]
@@ -32,6 +37,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Some(Command::Env { action }) => commands::env::run(action),
+        Some(Command::Collections { action }) => commands::collections::run(action),
         None => one_shot::run(&cli.one_shot).await,
     }
 }

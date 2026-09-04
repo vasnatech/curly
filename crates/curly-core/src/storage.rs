@@ -334,6 +334,16 @@ impl Storage {
             .with_context(|| format!("failed to write {}", path.display()))
     }
 
+    /// Load a collection if it exists, or `None` if it doesn't — used by
+    /// `collections add-request` to create the collection on first use.
+    pub fn load_collection_opt(&self, name: &str) -> Result<Option<Collection>> {
+        let path = self.collection_path(&slugify(name));
+        if !path.exists() {
+            return Ok(None);
+        }
+        self.load_collection(name).map(Some)
+    }
+
     pub fn delete_collection(&self, name: &str) -> Result<()> {
         let path = self.collection_path(&slugify(name));
         std::fs::remove_file(&path)

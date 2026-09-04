@@ -58,6 +58,14 @@ struct Cli {
     #[arg(short = 'i', long = "include")]
     include: bool,
 
+    /// Print status/headers/body as a single machine-readable JSON object (takes precedence over -i)
+    #[arg(long = "json")]
+    json_output: bool,
+
+    /// Pretty-print the response body if it's JSON (leaves non-JSON bodies unchanged)
+    #[arg(short = 'p', long = "pretty")]
+    pretty: bool,
+
     /// Print request/response trace to stderr
     #[arg(short = 'v', long = "verbose")]
     verbose: bool,
@@ -291,6 +299,38 @@ fn build_client(cli: &Cli) -> Result<reqwest::Client> {
     builder.build().context("failed to build HTTP client")
 }
 
+/// Pretty-print `body` if it parses as JSON; otherwise return it unchanged.
+fn pretty_json(body: &str) -> String {
+    match serde_json::from_str::<serde_json::Value>(body) {
+        Ok(value) => serde_json::to_string_pretty(&value).unwrap_or_else(|_| body.to_string()),
+        Err(_) => body.to_string(),
+    }
+}
+
+/// Render the response as the string that ultimately gets printed (or written
+/// to -o's file): the raw body by default, pretty-printed JSON with -p, or a
+/// single machine-readable JSON object (status/headers/body/timing) with --json.
+fn render_body(cli: &Cli, response: &exec::ResponseSummary) -> Result<String> {
+    if cli.json_output {
+        let headers: serde_json::Map<String, serde_json::Value> = response
+            .headers
+            .iter()
+            .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+            .collect();
+        let payload = serde_json::json!({
+            "status": response.status,
+            "elapsed_ms": response.elapsed.as_millis(),
+            "headers": headers,
+            "body": response.body,
+        });
+        serde_json::to_string_pretty(&payload).context("failed to serialize --json output")
+    } else if cli.pretty {
+        Ok(pretty_json(&response.body))
+    } else {
+        Ok(response.body.clone())
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -314,7 +354,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    if cli.include {
+    if cli.include && !cli.json_output {
         println!("HTTP {}", response.status);
         for (name, value) in &response.headers {
             println!("{name}: {value}");
@@ -322,12 +362,13 @@ async fn main() -> Result<()> {
         println!();
     }
 
+    let rendered = render_body(&cli, &response)?;
     match &cli.output {
         Some(path) => {
-            fs::write(path, &response.body)
+            fs::write(path, &rendered)
                 .with_context(|| format!("failed to write response body to {}", path.display()))?;
         }
-        None => println!("{}", response.body),
+        None => println!("{}", rendered),
     }
 
     if cli.fail && response.status >= 400 {
@@ -355,6 +396,8 @@ mod tests {
             bearer: None,
             output: None,
             include: false,
+            json_output: false,
+            pretty: false,
             verbose: false,
             insecure: false,
             fail: false,
@@ -536,5 +579,51 @@ mod tests {
         let mut cli = base_cli("https://example.com");
         cli.key = Some(PathBuf::from("/nonexistent/key.pem"));
         assert!(build_client(&cli).is_err());
+    }
+
+    fn sample_response(body: &str) -> exec::ResponseSummary {
+        exec::ResponseSummary {
+            status: 200,
+            headers: vec![("Content-Type".to_string(), "application/json".to_string())],
+            body: body.to_string(),
+            elapsed: std::time::Duration::from_millis(42),
+        }
+    }
+
+    #[test]
+    fn pretty_json_formats_valid_json() {
+        assert_eq!(pretty_json(r#"{"a":1}"#), "{\n  \"a\": 1\n}");
+    }
+
+    #[test]
+    fn pretty_json_leaves_non_json_unchanged() {
+        assert_eq!(pretty_json("not json"), "not json");
+    }
+
+    #[test]
+    fn render_body_defaults_to_raw() {
+        let cli = base_cli("https://example.com");
+        let rendered = render_body(&cli, &sample_response(r#"{"a":1}"#)).unwrap();
+        assert_eq!(rendered, r#"{"a":1}"#);
+    }
+
+    #[test]
+    fn render_body_pretty_formats_json() {
+        let mut cli = base_cli("https://example.com");
+        cli.pretty = true;
+        let rendered = render_body(&cli, &sample_response(r#"{"a":1}"#)).unwrap();
+        assert_eq!(rendered, "{\n  \"a\": 1\n}");
+    }
+
+    #[test]
+    fn render_body_json_output_wraps_status_headers_body() {
+        let mut cli = base_cli("https://example.com");
+        cli.json_output = true;
+        let rendered = render_body(&cli, &sample_response("hello")).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(value["status"], 200);
+        assert_eq!(value["body"], "hello");
+        assert_eq!(value["headers"]["Content-Type"], "application/json");
+        assert_eq!(value["elapsed_ms"], 42);
     }
 }

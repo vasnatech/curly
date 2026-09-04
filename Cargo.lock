@@ -184,6 +184,7 @@ dependencies = [
  "clap",
  "curly-core",
  "reqwest",
+ "serde_json",
  "tokio",
 ]
 

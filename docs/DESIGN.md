@@ -136,7 +136,14 @@ Single window, `egui` immediate-mode layout:
 
 ## 9. Milestones (maps to REQUIREMENTS §5, rough only — no dates yet)
 
-1. **M1 — core + CLI one-shot**: `curly-core` model/exec, CLI one-shot mode (FR-1..3, FR-9, FR-11, FR-14..16). No storage yet — a working curl replacement.
+1. **M1 — core + CLI one-shot** ✅ **done**: `curly-core` model/exec, CLI one-shot mode (FR-1..3, FR-9, FR-11, FR-14..16). No storage yet — a working curl replacement.
+   - FR-1 (method/URL/query/headers/body — raw, form-urlencoded, multipart incl. file upload, binary file): done.
+   - FR-2 (HTTP/1.1+2 via reqwest, TLS incl. `--cacert`/`--cert`/`--key`, redirects via `-L`/`--max-redirects`, `--max-time`, `-x`/`--proxy`): done.
+   - FR-3 (Basic via `-u`, Bearer via `--bearer`; API key covered by existing `-H`/`-Q`): done. OAuth2 explicitly deferred to M5 (interactive flow, out of one-shot-CLI scope).
+   - FR-9 (status/headers/body/timing; JSON pretty-print via `-p`): done. DNS/connect/TLS/TTFB timing *breakdown* (vs. total elapsed) not implemented — would need low-level `hyper` connection hooks; not pursued for CLI v1.
+   - FR-11, FR-14 (`--json`), FR-15 (`--fail`), FR-16: done.
+   - NFR-6: `curly-cli`'s request/client-building logic is pure and unit tested (24 tests); `curly-core::exec` has `wiremock`-based integration tests (8 tests) per §8.
+   - Not done / explicitly out of scope for M1: colorized TTY output, XML/HTML pretty-printing (JSON only).
 2. **M2 — storage + saved requests/collections/environments**: FR-4..8, FR-12..13 CLI subcommands.
 3. **M3 — Postman import**: FR-7.
 4. **M4 — GUI v1**: FR-17..24 against the by-then-stable core.

@@ -154,7 +154,7 @@ alias curly=./target/release/curly   # or use cargo run -- ... directly
 
 | # | Steps | Expected |
 |---|---|---|
-| 13.1 | `mkdir -p /tmp/proj/backend/src/main && cd /tmp/proj/backend && curly init` | "initialized curly project at /tmp/proj/backend/.curly"; `.curly/.gitignore` exists containing `history/`. |
+| 13.1 | `mkdir -p /tmp/proj/backend/src/main && cd /tmp/proj/backend && curly init` | "initialized curly project at /tmp/proj/backend/.curly"; `.curly/.gitignore` exists containing `environments/` and `history/` (only `collections/` is meant to be committed). |
 | 13.2 | Run `curly init` again in the same directory | "curly project already initialized at ..." — idempotent, not an error. |
 | 13.3 | `cd /tmp/proj/backend/src/main && curly env set dev X=1` (three levels below where `.curly` was created) | Succeeds; `/tmp/proj/backend/.curly/environments/dev.json` is what got written — confirms auto-detection walks *up* from the current directory, not just checks it. |
 | 13.4 | From anywhere outside `/tmp/proj`, `curly --data-dir /tmp/other env list` | Uses `/tmp/other`, not the OS default and not any `.curly` that happens to be an ancestor of the current directory — `--data-dir` wins outright. |

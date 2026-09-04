@@ -1,4 +1,6 @@
+mod args;
 mod commands;
+mod execute;
 mod one_shot;
 
 use anyhow::Result;
@@ -19,6 +21,8 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    /// Execute a saved request: curly run <collection>/<request-name>
+    Run(commands::run::RunArgs),
     /// Manage environments (named {{variable}} sets)
     Env {
         #[command(subcommand)]
@@ -36,6 +40,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Some(Command::Run(args)) => commands::run::run(args).await,
         Some(Command::Env { action }) => commands::env::run(action),
         Some(Command::Collections { action }) => commands::collections::run(action),
         None => one_shot::run(&cli.one_shot).await,

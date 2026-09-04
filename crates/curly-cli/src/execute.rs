@@ -11,7 +11,12 @@ use curly_core::storage::{HistoryEntry, Storage};
 
 use crate::args::{build_client, render_body, ConnectionArgs, OutputArgs};
 
-pub async fn run(request: &Request, connection: &ConnectionArgs, output: &OutputArgs) -> Result<()> {
+pub async fn run(
+    request: &Request,
+    connection: &ConnectionArgs,
+    output: &OutputArgs,
+    storage: &Storage,
+) -> Result<()> {
     if output.verbose {
         eprintln!("> {} {}", request.method, request.url);
         for (name, value) in &request.headers {
@@ -22,9 +27,7 @@ pub async fn run(request: &Request, connection: &ConnectionArgs, output: &Output
     let client = build_client(connection)?;
     let response = curly_core::exec::send(&client, request).await?;
 
-    if let Ok(storage) = Storage::default_location() {
-        let _ = storage.append_history(&HistoryEntry::new(request, &response));
-    }
+    let _ = storage.append_history(&HistoryEntry::new(request, &response));
 
     if output.verbose {
         eprintln!("< status: {} ({:?})", response.status, response.elapsed);

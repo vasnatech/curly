@@ -182,9 +182,7 @@ fn build_saved_request(name: &str, args: &AddRequestArgs) -> Result<SavedRequest
     Ok(saved)
 }
 
-pub fn run(command: CollectionsCommand) -> Result<()> {
-    let storage = Storage::default_location()?;
-
+pub fn run(command: CollectionsCommand, storage: &Storage) -> Result<()> {
     match command {
         CollectionsCommand::List => {
             let names = storage.list_collections()?;

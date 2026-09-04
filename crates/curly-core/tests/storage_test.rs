@@ -2,7 +2,10 @@ use std::time::Duration;
 
 use curly_core::exec::ResponseSummary;
 use curly_core::model::Request;
-use curly_core::storage::{slugify, Collection, Environment, HistoryEntry, SavedRequest, Storage};
+use curly_core::storage::{
+    find_project_local_root, slugify, Collection, Environment, HistoryEntry, SavedRequest,
+    Storage,
+};
 use reqwest::Method;
 use tempfile::tempdir;
 
@@ -192,4 +195,98 @@ fn list_history_on_missing_directory_is_empty_not_an_error() {
     let dir = tempdir().unwrap();
     let storage = Storage::new(dir.path());
     assert_eq!(storage.list_history(10).unwrap().len(), 0);
+}
+
+#[test]
+fn find_project_local_root_finds_dot_curly_in_start_dir() {
+    let dir = tempdir().unwrap();
+    std::fs::create_dir(dir.path().join(".curly")).unwrap();
+    assert_eq!(
+        find_project_local_root(dir.path()),
+        Some(dir.path().join(".curly"))
+    );
+}
+
+#[test]
+fn find_project_local_root_walks_up_through_ancestors() {
+    let dir = tempdir().unwrap();
+    std::fs::create_dir(dir.path().join(".curly")).unwrap();
+    let nested = dir.path().join("backend").join("src").join("main");
+    std::fs::create_dir_all(&nested).unwrap();
+
+    assert_eq!(
+        find_project_local_root(&nested),
+        Some(dir.path().join(".curly"))
+    );
+}
+
+#[test]
+fn find_project_local_root_returns_none_when_absent() {
+    let dir = tempdir().unwrap();
+    let nested = dir.path().join("a").join("b");
+    std::fs::create_dir_all(&nested).unwrap();
+    assert_eq!(find_project_local_root(&nested), None);
+}
+
+#[test]
+fn find_project_local_root_ignores_a_file_named_dot_curly() {
+    let dir = tempdir().unwrap();
+    std::fs::write(dir.path().join(".curly"), "not a directory").unwrap();
+    assert_eq!(find_project_local_root(dir.path()), None);
+}
+
+#[test]
+fn resolve_prefers_explicit_over_everything() {
+    let explicit = tempdir().unwrap();
+    let cwd_with_local = tempdir().unwrap();
+    std::fs::create_dir(cwd_with_local.path().join(".curly")).unwrap();
+
+    let storage = Storage::resolve(
+        Some(explicit.path()),
+        Some("/some/env/dir"),
+        cwd_with_local.path(),
+    )
+    .unwrap();
+    assert_eq!(storage.root(), explicit.path());
+}
+
+#[test]
+fn resolve_prefers_env_var_over_auto_detected_local_root() {
+    let env_dir = tempdir().unwrap();
+    let cwd_with_local = tempdir().unwrap();
+    std::fs::create_dir(cwd_with_local.path().join(".curly")).unwrap();
+
+    let storage = Storage::resolve(
+        None,
+        Some(env_dir.path().to_str().unwrap()),
+        cwd_with_local.path(),
+    )
+    .unwrap();
+    assert_eq!(storage.root(), env_dir.path());
+}
+
+#[test]
+fn resolve_falls_back_to_auto_detected_local_root() {
+    let cwd_with_local = tempdir().unwrap();
+    std::fs::create_dir(cwd_with_local.path().join(".curly")).unwrap();
+
+    let storage = Storage::resolve(None, None, cwd_with_local.path()).unwrap();
+    assert_eq!(storage.root(), cwd_with_local.path().join(".curly"));
+}
+
+#[test]
+fn resolve_falls_back_to_default_location_when_nothing_else_matches() {
+    let cwd_without_local = tempdir().unwrap();
+
+    let storage = Storage::resolve(None, None, cwd_without_local.path()).unwrap();
+    assert_eq!(storage.root(), Storage::default_location().unwrap().root());
+}
+
+#[test]
+fn resolve_ignores_blank_env_var() {
+    let cwd_with_local = tempdir().unwrap();
+    std::fs::create_dir(cwd_with_local.path().join(".curly")).unwrap();
+
+    let storage = Storage::resolve(None, Some("   "), cwd_with_local.path()).unwrap();
+    assert_eq!(storage.root(), cwd_with_local.path().join(".curly"));
 }

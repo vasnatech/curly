@@ -13,8 +13,7 @@ pub struct HistoryArgs {
     pub limit: usize,
 }
 
-pub fn run(args: HistoryArgs) -> Result<()> {
-    let storage = Storage::default_location()?;
+pub fn run(args: HistoryArgs, storage: &Storage) -> Result<()> {
     let entries = storage.list_history(args.limit)?;
 
     if entries.is_empty() {

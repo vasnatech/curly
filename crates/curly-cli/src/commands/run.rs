@@ -60,18 +60,17 @@ fn merged_variables(storage: &Storage, args: &RunArgs) -> Result<BTreeMap<String
     Ok(variables)
 }
 
-pub async fn run(args: RunArgs) -> Result<()> {
+pub async fn run(args: RunArgs, storage: &Storage) -> Result<()> {
     let (collection_name, request_name) = storage::parse_run_target(&args.target)?;
 
-    let storage_handle = Storage::default_location()?;
-    let collection = storage_handle.load_collection(collection_name)?;
+    let collection = storage.load_collection(collection_name)?;
     let saved = collection.find_request(request_name).ok_or_else(|| {
         anyhow!("collection \"{collection_name}\" has no request named \"{request_name}\"")
     })?;
 
-    let variables = merged_variables(&storage_handle, &args)?;
+    let variables = merged_variables(storage, &args)?;
     let resolved = substitution::resolve(saved, &variables)?;
     let request = storage::into_request(&resolved)?;
 
-    execute::run(&request, &args.connection, &args.output).await
+    execute::run(&request, &args.connection, &args.output, storage).await
 }

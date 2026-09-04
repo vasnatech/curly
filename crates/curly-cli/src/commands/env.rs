@@ -27,9 +27,7 @@ pub enum EnvCommand {
     Delete { name: String },
 }
 
-pub fn run(command: EnvCommand) -> Result<()> {
-    let storage = Storage::default_location()?;
-
+pub fn run(command: EnvCommand, storage: &Storage) -> Result<()> {
     match command {
         EnvCommand::List => {
             let names = storage.list_environments()?;

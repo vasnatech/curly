@@ -200,9 +200,9 @@ fn build_request(args: &OneShotArgs) -> Result<Request> {
     Ok(request)
 }
 
-pub async fn run(args: &OneShotArgs) -> Result<()> {
+pub async fn run(args: &OneShotArgs, storage: &curly_core::storage::Storage) -> Result<()> {
     let request = build_request(args)?;
-    execute::run(&request, &args.connection, &args.output).await
+    execute::run(&request, &args.connection, &args.output, storage).await
 }
 
 #[cfg(test)]

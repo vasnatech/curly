@@ -251,6 +251,25 @@ impl HistoryEntry {
 
 /// Turn a display name into a filesystem-safe slug: lowercase, `[a-z0-9-_]`
 /// only, runs of anything else collapsed to a single `-`.
+/// Name of the project-local storage directory `curly init` creates, and
+/// that [`find_project_local_root`] looks for.
+pub const PROJECT_LOCAL_DIR_NAME: &str = ".curly";
+
+/// Walk up from `start` looking for a `.curly` directory, the way git
+/// discovers `.git` from any subdirectory of a repo. Returns the `.curly`
+/// path itself (not its parent) if found.
+pub fn find_project_local_root(start: &Path) -> Option<PathBuf> {
+    let mut dir = Some(start);
+    while let Some(d) = dir {
+        let candidate = d.join(PROJECT_LOCAL_DIR_NAME);
+        if candidate.is_dir() {
+            return Some(candidate);
+        }
+        dir = d.parent();
+    }
+    None
+}
+
 pub fn slugify(name: &str) -> String {
     let mut slug = String::with_capacity(name.len());
     let mut last_was_dash = false;
@@ -290,6 +309,42 @@ impl Storage {
         let base = dirs::data_dir()
             .ok_or_else(|| anyhow!("could not determine the user data directory for this OS"))?;
         Ok(Self::new(base.join("curly")))
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Resolve where storage should live, in precedence order: `explicit`
+    /// (the `--data-dir` flag), then `env_data_dir` (`CURLY_DATA_DIR`), then
+    /// an auto-detected `.curly/` walking up from `cwd` (see [`find_project_local_root`],
+    /// created by `curly init` — the same idea as git discovering `.git` from
+    /// any subdirectory), then [`Storage::default_location`]. Takes `cwd` and
+    /// the env var's value as plain parameters (rather than reading
+    /// `std::env` itself) so the precedence logic is testable without
+    /// mutating real process state; see [`Storage::resolve_default`] for the
+    /// real-world entry point.
+    pub fn resolve(explicit: Option<&Path>, env_data_dir: Option<&str>, cwd: &Path) -> Result<Self> {
+        if let Some(path) = explicit {
+            return Ok(Self::new(path));
+        }
+        if let Some(env_path) = env_data_dir {
+            if !env_path.trim().is_empty() {
+                return Ok(Self::new(env_path));
+            }
+        }
+        if let Some(local_root) = find_project_local_root(cwd) {
+            return Ok(Self::new(local_root));
+        }
+        Self::default_location()
+    }
+
+    /// [`Storage::resolve`] wired up to the real current directory and
+    /// `CURLY_DATA_DIR` — what the CLI actually calls.
+    pub fn resolve_default(explicit: Option<&Path>) -> Result<Self> {
+        let cwd = std::env::current_dir().context("failed to determine current directory")?;
+        let env_var = std::env::var("CURLY_DATA_DIR").ok();
+        Self::resolve(explicit, env_var.as_deref(), &cwd)
     }
 
     fn collections_dir(&self) -> PathBuf {

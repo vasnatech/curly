@@ -33,6 +33,8 @@ enum Command {
         #[command(subcommand)]
         action: commands::collections::CollectionsCommand,
     },
+    /// Browse request history
+    History(commands::history::HistoryArgs),
 }
 
 #[tokio::main]
@@ -43,6 +45,7 @@ async fn main() -> Result<()> {
         Some(Command::Run(args)) => commands::run::run(args).await,
         Some(Command::Env { action }) => commands::env::run(action),
         Some(Command::Collections { action }) => commands::collections::run(action),
+        Some(Command::History(args)) => commands::history::run(args),
         None => one_shot::run(&cli.one_shot).await,
     }
 }

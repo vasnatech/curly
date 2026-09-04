@@ -85,6 +85,18 @@ struct Cli {
     /// Send the request through an HTTP/HTTPS proxy, e.g. http://localhost:8080
     #[arg(short = 'x', long = "proxy")]
     proxy: Option<String>,
+
+    /// Trust an additional CA certificate (PEM) when verifying the server, e.g. for a self-signed dev server
+    #[arg(long = "cacert")]
+    cacert: Option<PathBuf>,
+
+    /// Client certificate (PEM) to present for mutual TLS — requires --key
+    #[arg(long = "cert")]
+    cert: Option<PathBuf>,
+
+    /// Private key (PEM) matching --cert — requires --cert
+    #[arg(long = "key")]
+    key: Option<PathBuf>,
 }
 
 /// Split "key=value" into its two halves. Used for -Q, --data-urlencode, and text -F fields.
@@ -247,6 +259,35 @@ fn build_client(cli: &Cli) -> Result<reqwest::Client> {
         builder = builder.proxy(proxy);
     }
 
+    if let Some(path) = &cli.cacert {
+        let pem = fs::read(path)
+            .with_context(|| format!("failed to read --cacert file: {}", path.display()))?;
+        let cert = reqwest::Certificate::from_pem(&pem)
+            .with_context(|| format!("invalid PEM in --cacert file: {}", path.display()))?;
+        builder = builder.add_root_certificate(cert);
+    }
+
+    match (&cli.cert, &cli.key) {
+        (Some(cert_path), Some(key_path)) => {
+            let mut pem = fs::read(cert_path)
+                .with_context(|| format!("failed to read --cert file: {}", cert_path.display()))?;
+            let mut key_pem = fs::read(key_path)
+                .with_context(|| format!("failed to read --key file: {}", key_path.display()))?;
+            pem.push(b'\n');
+            pem.append(&mut key_pem);
+            let identity = reqwest::Identity::from_pem(&pem).with_context(|| {
+                format!(
+                    "invalid PEM in --cert/--key files: {} / {}",
+                    cert_path.display(),
+                    key_path.display()
+                )
+            })?;
+            builder = builder.identity(identity);
+        }
+        (None, None) => {}
+        _ => bail!("--cert and --key must be used together"),
+    }
+
     builder.build().context("failed to build HTTP client")
 }
 
@@ -321,6 +362,9 @@ mod tests {
             max_redirects: None,
             max_time: None,
             proxy: None,
+            cacert: None,
+            cert: None,
+            key: None,
         }
     }
 
@@ -470,6 +514,27 @@ mod tests {
     fn invalid_proxy_url_errors() {
         let mut cli = base_cli("https://example.com");
         cli.proxy = Some("not a url".into());
+        assert!(build_client(&cli).is_err());
+    }
+
+    #[test]
+    fn missing_cacert_file_errors() {
+        let mut cli = base_cli("https://example.com");
+        cli.cacert = Some(PathBuf::from("/nonexistent/ca.pem"));
+        assert!(build_client(&cli).is_err());
+    }
+
+    #[test]
+    fn cert_without_key_errors() {
+        let mut cli = base_cli("https://example.com");
+        cli.cert = Some(PathBuf::from("/nonexistent/cert.pem"));
+        assert!(build_client(&cli).is_err());
+    }
+
+    #[test]
+    fn key_without_cert_errors() {
+        let mut cli = base_cli("https://example.com");
+        cli.key = Some(PathBuf::from("/nonexistent/key.pem"));
         assert!(build_client(&cli).is_err());
     }
 }

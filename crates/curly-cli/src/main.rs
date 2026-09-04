@@ -69,6 +69,22 @@ struct Cli {
     /// Exit with a non-zero status if the response is a 4xx/5xx
     #[arg(long = "fail")]
     fail: bool,
+
+    /// Follow HTTP redirects (off by default, like curl)
+    #[arg(short = 'L', long = "location")]
+    location: bool,
+
+    /// Maximum number of redirects to follow when -L/--location is set (default 10)
+    #[arg(long = "max-redirects")]
+    max_redirects: Option<usize>,
+
+    /// Abort the request after this many seconds
+    #[arg(long = "max-time")]
+    max_time: Option<f64>,
+
+    /// Send the request through an HTTP/HTTPS proxy, e.g. http://localhost:8080
+    #[arg(short = 'x', long = "proxy")]
+    proxy: Option<String>,
 }
 
 /// Split "key=value" into its two halves. Used for -Q, --data-urlencode, and text -F fields.
@@ -207,6 +223,33 @@ fn build_request(cli: &Cli) -> Result<Request> {
     Ok(request)
 }
 
+/// Build the reqwest client from the connection-level CLI flags (redirects,
+/// timeout, proxy, TLS verification) — everything that's per-client rather
+/// than per-request in reqwest's API.
+fn build_client(cli: &Cli) -> Result<reqwest::Client> {
+    let redirect_policy = if cli.location {
+        reqwest::redirect::Policy::limited(cli.max_redirects.unwrap_or(10))
+    } else {
+        reqwest::redirect::Policy::none()
+    };
+
+    let mut builder = reqwest::Client::builder()
+        .danger_accept_invalid_certs(cli.insecure)
+        .redirect(redirect_policy);
+
+    if let Some(secs) = cli.max_time {
+        builder = builder.timeout(std::time::Duration::from_secs_f64(secs));
+    }
+
+    if let Some(proxy_url) = &cli.proxy {
+        let proxy = reqwest::Proxy::all(proxy_url)
+            .with_context(|| format!("invalid --proxy URL: {proxy_url}"))?;
+        builder = builder.proxy(proxy);
+    }
+
+    builder.build().context("failed to build HTTP client")
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -219,10 +262,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    let client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(cli.insecure)
-        .build()
-        .context("failed to build HTTP client")?;
+    let client = build_client(&cli)?;
 
     let response = exec::send(&client, &request).await?;
 
@@ -277,6 +317,10 @@ mod tests {
             verbose: false,
             insecure: false,
             fail: false,
+            location: false,
+            max_redirects: None,
+            max_time: None,
+            proxy: None,
         }
     }
 
@@ -414,5 +458,18 @@ mod tests {
         cli.user = Some("alice:s3cret".into());
         cli.bearer = Some("tok123".into());
         assert!(build_request(&cli).is_err());
+    }
+
+    #[test]
+    fn build_client_defaults_are_fine() {
+        let cli = base_cli("https://example.com");
+        assert!(build_client(&cli).is_ok());
+    }
+
+    #[test]
+    fn invalid_proxy_url_errors() {
+        let mut cli = base_cli("https://example.com");
+        cli.proxy = Some("not a url".into());
+        assert!(build_client(&cli).is_err());
     }
 }

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 use curly_core::exec;
-use curly_core::model::{Body, MultipartField, Request};
+use curly_core::model::{Auth, Body, MultipartField, Request};
 use reqwest::Method;
 
 /// curly - a curl-like HTTP client (CLI face of the Curly project).
@@ -41,6 +41,14 @@ struct Cli {
     /// Add a multipart/form-data field: "name=value" for text, "name=@path" to upload a file (repeatable)
     #[arg(short = 'F', long = "form")]
     form: Vec<String>,
+
+    /// Basic auth credentials as "user:password"
+    #[arg(short = 'u', long = "user")]
+    user: Option<String>,
+
+    /// Send a Bearer token in the Authorization header
+    #[arg(long = "bearer")]
+    bearer: Option<String>,
 
     /// Write the response body to a file instead of stdout
     #[arg(short = 'o', long = "output")]
@@ -145,8 +153,29 @@ fn build_body(cli: &Cli) -> Result<Option<Body>> {
     Ok(None)
 }
 
+/// Build the `Auth` (if any) from -u/--user and --bearer, rejecting both at once.
+fn build_auth(cli: &Cli) -> Result<Option<Auth>> {
+    match (&cli.user, &cli.bearer) {
+        (Some(_), Some(_)) => bail!("only one of -u/--user or --bearer may be used per request"),
+        (Some(user_pass), None) => {
+            let (username, password) = user_pass.split_once(':').ok_or_else(|| {
+                anyhow!("invalid -u/--user value (expected \"user:password\"): {user_pass}")
+            })?;
+            Ok(Some(Auth::Basic {
+                username: username.to_string(),
+                password: password.to_string(),
+            }))
+        }
+        (None, Some(token)) => Ok(Some(Auth::Bearer {
+            token: token.clone(),
+        })),
+        (None, None) => Ok(None),
+    }
+}
+
 fn build_request(cli: &Cli) -> Result<Request> {
     let body = build_body(cli)?;
+    let auth = build_auth(cli)?;
 
     let method = match &cli.method {
         Some(m) => Method::from_bytes(m.to_uppercase().as_bytes())
@@ -169,6 +198,10 @@ fn build_request(cli: &Cli) -> Result<Request> {
 
     if let Some(body) = body {
         request = request.with_body(body);
+    }
+
+    if let Some(auth) = auth {
+        request = request.with_auth(auth);
     }
 
     Ok(request)
@@ -237,6 +270,8 @@ mod tests {
             data_urlencode: Vec::new(),
             data_binary: None,
             form: Vec::new(),
+            user: None,
+            bearer: None,
             output: None,
             include: false,
             verbose: false,
@@ -340,6 +375,44 @@ mod tests {
         let mut cli = base_cli("https://example.com");
         cli.data = Some("raw".into());
         cli.form = vec!["a=b".into()];
+        assert!(build_request(&cli).is_err());
+    }
+
+    #[test]
+    fn user_flag_builds_basic_auth() {
+        let mut cli = base_cli("https://example.com");
+        cli.user = Some("alice:s3cret".into());
+        let request = build_request(&cli).unwrap();
+        assert!(matches!(
+            request.auth,
+            Some(Auth::Basic { ref username, ref password })
+                if username == "alice" && password == "s3cret"
+        ));
+    }
+
+    #[test]
+    fn user_flag_without_colon_errors() {
+        let mut cli = base_cli("https://example.com");
+        cli.user = Some("alice".into());
+        assert!(build_request(&cli).is_err());
+    }
+
+    #[test]
+    fn bearer_flag_builds_bearer_auth() {
+        let mut cli = base_cli("https://example.com");
+        cli.bearer = Some("tok123".into());
+        let request = build_request(&cli).unwrap();
+        assert!(matches!(
+            request.auth,
+            Some(Auth::Bearer { ref token }) if token == "tok123"
+        ));
+    }
+
+    #[test]
+    fn user_and_bearer_together_error() {
+        let mut cli = base_cli("https://example.com");
+        cli.user = Some("alice:s3cret".into());
+        cli.bearer = Some("tok123".into());
         assert!(build_request(&cli).is_err());
     }
 }

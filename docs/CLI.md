@@ -398,22 +398,25 @@ curly env delete dev
 
 ### Collections — `curly collections`
 
-A collection is a named, ordered group of saved requests, stored as one JSON file (`curly collections show <name>` to see what's in it; the file itself lives at `<data dir>/curly/collections/<slug>.json` if you want to inspect or hand-edit it, or check it into a project's git repo).
+A collection is a named, ordered group of saved requests, optionally organized into nested folders, stored as one JSON file (`curly collections show <name>` to see what's in it as a tree; the file itself lives at `<data dir>/curly/collections/<slug>.json` if you want to inspect or hand-edit it, or check it into a project's git repo).
 
 ```sh
 curly collections create "My API"
-curly collections add-request "My API" get-user "https://{{HOST}}/users/{{USER_ID}}" \
+curly collections add-request "My API" "Auth/get-user" "https://{{HOST}}/users/{{USER_ID}}" \
   -H "Authorization: Bearer {{TOKEN}}"
 curly collections show "My API"
-curly collections remove-request "My API" get-user
+curly collections remove-request "My API" "Auth/get-user"
 curly collections delete "My API"
 ```
 
 - `curly collections list` — list collection names.
 - `curly collections create <name>` — create an empty collection. Errors if one with that name already exists.
 - `curly collections delete <name>` — delete a collection and everything saved in it.
-- `curly collections show <name>` — list its saved requests (method, name, URL).
-- `curly collections add-request <collection> <request-name> <url> [flags...]` — save a request. Creates the collection first if it doesn't exist yet. The flags are **exactly the same body/header/auth flags as one-shot mode** (`-X`, `-H`, `-Q`, `-d`, `--data-urlencode`, `--data-binary`, `-F`, `-u`, `--bearer`) — so the easiest workflow is: get a request working with plain `curly <url> ...`, then re-run the same flags under `collections add-request <collection> <name> <url> ...` to save it. `{{variable}}` tokens are stored literally — they're not resolved until `run`. Errors if the collection already has a request with that name (remove it first).
+- `curly collections show <name>` — print a tree of its folders and saved requests (method + name; nested requests indented under their folder).
+- `curly collections add-request <collection> <request-path> <url> [flags...]` — save a request. Creates the collection first if it doesn't exist yet. `<request-path>` is either a bare name (`login`) for a top-level request, or a `/`-separated path (`Auth/OAuth/login`) to nest it — any folders in the path that don't exist yet are created automatically, and an existing folder with the same name is reused rather than duplicated. The flags are **exactly the same body/header/auth flags as one-shot mode** (`-X`, `-H`, `-Q`, `-d`, `--data-urlencode`, `--data-binary`, `-F`, `-u`, `--bearer`) — so the easiest workflow is: get a request working with plain `curly <url> ...`, then re-run the same flags under `collections add-request <collection> <path> <url> ...` to save it. `{{variable}}` tokens are stored literally — they're not resolved until `run`. Errors if the collection already has a request at that exact path (remove it first).
+- `curly collections remove-request <collection> <request-path>` — same path syntax as `add-request`. Removing a request doesn't remove its (possibly now-empty) parent folder — use `remove-folder` for that.
+- `curly collections add-folder <collection> <folder-path>` — create a folder (and any missing parent folders) without adding a request to it yet, e.g. to set up structure ahead of time. Idempotent: running it again for a folder that already exists is a no-op, not an error.
+- `curly collections remove-folder <collection> <folder-path> [--force]` — remove a folder. Errors if it still contains requests or sub-folders unless `--force` is given, which deletes everything inside it too.
 - `curly collections remove-request <collection> <request-name>` — delete one saved request from a collection.
 
 ### Running a saved request — `curly run`
@@ -423,7 +426,7 @@ curly run "My API/get-user" --env dev
 curly run "My API/get-user" --env dev --var USER_ID=42
 ```
 
-`curly run <collection>/<request-name>` resolves `{{variable}}` tokens against the merged variable scope (`global` + `--env`'s environment + any `--var key=value` overrides, in that precedence order — later wins) and sends the result. **Any variable left unresolved is a hard error** naming every undefined variable found, not a silently-sent literal `{{var}}` — that's a deliberate difference from Postman's GUI behavior, since a CLI/CI tool sending garbage to a server is almost always a bug worth catching immediately.
+`curly run <collection>/<request-path>` (`<request-path>` may be nested, e.g. `curly run "My API/Auth/login"`) resolves `{{variable}}` tokens against the merged variable scope (`global` + `--env`'s environment + any `--var key=value` overrides, in that precedence order — later wins) and sends the result. **Any variable left unresolved is a hard error** naming every undefined variable found, not a silently-sent literal `{{var}}` — that's a deliberate difference from Postman's GUI behavior, since a CLI/CI tool sending garbage to a server is almost always a bug worth catching immediately.
 
 `run` accepts the same connection/output flags as one-shot mode — `-i`, `-v`, `-k`, `--fail`, `-o`, `--json`, `-p`, `-L`, `--max-redirects`, `--max-time`, `-x`, `--cacert`, `--cert`, `--key` — everything from [§4](#4-argument-reference) except the request-building flags (those come from the saved request, not the command line).
 
@@ -449,7 +452,6 @@ These are on the roadmap (see [DESIGN.md](DESIGN.md) §9) but don't exist in the
 - OAuth2 authorization-code/client-credentials auth helpers
 - Importing curl commands or Postman collections; exporting collections in Postman's format
 - Re-running or viewing the full detail of a single history entry (only the summary list exists)
-- Folder nesting within a collection (collections are a flat, ordered list of requests)
 - Editing a saved request in place (currently: remove-request, then add-request again)
 - Colorized output when connected to a TTY
 - Pretty-printing for non-JSON bodies (XML/HTML)

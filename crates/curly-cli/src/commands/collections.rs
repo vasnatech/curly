@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Subcommand};
 use curly_core::storage::{
-    Collection, KvPair, SavedAuth, SavedBody, SavedMultipartField, SavedRequest, Storage,
+    Collection, Folder, KvPair, SavedAuth, SavedBody, SavedMultipartField, SavedRequest, Storage,
 };
 use reqwest::Method;
 
@@ -23,19 +23,36 @@ pub enum CollectionsCommand {
     Create { name: String },
     /// Delete a collection and all its saved requests
     Delete { name: String },
-    /// List the requests saved in a collection
+    /// List the requests and folders saved in a collection, as a tree
     Show { name: String },
-    /// Save a request into a collection (creating the collection if needed)
+    /// Save a request into a collection (creating the collection and any
+    /// folders in its path if needed) — request_path may be a bare name
+    /// ("login") or nested ("Auth/OAuth/login")
     AddRequest {
         collection: String,
-        request_name: String,
+        request_path: String,
         #[command(flatten)]
         request: AddRequestArgs,
     },
-    /// Remove a saved request from a collection
+    /// Remove a saved request from a collection (request_path may be nested)
     RemoveRequest {
         collection: String,
-        request_name: String,
+        request_path: String,
+    },
+    /// Create a folder (and any missing parent folders) inside a collection
+    AddFolder {
+        collection: String,
+        /// May be nested, e.g. "Auth/OAuth"
+        folder_path: String,
+    },
+    /// Remove a folder from a collection
+    RemoveFolder {
+        collection: String,
+        /// May be nested, e.g. "Auth/OAuth"
+        folder_path: String,
+        /// Required if the folder still has requests or sub-folders in it
+        #[arg(long = "force")]
+        force: bool,
     },
 }
 
@@ -210,49 +227,77 @@ pub fn run(command: CollectionsCommand, storage: &Storage) -> Result<()> {
 
         CollectionsCommand::Show { name } => {
             let collection = storage.load_collection(&name)?;
-            if collection.requests.is_empty() {
+            if collection.folders.is_empty() && collection.requests.is_empty() {
                 println!("collection \"{name}\" has no requests yet");
             } else {
-                for r in &collection.requests {
-                    println!("{:<7} {:<24} {}", r.method, r.name, r.url);
-                }
+                print_tree(&collection.folders, &collection.requests, 0);
             }
         }
 
         CollectionsCommand::AddRequest {
             collection,
-            request_name,
+            request_path,
             request,
         } => {
             let mut coll = storage
                 .load_collection_opt(&collection)?
                 .unwrap_or_else(|| Collection::new(&collection));
-            if coll.find_request(&request_name).is_some() {
-                bail!(
-                    "collection \"{collection}\" already has a request named \"{request_name}\" \
-                     (remove it first with collections remove-request)"
-                );
-            }
-            let saved = build_saved_request(&request_name, &request)?;
-            coll.requests.push(saved);
+            let saved = build_saved_request(&request_path, &request)?;
+            coll.add_request(&request_path, saved).with_context(|| {
+                format!("in collection \"{collection}\" (remove it first with collections remove-request)")
+            })?;
             storage.save_collection(&coll)?;
-            println!("saved \"{request_name}\" in collection \"{collection}\"");
+            println!("saved \"{request_path}\" in collection \"{collection}\"");
         }
 
         CollectionsCommand::RemoveRequest {
             collection,
-            request_name,
+            request_path,
         } => {
             let mut coll = storage.load_collection(&collection)?;
-            let before = coll.requests.len();
-            coll.requests.retain(|r| r.name != request_name);
-            if coll.requests.len() == before {
-                bail!("collection \"{collection}\" has no request named \"{request_name}\"");
+            if !coll.remove_request(&request_path) {
+                bail!("collection \"{collection}\" has no request named \"{request_path}\"");
             }
             storage.save_collection(&coll)?;
-            println!("removed \"{request_name}\" from collection \"{collection}\"");
+            println!("removed \"{request_path}\" from collection \"{collection}\"");
+        }
+
+        CollectionsCommand::AddFolder {
+            collection,
+            folder_path,
+        } => {
+            let mut coll = storage
+                .load_collection_opt(&collection)?
+                .unwrap_or_else(|| Collection::new(&collection));
+            coll.add_folder(&folder_path);
+            storage.save_collection(&coll)?;
+            println!("created folder \"{folder_path}\" in collection \"{collection}\"");
+        }
+
+        CollectionsCommand::RemoveFolder {
+            collection,
+            folder_path,
+            force,
+        } => {
+            let mut coll = storage.load_collection(&collection)?;
+            if !coll.remove_folder(&folder_path, force)? {
+                bail!("collection \"{collection}\" has no folder named \"{folder_path}\"");
+            }
+            storage.save_collection(&coll)?;
+            println!("removed folder \"{folder_path}\" from collection \"{collection}\"");
         }
     }
 
     Ok(())
+}
+
+fn print_tree(folders: &[Folder], requests: &[SavedRequest], depth: usize) {
+    let indent = "  ".repeat(depth);
+    for folder in folders {
+        println!("{indent}{}/", folder.name);
+        print_tree(&folder.folders, &folder.requests, depth + 1);
+    }
+    for r in requests {
+        println!("{indent}{:<7} {}", r.method, r.name);
+    }
 }

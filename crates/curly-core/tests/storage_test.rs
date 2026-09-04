@@ -290,3 +290,161 @@ fn resolve_ignores_blank_env_var() {
     let storage = Storage::resolve(None, Some("   "), cwd_with_local.path()).unwrap();
     assert_eq!(storage.root(), cwd_with_local.path().join(".curly"));
 }
+
+fn sample_request(name: &str) -> SavedRequest {
+    SavedRequest::new(name, Method::GET, "https://example.com")
+}
+
+#[test]
+fn add_request_at_top_level() {
+    let mut coll = Collection::new("My API");
+    coll.add_request("login", sample_request("login")).unwrap();
+    assert!(coll.find_request("login").is_some());
+    assert_eq!(coll.requests.len(), 1);
+    assert!(coll.folders.is_empty());
+}
+
+#[test]
+fn add_request_creates_missing_folders() {
+    let mut coll = Collection::new("My API");
+    coll.add_request("Auth/OAuth/refresh", sample_request("placeholder"))
+        .unwrap();
+
+    let auth = coll.folders.iter().find(|f| f.name == "Auth").unwrap();
+    let oauth = auth.folders.iter().find(|f| f.name == "OAuth").unwrap();
+    assert_eq!(oauth.requests.len(), 1);
+    assert_eq!(oauth.requests[0].name, "refresh");
+
+    // find_request resolves the same path
+    let found = coll.find_request("Auth/OAuth/refresh").unwrap();
+    assert_eq!(found.name, "refresh");
+}
+
+#[test]
+fn add_request_reuses_existing_folder_rather_than_duplicating() {
+    let mut coll = Collection::new("My API");
+    coll.add_request("Auth/login", sample_request("login")).unwrap();
+    coll.add_request("Auth/logout", sample_request("logout")).unwrap();
+
+    assert_eq!(coll.folders.len(), 1);
+    let auth = &coll.folders[0];
+    assert_eq!(auth.requests.len(), 2);
+}
+
+#[test]
+fn add_request_duplicate_path_errors() {
+    let mut coll = Collection::new("My API");
+    coll.add_request("Auth/login", sample_request("login")).unwrap();
+    assert!(coll
+        .add_request("Auth/login", sample_request("login"))
+        .is_err());
+}
+
+#[test]
+fn find_request_missing_folder_segment_is_none() {
+    let coll = Collection::new("My API");
+    assert!(coll.find_request("NoSuchFolder/login").is_none());
+}
+
+#[test]
+fn remove_request_nested() {
+    let mut coll = Collection::new("My API");
+    coll.add_request("Auth/login", sample_request("login")).unwrap();
+
+    assert!(coll.remove_request("Auth/login"));
+    assert!(coll.find_request("Auth/login").is_none());
+    // the (now-empty) Auth folder itself is left in place
+    assert_eq!(coll.folders.len(), 1);
+}
+
+#[test]
+fn remove_request_missing_returns_false() {
+    let mut coll = Collection::new("My API");
+    assert!(!coll.remove_request("Auth/login"));
+}
+
+#[test]
+fn add_folder_is_idempotent() {
+    let mut coll = Collection::new("My API");
+    coll.add_folder("Auth");
+    coll.add_folder("Auth");
+    assert_eq!(coll.folders.len(), 1);
+}
+
+#[test]
+fn add_folder_creates_nested_path() {
+    let mut coll = Collection::new("My API");
+    coll.add_folder("Auth/OAuth");
+    let auth = coll.folders.iter().find(|f| f.name == "Auth").unwrap();
+    assert!(auth.folders.iter().any(|f| f.name == "OAuth"));
+}
+
+#[test]
+fn remove_folder_empty_succeeds() {
+    let mut coll = Collection::new("My API");
+    coll.add_folder("Auth");
+    assert!(coll.remove_folder("Auth", false).unwrap());
+    assert!(coll.folders.is_empty());
+}
+
+#[test]
+fn remove_folder_nonempty_without_force_errors() {
+    let mut coll = Collection::new("My API");
+    coll.add_request("Auth/login", sample_request("login")).unwrap();
+    assert!(coll.remove_folder("Auth", false).is_err());
+    assert!(coll.find_request("Auth/login").is_some());
+}
+
+#[test]
+fn remove_folder_nonempty_with_force_succeeds() {
+    let mut coll = Collection::new("My API");
+    coll.add_request("Auth/login", sample_request("login")).unwrap();
+    assert!(coll.remove_folder("Auth", true).unwrap());
+    assert!(coll.folders.is_empty());
+}
+
+#[test]
+fn remove_folder_missing_returns_false() {
+    let mut coll = Collection::new("My API");
+    assert!(!coll.remove_folder("NoSuchFolder", false).unwrap());
+}
+
+#[test]
+fn nested_collection_round_trips_through_disk() {
+    let dir = tempdir().unwrap();
+    let storage = Storage::new(dir.path());
+
+    let mut coll = Collection::new("My API");
+    coll.add_request("Auth/login", sample_request("login")).unwrap();
+    coll.add_folder("Empty");
+    storage.save_collection(&coll).unwrap();
+
+    let loaded = storage.load_collection("My API").unwrap();
+    assert!(loaded.find_request("Auth/login").is_some());
+    assert!(loaded.folders.iter().any(|f| f.name == "Empty"));
+}
+
+#[test]
+fn collection_without_folders_key_still_parses() {
+    // A collection saved before folder support existed (M2) — no "folders"
+    // key at all. Must still load correctly (backward compatibility).
+    let old_format = r#"{
+        "id": "2de0e066-83db-4252-a018-cd0265fde8de",
+        "name": "My API",
+        "requests": [
+            {
+                "id": "86d01615-0d5e-42e4-be08-e1e4b74ce3e6",
+                "name": "login",
+                "method": "GET",
+                "url": "https://example.com",
+                "query_params": [],
+                "headers": [],
+                "body": null,
+                "auth": null
+            }
+        ]
+    }"#;
+    let collection: Collection = serde_json::from_str(old_format).unwrap();
+    assert!(collection.folders.is_empty());
+    assert!(collection.find_request("login").is_some());
+}

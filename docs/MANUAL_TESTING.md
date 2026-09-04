@@ -120,13 +120,28 @@ alias curly=./target/release/curly   # or use cargo run -- ... directly
 | 10.1 | `curly collections list` (clean state) | "no collections yet — create one with: ..." |
 | 10.2 | `curly collections create "My API"` then `curly collections create "My API"` again | First succeeds; second fails with "already exists". |
 | 10.3 | `curly collections add-request "My API" get-user "https://httpbin.org/get" -Q "id=42"` | "saved \"get-user\" in collection \"My API\"" — also auto-creates a collection that doesn't exist yet if you skip step 10.2. |
-| 10.4 | `curly collections add-request "My API" get-user "https://httpbin.org/get"` again (same name) | Fails with "already has a request named \"get-user\"". |
-| 10.5 | `curly collections show "My API"` | Lists `GET     get-user   https://httpbin.org/get`. |
-| 10.6 | Inspect `$XDG_DATA_HOME/curly/collections/my-api.json` directly | Human-readable JSON; the `-Q "id=42"` from 10.3 appears as a `query_params` entry with `"enabled": true`. |
+| 10.4 | `curly collections add-request "My API" get-user "https://httpbin.org/get"` again (same path) | Fails with "a request already exists at \"get-user\"" (wrapped in "in collection \"My API\" (remove it first with collections remove-request)"). |
+| 10.5 | `curly collections show "My API"` | Lists `GET     get-user`. |
+| 10.6 | Inspect `$XDG_DATA_HOME/curly/collections/my-api.json` directly | Human-readable JSON; a top-level `"folders": []` plus `"requests"`; the `-Q "id=42"` from 10.3 appears as a `query_params` entry with `"enabled": true`. |
 | 10.7 | `curly collections remove-request "My API" get-user` then `show` | "removed ..."; show then says "has no requests yet". |
 | 10.8 | `curly collections remove-request "My API" nope` | Fails with "has no request named \"nope\"". |
 | 10.9 | `curly collections delete "My API"` then `list` | Delete succeeds; list back to "no collections yet". |
 | 10.10 | `curly collections add-request "My API" login https://httpbin.org/post -d '{"u":"a"}' -H "Content-Type: application/json"` | Saves a POST with a JSON body — same body/header flags as one-shot mode. |
+
+### Folders
+
+| # | Steps | Expected |
+|---|---|---|
+| 10.11 | `curly collections add-request "My API" "Auth/OAuth/login" https://httpbin.org/post` | Creates `Auth` and `Auth/OAuth` folders along the way; "saved \"Auth/OAuth/login\" in collection \"My API\"". |
+| 10.12 | `curly collections add-request "My API" "Auth/logout" https://httpbin.org/post` | Succeeds; reuses the existing `Auth` folder rather than creating a duplicate one — confirm via 10.14. |
+| 10.13 | `curly run "My API/Auth/OAuth/login"` | Runs the nested request directly — same path syntax works for `run` as for `add-request`/`remove-request`. |
+| 10.14 | `curly collections show "My API"` | Tree output: `Auth/` containing `OAuth/` (with `login`) and `logout` as a sibling — one `Auth` folder, not two. |
+| 10.15 | `curly collections add-folder "My API" "Empty/Nested"` then `show` | Creates both folder levels even with no request in them; appears in the tree as empty. |
+| 10.16 | `curly collections add-folder "My API" "Auth"` again | No error, no duplicate — idempotent. |
+| 10.17 | `curly collections remove-folder "My API" "Auth"` (still has `OAuth/login` and `logout` in it) | Fails with "is not empty (pass force to delete it and everything inside)"; nothing removed. |
+| 10.18 | `curly collections remove-folder "My API" "Auth" --force` then `show` | Removes `Auth` and everything nested inside it (`OAuth/login`, `logout`) in one shot. |
+| 10.19 | `curly collections remove-folder "My API" "NoSuchFolder"` | Fails with "has no folder named \"NoSuchFolder\"". |
+| 10.20 | Take the `health-record-backend-spring/.curly/collections/health-record-api.json` committed before folder support existed (no `"folders"` key at all) and run `curly collections show "Health Record API"` against it | Still loads and shows correctly (`folders` defaults to empty on parse) — confirms old collection files aren't broken by this feature. |
 
 ## 11. Running a saved request — `curly run`
 

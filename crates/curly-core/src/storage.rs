@@ -15,12 +15,13 @@
 //! correctly, still git-friendly (a whole collection diffs as one file, the
 //! way a Postman collection export already does), and still satisfies NFR-5
 //! (CLI and GUI read/write the same files) since nothing here is CLI-specific.
-//! `collection.json`'s `requests/` subdirectory and `Folder` nesting are not
-//! implemented in M2 — collections are a flat, ordered list of requests for now.
+//! `collection.json`'s `requests/` subdirectory isn't implemented — requests
+//! are always embedded inline, nested under `Folder`s as deep as needed
+//! (see [`Collection`]/[`Folder`]/[`Collection::find_request`]'s path syntax).
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Utc};
 use reqwest::Method;
 use serde::{Deserialize, Serialize};
@@ -113,13 +114,123 @@ impl SavedRequest {
     }
 }
 
+/// A named group of sub-folders and requests, nested inside a [`Collection`]
+/// or another `Folder`. Requests are addressed by slash-separated path from
+/// their collection root, e.g. `"Auth/OAuth/refresh"` — see
+/// [`Collection::find_request`].
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Folder {
+    #[serde(default = "Uuid::new_v4")]
+    pub id: Uuid,
+    pub name: String,
+    #[serde(default)]
+    pub folders: Vec<Folder>,
+    #[serde(default)]
+    pub requests: Vec<SavedRequest>,
+}
+
+impl Folder {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            name: name.into(),
+            folders: Vec::new(),
+            requests: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Collection {
     #[serde(default = "Uuid::new_v4")]
     pub id: Uuid,
     pub name: String,
+    /// Present for backward compatibility with collections saved before
+    /// folder support (M2): those files have no `folders` key at all, so
+    /// this defaults to empty on load rather than failing to parse.
+    #[serde(default)]
+    pub folders: Vec<Folder>,
     #[serde(default)]
     pub requests: Vec<SavedRequest>,
+}
+
+/// Split `"Auth/OAuth/login"` into (`["Auth", "OAuth"]`, `"login"`) — the
+/// folder path segments and the leaf request/folder name. A bare `"login"`
+/// (no `/`) is `([], "login")`. Empty segments from stray slashes are
+/// dropped, so `"Auth//login"` behaves the same as `"Auth/login"`.
+fn split_request_path(path: &str) -> (Vec<&str>, &str) {
+    let mut segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let leaf = segments.pop().unwrap_or(path);
+    (segments, leaf)
+}
+
+fn find_request_in<'a>(
+    folders: &'a [Folder],
+    requests: &'a [SavedRequest],
+    folder_path: &[&str],
+    leaf: &str,
+) -> Option<&'a SavedRequest> {
+    match folder_path.split_first() {
+        None => requests.iter().find(|r| r.name == leaf),
+        Some((head, rest)) => {
+            let folder = folders.iter().find(|f| f.name == *head)?;
+            find_request_in(&folder.folders, &folder.requests, rest, leaf)
+        }
+    }
+}
+
+fn find_request_in_mut<'a>(
+    folders: &'a mut [Folder],
+    requests: &'a mut [SavedRequest],
+    folder_path: &[&str],
+    leaf: &str,
+) -> Option<&'a mut SavedRequest> {
+    match folder_path.split_first() {
+        None => requests.iter_mut().find(|r| r.name == leaf),
+        Some((head, rest)) => {
+            let folder = folders.iter_mut().find(|f| f.name == *head)?;
+            find_request_in_mut(&mut folder.folders, &mut folder.requests, rest, leaf)
+        }
+    }
+}
+
+/// Navigate to the (folders, requests) pair at `folder_path`, creating any
+/// missing folders along the way (used by `add_request`/`add_folder`).
+fn navigate_create<'a>(
+    folders: &'a mut Vec<Folder>,
+    requests: &'a mut Vec<SavedRequest>,
+    folder_path: &[&str],
+) -> (&'a mut Vec<Folder>, &'a mut Vec<SavedRequest>) {
+    match folder_path.split_first() {
+        None => (folders, requests),
+        Some((head, rest)) => {
+            let idx = match folders.iter().position(|f| f.name == *head) {
+                Some(i) => i,
+                None => {
+                    folders.push(Folder::new(*head));
+                    folders.len() - 1
+                }
+            };
+            let folder = &mut folders[idx];
+            navigate_create(&mut folder.folders, &mut folder.requests, rest)
+        }
+    }
+}
+
+/// Like [`navigate_create`] but doesn't create missing folders — `None` if
+/// any segment of `folder_path` doesn't exist (used by removal/lookup).
+fn navigate_existing<'a>(
+    folders: &'a mut Vec<Folder>,
+    requests: &'a mut Vec<SavedRequest>,
+    folder_path: &[&str],
+) -> Option<(&'a mut Vec<Folder>, &'a mut Vec<SavedRequest>)> {
+    match folder_path.split_first() {
+        None => Some((folders, requests)),
+        Some((head, rest)) => {
+            let folder = folders.iter_mut().find(|f| f.name == *head)?;
+            navigate_existing(&mut folder.folders, &mut folder.requests, rest)
+        }
+    }
 }
 
 impl Collection {
@@ -127,16 +238,75 @@ impl Collection {
         Self {
             id: Uuid::new_v4(),
             name: name.into(),
+            folders: Vec::new(),
             requests: Vec::new(),
         }
     }
 
-    pub fn find_request(&self, name: &str) -> Option<&SavedRequest> {
-        self.requests.iter().find(|r| r.name == name)
+    /// Find a request by path, e.g. `"login"` (top-level) or
+    /// `"Auth/OAuth/refresh"` (nested in folders, created if needed by
+    /// [`Collection::add_request`]).
+    pub fn find_request(&self, path: &str) -> Option<&SavedRequest> {
+        let (folder_path, leaf) = split_request_path(path);
+        find_request_in(&self.folders, &self.requests, &folder_path, leaf)
     }
 
-    pub fn find_request_mut(&mut self, name: &str) -> Option<&mut SavedRequest> {
-        self.requests.iter_mut().find(|r| r.name == name)
+    pub fn find_request_mut(&mut self, path: &str) -> Option<&mut SavedRequest> {
+        let (folder_path, leaf) = split_request_path(path);
+        find_request_in_mut(&mut self.folders, &mut self.requests, &folder_path, leaf)
+    }
+
+    /// Add `request` at `path`, creating any missing folders along the way.
+    /// `request.name` is set to the path's leaf segment. Errors if a
+    /// request already exists at that exact path.
+    pub fn add_request(&mut self, path: &str, mut request: SavedRequest) -> Result<()> {
+        let (folder_path, leaf) = split_request_path(path);
+        let (_, requests) = navigate_create(&mut self.folders, &mut self.requests, &folder_path);
+        if requests.iter().any(|r| r.name == leaf) {
+            bail!("a request already exists at \"{path}\"");
+        }
+        request.name = leaf.to_string();
+        requests.push(request);
+        Ok(())
+    }
+
+    /// Remove the request at `path`. Returns `true` if one was removed.
+    pub fn remove_request(&mut self, path: &str) -> bool {
+        let (folder_path, leaf) = split_request_path(path);
+        let Some((_, requests)) = navigate_existing(&mut self.folders, &mut self.requests, &folder_path) else {
+            return false;
+        };
+        let before = requests.len();
+        requests.retain(|r| r.name != leaf);
+        requests.len() != before
+    }
+
+    /// Create a folder at `path` (and any missing ancestor folders).
+    /// Idempotent: a no-op, not an error, if the exact folder already exists.
+    pub fn add_folder(&mut self, path: &str) {
+        let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+        navigate_create(&mut self.folders, &mut self.requests, &segments);
+    }
+
+    /// Remove the folder at `path` and everything inside it. Errors if the
+    /// folder is non-empty and `force` is false. Returns `true` if a folder
+    /// was removed, `false` if `path` didn't name an existing folder.
+    pub fn remove_folder(&mut self, path: &str, force: bool) -> Result<bool> {
+        let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+        let Some((parent_name, ancestors)) = segments.split_last() else {
+            return Ok(false);
+        };
+        let Some((folders, _)) = navigate_existing(&mut self.folders, &mut self.requests, ancestors) else {
+            return Ok(false);
+        };
+        let Some(idx) = folders.iter().position(|f| f.name == *parent_name) else {
+            return Ok(false);
+        };
+        if !force && (!folders[idx].folders.is_empty() || !folders[idx].requests.is_empty()) {
+            bail!("folder \"{path}\" is not empty (pass force to delete it and everything inside)");
+        }
+        folders.remove(idx);
+        Ok(true)
     }
 }
 

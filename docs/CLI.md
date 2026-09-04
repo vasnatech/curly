@@ -355,7 +355,24 @@ Errors are printed to stderr with an `Error:` prefix.
 
 ## 6. Saved Requests, Collections, and Environments
 
-Beyond one-shot mode, `curly` can save requests into named **collections**, parameterize them with `{{variable}}` tokens, and resolve those against named **environments** — all stored as plain JSON under your user data directory (`~/.local/share/curly` on Linux, `~/Library/Application Support/curly` on macOS, `%APPDATA%\curly` on Windows), so `curly env list`/`curly collections list` etc. work identically regardless of which project directory you're in.
+Beyond one-shot mode, `curly` can save requests into named **collections**, parameterize them with `{{variable}}` tokens, and resolve those against named **environments** — all stored as plain JSON files (see [DESIGN.md](DESIGN.md) §4 for the exact layout).
+
+### Where the data lives
+
+By default, that's a single OS-wide location shared across every project: `~/.local/share/curly` on Linux, `~/Library/Application Support/curly` on macOS, `%APPDATA%\curly` on Windows. For a collection tied to one specific project (an API you're building, say) you usually want it to live *in that project's repo* instead, so it's shared with anyone who clones it. Three ways to point `curly` elsewhere, checked in this order:
+
+1. **`--data-dir <path>`** — an explicit flag on any command, highest priority.
+2. **`CURLY_DATA_DIR`** environment variable.
+3. **`curly init`** — run once inside a project directory, creates `./.curly/` there (the same idea as `git init` creating `./.git/`). Every `curly` command run from that directory *or any subdirectory of it* then auto-detects and uses `./.curly` automatically — no flag needed, the same way `git` finds `.git` from anywhere inside a repo. `init` also drops a `.curly/.gitignore` containing `history/`, so collections/environments get committed with the project while personal request history (which can carry response body content) doesn't, by default. Running `init` again when `.curly/` already exists is a no-op ("already initialized"), not an error.
+
+If none of the three apply, it falls back to the OS-wide default.
+
+```sh
+cd my-project
+curly init                                    # creates ./.curly, commit it
+curly collections create "My API"             # lands in ./.curly, not ~/.local/share/curly
+curly --data-dir /tmp/scratch env list         # one-off override, ignores ./.curly entirely
+```
 
 ### Environments — `curly env`
 

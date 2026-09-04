@@ -150,7 +150,18 @@ alias curly=./target/release/curly   # or use cargo run -- ... directly
 | 12.3 | `curly history --limit 1` | Only the most recent entry. |
 | 12.4 | `curly -H "Authorization: Bearer sekrit" https://httpbin.org/get`, then inspect `$XDG_DATA_HOME/curly/history/*.jsonl` directly | The stored `request_headers` entry for `Authorization` reads `"***redacted***"`, not the real token — confirms NFR-4 redaction independent of what `curly history`'s own summary view shows (it doesn't print headers at all). |
 
-## 13. Cross-platform sanity (when releasing)
+## 13. Project-local storage — `curly init`, `--data-dir`
+
+| # | Steps | Expected |
+|---|---|---|
+| 13.1 | `mkdir -p /tmp/proj/backend/src/main && cd /tmp/proj/backend && curly init` | "initialized curly project at /tmp/proj/backend/.curly"; `.curly/.gitignore` exists containing `history/`. |
+| 13.2 | Run `curly init` again in the same directory | "curly project already initialized at ..." — idempotent, not an error. |
+| 13.3 | `cd /tmp/proj/backend/src/main && curly env set dev X=1` (three levels below where `.curly` was created) | Succeeds; `/tmp/proj/backend/.curly/environments/dev.json` is what got written — confirms auto-detection walks *up* from the current directory, not just checks it. |
+| 13.4 | From anywhere outside `/tmp/proj`, `curly --data-dir /tmp/other env list` | Uses `/tmp/other`, not the OS default and not any `.curly` that happens to be an ancestor of the current directory — `--data-dir` wins outright. |
+| 13.5 | `CURLY_DATA_DIR=/tmp/other2 curly env list` (run from inside `/tmp/proj/backend`, which has its own `.curly`) | Uses `/tmp/other2` — the env var beats auto-detection, even though a `.curly` is sitting right there. |
+| 13.6 | From a directory with no `.curly` anywhere in its ancestry and no `--data-dir`/`CURLY_DATA_DIR` set, `curly env list` | Falls back to the OS default (`~/.local/share/curly` on Linux) — unchanged pre-M2 behavior. |
+
+## 14. Cross-platform sanity (when releasing)
 
 | # | Steps | Expected |
 |---|---|---|
@@ -158,7 +169,7 @@ alias curly=./target/release/curly   # or use cargo run -- ... directly
 | 13.2 | Run scenario 1.1 and 4.1 on each OS | Same output shape on all three (path separators in `-o`/`--data-binary`/`--cacert` examples are the main thing to sanity-check on Windows). |
 | 13.3 | Run scenario 10.6 (inspect the collection JSON file) on each OS | Confirms the data directory resolves correctly per-OS (`~/.local/share/curly`, `~/Library/Application Support/curly`, `%APPDATA%\curly`). |
 
-## 14. Regression checklist for new flags/subcommands
+## 15. Regression checklist for new flags/subcommands
 
 When adding a new flag or subcommand, add at minimum:
 - A unit test covering the pure parsing/building logic — `crates/curly-cli/src/one_shot.rs`, `args.rs`, or `commands/*.rs`'s `#[cfg(test)] mod tests` depending on where the logic lives, plus `crates/curly-core/tests/` for anything storage- or substitution-related.

@@ -45,7 +45,9 @@ Revisit if GUI dependencies meaningfully bloat the CLI-only use case (e.g., CI e
 
 ## 4. Data Model & Storage Layout
 
-Root data directory (`dirs::data_dir()` — e.g. `~/.local/share/curly` on Linux, `~/Library/Application Support/curly` on macOS, `%APPDATA%\curly` on Windows):
+**Root directory resolution** (`Storage::resolve`, precedence order): an explicit `--data-dir` flag → `CURLY_DATA_DIR` env var → an auto-detected `./.curly` walking up from the current directory (created by `curly init`, discovered the way git finds `.git` from any subdirectory) → the OS default below. This lets a collection live inside a project's own repo (committed, shared with anyone who clones it) instead of only in the OS-wide default — added after M2 shipped with only the OS-wide default, once dogfooding curly against a real project (this repo's own `health-record` backend) made the gap obvious. `curly init` also writes a `.curly/.gitignore` containing `history/`, since history can carry response body content that shouldn't default to being committed.
+
+OS default (`dirs::data_dir()` — e.g. `~/.local/share/curly` on Linux, `~/Library/Application Support/curly` on macOS, `%APPDATA%\curly` on Windows):
 
 ```
 curly/
@@ -148,7 +150,7 @@ Single window, `egui` immediate-mode layout:
    - FR-4 (variables/environments, `{{var}}` substitution, global + per-environment scope): done via `curly-core::substitution` + `curly env`. Deliberate deviation from Postman: substitution errors on any undefined variable (naming all of them) rather than silently leaving `{{var}}` in place — see substitution.rs's module doc for rationale.
    - FR-5 (named, ordered collections of saved requests, folders/nesting): done except folder nesting — collections are a flat, ordered list for M2 (deferred until the GUI needs the tree view; `Folder`/`RequestRef` from the original DESIGN.md sketch aren't implemented).
    - FR-6 (history, browsable): done via `curly history`. Not done: re-running from history, viewing one entry's full detail (only the summary list exists).
-   - FR-8 (local plain-file persistence): done, but the on-disk layout deviates from this doc's original §4 sketch — see storage.rs's module doc: one `collections/<slug>.json` file per collection with requests embedded inline, instead of `collection.json` + a `requests/<id>.json` per request. Simpler to implement correctly, still git-diffable as a whole, still satisfies NFR-5.
+   - FR-8 (local plain-file persistence): done, but the on-disk layout deviates from this doc's original §4 sketch — see storage.rs's module doc: one `collections/<slug>.json` file per collection with requests embedded inline, instead of `collection.json` + a `requests/<id>.json` per request. Simpler to implement correctly, still git-diffable as a whole, still satisfies NFR-5. **Post-M2 addition**: `curly init` + `--data-dir`/`CURLY_DATA_DIR` for project-local storage (§4) — M2 as originally shipped only had the OS-wide default.
    - FR-12 (`curly run <collection>/<request-name> --env --var`): done.
    - FR-13 (collection/environment management subcommands): done for list/create-or-set/delete/show; `import`/`export` subcommands from this doc's §5 CLI sketch are M3's job (Postman import) and not yet implemented. No `$EDITOR`-based editing — editing a saved request is currently remove-request + add-request again.
    - NFR-4 (secrets not logged in plaintext): `env set --secret` masks values in `env show`; history entries redact `Authorization`/`X-Api-Key`/`Cookie` header values. Not done: OS-keychain storage (`--secret` values are still plain JSON on disk) — deferred to M5 per this doc's tech-choices table.

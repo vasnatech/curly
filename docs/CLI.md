@@ -395,6 +395,7 @@ curly env delete dev
 - `curly env set <name> KEY=VALUE [--secret]` — create the environment if it doesn't exist yet, then set (or overwrite) one variable. `--secret` masks it in `show` — it's still stored as plain JSON on disk, though, so treat the whole storage directory as sensitive if you keep real credentials in it (there's no OS-keychain integration yet, see DESIGN.md §2).
 - `curly env unset <name> KEY` — remove one variable.
 - `curly env delete <name>` — delete the environment entirely.
+- `curly env import-postman <path> [--as <name>]` — import a Postman Environment *or* Globals export (same file shape; curly tells them apart automatically). See **Importing from Postman or curl** below.
 
 ### Collections — `curly collections`
 
@@ -417,6 +418,43 @@ curly collections delete "My API"
 - `curly collections remove-request <collection> <request-path>` — same path syntax as `add-request`. Removing a request doesn't remove its (possibly now-empty) parent folder — use `remove-folder` for that.
 - `curly collections add-folder <collection> <folder-path>` — create a folder (and any missing parent folders) without adding a request to it yet, e.g. to set up structure ahead of time. Idempotent: running it again for a folder that already exists is a no-op, not an error.
 - `curly collections remove-folder <collection> <folder-path> [--force]` — remove a folder. Errors if it still contains requests or sub-folders unless `--force` is given, which deletes everything inside it too.
+- `curly collections import postman <collection> <path>` / `curly collections import curl <collection> <request-path> [command]` — see **Importing from Postman or curl** below.
+
+### Importing from Postman or curl
+
+Postman actually has three distinct export file shapes, not one — worth knowing since curly imports them differently:
+
+1. **Collection Format v2.1** — the file you get from "Export" on a collection. `curly collections import postman <collection> <path>`.
+2. **Environment export** — a separate file per environment (Postman calls this "variables"). `curly env import-postman <path>`.
+3. **Globals export** — same shape as an environment export, distinguished by an internal `_postman_variable_scope: "globals"` field. Also `curly env import-postman <path>` — curly detects the difference and, unless you pass `--as`, names the imported environment `global` (curly's own always-merged-in base scope, so a Postman "Globals" import behaves the same way it did in Postman).
+
+```sh
+curly collections import postman "My API" ./My-API.postman_collection.json
+curly env import-postman ./Dev.postman_environment.json
+curly env import-postman ./globals.postman_globals.json          # → environment "global"
+curly env import-postman ./Dev.postman_environment.json --as local  # override the name
+```
+
+Postman's `{{variable}}` syntax is identical to curly's, so URLs/headers/bodies import verbatim — nothing to translate. Both `collections import postman` and `env import-postman` refuse to overwrite an existing collection/environment of that name (delete it first if you want to re-import). A few things Postman collections can express that don't come across:
+
+- **Pre-request/test scripts** (Postman's JS-based automation) are dropped — there's no reliable way to translate arbitrary JavaScript into curly's declarative `--extract-*` rules. Add extraction rules by hand afterward (`collections add-request` again, or hand-edit the JSON) if a request needs them.
+- Only **Bearer** and **Basic** auth import (matching curly's own auth support) — API key/OAuth2/digest auth on a Postman request is dropped.
+- Auth/variables **inherited** from a folder or the collection root aren't resolved — only auth set directly on each request imports.
+- **GraphQL-mode** bodies are dropped (curly has no GraphQL concept).
+- Disabled headers/fields/variables in the Postman export are simply not imported (rather than imported-but-disabled, since curly has no such state).
+
+**curl command import** — paste a curl command (e.g. from a browser's "Copy as cURL", a doc, or a script) as a saved request instead of retyping it as `add-request` flags:
+
+```sh
+curly collections import curl "My API" "Auth/login" \
+  "curl 'https://api.example.com/login' -H 'Content-Type: application/json' -d '{\"user\":\"a\"}'"
+
+# or, for a multi-line paste (what "Copy as cURL" usually gives you) — pipe it in instead of
+# fighting your shell's quoting:
+pbpaste | curly collections import curl "My API" "Auth/login"
+```
+
+Recognizes the common flags (`-X`, `-H`, `-d`/`--data`/`--data-raw`/`--data-binary`, `-u`, `-F`, `--url`) — full curl flag coverage is intentionally out of scope, matching DESIGN.md's tech-choices table. `-d`/`--data-binary` honor a leading `@` the same way curly's own `--data-binary` one-shot flag does (reads from that file instead of using the text literally).
 
 ### Extracting variables from a response
 
@@ -484,7 +522,7 @@ Each line shows timestamp, method, status, URL, and elapsed time. Recorded entri
 These are on the roadmap (see [DESIGN.md](DESIGN.md) §9) but don't exist in the CLI yet — using them will just fail as an unrecognized flag or bare argument for now:
 
 - OAuth2 authorization-code/client-credentials auth helpers
-- Importing curl commands or Postman collections; exporting collections in Postman's format
+- Exporting collections/environments in Postman's format (curly's own JSON is the only export format)
 - Re-running or viewing the full detail of a single history entry (only the summary list exists)
 - Editing a saved request in place (currently: remove-request, then add-request again)
 - Colorized output when connected to a TTY

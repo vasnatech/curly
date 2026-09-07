@@ -173,35 +173,80 @@ alias curly=./target/release/curly   # or use cargo run -- ... directly
 | 12.11 | `curly collections add-request "Test" x "https://httpbin.org/get" --extract-secret NOPE` (no matching `--extract-body/--extract-header/--extract-template`) | Fails immediately with "no --extract-body/--extract-header/--extract-template above defines a variable named \"NOPE\"" — before saving anything. |
 | 12.12 | Inspect `$XDG_DATA_HOME/curly/session/global.json` directly after 12.3 | Same shape as an environment file (`name`, `variables: [{key, value, secret}]`) — confirms sessions reuse the Environment format. |
 
-## 13. History — `curly history`
+## 13. Import — Postman and curl
+
+Fixture files, create once at the top of this section:
+
+```sh
+cat > /tmp/sample-collection.json <<'EOF'
+{
+  "info": { "name": "Sample API" },
+  "item": [
+    { "name": "login", "request": { "method": "POST", "header": [{"key":"Content-Type","value":"application/json"}], "body": {"mode":"raw","raw":"{\"email\":\"{{EMAIL}}\"}"}, "url": "{{BASE_URL}}/post" } },
+    { "name": "Users", "item": [
+        { "name": "get-me", "request": { "method": "GET", "url": "{{BASE_URL}}/get", "auth": {"type":"bearer","bearer":[{"key":"token","value":"{{TOKEN}}"}]} } }
+    ]}
+  ]
+}
+EOF
+cat > /tmp/sample-env.json <<'EOF'
+{ "name": "Dev", "values": [
+    {"key":"BASE_URL","value":"https://httpbin.org","type":"default","enabled":true},
+    {"key":"TOKEN","value":"abc123","type":"secret","enabled":true},
+    {"key":"SKIP_ME","value":"x","type":"default","enabled":false}
+]}
+EOF
+cat > /tmp/sample-globals.json <<'EOF'
+{ "name": "Globals", "values": [{"key":"API_VERSION","value":"v2","type":"default","enabled":true}], "_postman_variable_scope": "globals" }
+EOF
+```
 
 | # | Steps | Expected |
 |---|---|---|
-| 13.1 | `curly history` (clean state) | "no history yet" |
-| 13.2 | `curly https://httpbin.org/get`, then `curly -X POST -d '{}' -H "Content-Type: application/json" https://httpbin.org/post`, then `curly history` | Both appear, most recent (POST) first, with correct method/status/URL/elapsed_ms. |
-| 13.3 | `curly history --limit 1` | Only the most recent entry. |
-| 13.4 | `curly -H "Authorization: Bearer sekrit" https://httpbin.org/get`, then inspect `$XDG_DATA_HOME/curly/history/*.jsonl` directly | The stored `request_headers` entry for `Authorization` reads `"***redacted***"`, not the real token — confirms NFR-4 redaction independent of what `curly history`'s own summary view shows (it doesn't print headers at all). |
+| 13.1 | `curly collections import postman "Sample API" /tmp/sample-collection.json` | "imported 2 request(s) into collection \"Sample API\"". |
+| 13.2 | `curly collections show "Sample API"` | Tree shows `POST login` at top level and `Users/` containing `GET get-me` — nested folders imported correctly. |
+| 13.3 | `curly run "Sample API/login" --env Dev` (after 13.4's env import) | Resolves `{{BASE_URL}}`/`{{EMAIL}}` — succeeds against httpbin.org (note: `{{EMAIL}}` isn't in the sample env, so this actually errors with "undefined variable(s): EMAIL" unless you `env set Dev EMAIL=...` first — confirms imported `{{variable}}` tokens behave exactly like hand-authored ones). |
+| 13.4 | `curly env import-postman /tmp/sample-env.json` then `curly env show Dev` | "imported 2 variable(s)" (not 3 — `SKIP_ME` is disabled and dropped); `TOKEN` shows as `***` (imported as secret from `"type":"secret"`). |
+| 13.5 | `curly env import-postman /tmp/sample-globals.json` then `curly env list` | Imports as environment **`global`**, not "Globals" — confirms `_postman_variable_scope: "globals"` auto-maps to curly's always-merged-in scope. |
+| 13.6 | `curly env import-postman /tmp/sample-env.json --as staging` | Imports as `staging` instead of `Dev` — `--as` overrides the file's own name. |
+| 13.7 | `curly collections import postman "Sample API" /tmp/sample-collection.json` again | Fails with "collection \"Sample API\" already exists (delete it first to re-import)". |
+| 13.8 | `curly env import-postman /tmp/sample-env.json` again (still named `Dev`) | Fails with "environment \"Dev\" already exists (delete it first to re-import)". |
+| 13.9 | `curly collections import postman "X" /tmp/does-not-exist.json` | Fails with a clear file-not-found error, not a panic. |
+| 13.10 | `curly collections import curl "Sample API" "Users/list" "curl 'https://httpbin.org/get?x=1' -H 'Accept: application/json'"` then `curly run "Sample API/Users/list"` | Saves and runs correctly — `args.x == "1"` in the response. |
+| 13.11 | `echo "curl 'https://httpbin.org/get?via=stdin'" \| curly collections import curl "Sample API" "via-stdin"` (no command argument — reads stdin) then `curly run "Sample API/via-stdin"` | `args.via == "stdin"` — confirms the stdin path works, important for pasting real multi-line "Copy as cURL" exports. |
+| 13.12 | `curly collections import curl "Sample API" bad-user "curl -u alice https://httpbin.org/get"` (no colon in `-u` value) | Fails with "invalid -u/--user value (expected \"user:password\")". |
+| 13.13 | `curly collections import curl "Sample API" both-bodies "curl -d 'a' -F 'b=c' https://httpbin.org/post"` | Fails with "only one of -d/--data* or -F/--form may be used per curl command". |
+| 13.14 | `curly collections import curl "Sample API" via-timeout "curl --connect-timeout 5 https://httpbin.org/get"` then inspect the saved request's URL | URL is `https://httpbin.org/get`, not `5` — confirms an unrecognized flag's own value isn't mistaken for the URL. |
 
-## 14. Project-local storage — `curly init`, `--data-dir`
+## 14. History — `curly history`
 
 | # | Steps | Expected |
 |---|---|---|
-| 14.1 | `mkdir -p /tmp/proj/backend/src/main && cd /tmp/proj/backend && curly init` | "initialized curly project at /tmp/proj/backend/.curly"; `.curly/.gitignore` exists containing `environments/`, `session/`, and `history/` (only `collections/` is meant to be committed). |
-| 14.2 | Run `curly init` again in the same directory | "curly project already initialized at ..." — idempotent, not an error. |
-| 14.3 | `cd /tmp/proj/backend/src/main && curly env set dev X=1` (three levels below where `.curly` was created) | Succeeds; `/tmp/proj/backend/.curly/environments/dev.json` is what got written — confirms auto-detection walks *up* from the current directory, not just checks it. |
-| 14.4 | From anywhere outside `/tmp/proj`, `curly --data-dir /tmp/other env list` | Uses `/tmp/other`, not the OS default and not any `.curly` that happens to be an ancestor of the current directory — `--data-dir` wins outright. |
-| 14.5 | `CURLY_DATA_DIR=/tmp/other2 curly env list` (run from inside `/tmp/proj/backend`, which has its own `.curly`) | Uses `/tmp/other2` — the env var beats auto-detection, even though a `.curly` is sitting right there. |
-| 14.6 | From a directory with no `.curly` anywhere in its ancestry and no `--data-dir`/`CURLY_DATA_DIR` set, `curly env list` | Falls back to the OS default (`~/.local/share/curly` on Linux) — unchanged pre-M2 behavior. |
+| 14.1 | `curly history` (clean state) | "no history yet" |
+| 14.2 | `curly https://httpbin.org/get`, then `curly -X POST -d '{}' -H "Content-Type: application/json" https://httpbin.org/post`, then `curly history` | Both appear, most recent (POST) first, with correct method/status/URL/elapsed_ms. |
+| 14.3 | `curly history --limit 1` | Only the most recent entry. |
+| 14.4 | `curly -H "Authorization: Bearer sekrit" https://httpbin.org/get`, then inspect `$XDG_DATA_HOME/curly/history/*.jsonl` directly | The stored `request_headers` entry for `Authorization` reads `"***redacted***"`, not the real token — confirms NFR-4 redaction independent of what `curly history`'s own summary view shows (it doesn't print headers at all). |
 
-## 15. Cross-platform sanity (when releasing)
+## 15. Project-local storage — `curly init`, `--data-dir`
 
 | # | Steps | Expected |
 |---|---|---|
-| 15.1 | `cargo build --release` on Linux, macOS, and Windows | Each produces a working binary with no OS-specific build errors. |
-| 15.2 | Run scenario 1.1 and 4.1 on each OS | Same output shape on all three (path separators in `-o`/`--data-binary`/`--cacert` examples are the main thing to sanity-check on Windows). |
-| 15.3 | Run scenario 10.6 (inspect the collection JSON file) on each OS | Confirms the data directory resolves correctly per-OS (`~/.local/share/curly`, `~/Library/Application Support/curly`, `%APPDATA%\curly`). |
+| 15.1 | `mkdir -p /tmp/proj/backend/src/main && cd /tmp/proj/backend && curly init` | "initialized curly project at /tmp/proj/backend/.curly"; `.curly/.gitignore` exists containing `environments/`, `session/`, and `history/` (only `collections/` is meant to be committed). |
+| 15.2 | Run `curly init` again in the same directory | "curly project already initialized at ..." — idempotent, not an error. |
+| 15.3 | `cd /tmp/proj/backend/src/main && curly env set dev X=1` (three levels below where `.curly` was created) | Succeeds; `/tmp/proj/backend/.curly/environments/dev.json` is what got written — confirms auto-detection walks *up* from the current directory, not just checks it. |
+| 15.4 | From anywhere outside `/tmp/proj`, `curly --data-dir /tmp/other env list` | Uses `/tmp/other`, not the OS default and not any `.curly` that happens to be an ancestor of the current directory — `--data-dir` wins outright. |
+| 15.5 | `CURLY_DATA_DIR=/tmp/other2 curly env list` (run from inside `/tmp/proj/backend`, which has its own `.curly`) | Uses `/tmp/other2` — the env var beats auto-detection, even though a `.curly` is sitting right there. |
+| 15.6 | From a directory with no `.curly` anywhere in its ancestry and no `--data-dir`/`CURLY_DATA_DIR` set, `curly env list` | Falls back to the OS default (`~/.local/share/curly` on Linux) — unchanged pre-M2 behavior. |
 
-## 16. Regression checklist for new flags/subcommands
+## 16. Cross-platform sanity (when releasing)
+
+| # | Steps | Expected |
+|---|---|---|
+| 16.1 | `cargo build --release` on Linux, macOS, and Windows | Each produces a working binary with no OS-specific build errors. |
+| 16.2 | Run scenario 1.1 and 4.1 on each OS | Same output shape on all three (path separators in `-o`/`--data-binary`/`--cacert` examples are the main thing to sanity-check on Windows). |
+| 16.3 | Run scenario 10.6 (inspect the collection JSON file) on each OS | Confirms the data directory resolves correctly per-OS (`~/.local/share/curly`, `~/Library/Application Support/curly`, `%APPDATA%\curly`). |
+
+## 17. Regression checklist for new flags/subcommands
 
 When adding a new flag or subcommand, add at minimum:
 - A unit test covering the pure parsing/building logic — `crates/curly-cli/src/one_shot.rs`, `args.rs`, or `commands/*.rs`'s `#[cfg(test)] mod tests` depending on where the logic lives, plus `crates/curly-core/tests/` for anything storage- or substitution-related.

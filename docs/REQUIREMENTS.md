@@ -34,7 +34,7 @@ Curly is a REST API testing tool, positioned as a lighter, self-contained altern
 - FR-4: Variables and environments: named key/value sets, `{{variable}}` substitution in URL/headers/body, an active environment selectable per request/run, a global scope plus per-environment overrides.
 - FR-5: Collections: named, ordered groups of saved requests, with folders/nesting.
 - FR-6: Request history: every sent request (and its response) recorded locally, browsable and re-runnable.
-- FR-7: Import: at minimum, Postman Collection v2.1 JSON and curl command strings. Export: Curly's own format at minimum; Postman-compatible export as a stretch goal.
+- FR-7: Import (done, see DESIGN.md M3): Postman Collection v2.1 JSON, Postman Environment/Globals JSON, and curl command strings. Export: Curly's own format at minimum (done — it's just the collection/environment JSON); Postman-compatible export remains a stretch goal, not implemented.
 - FR-8: Local persistence in plain files under a user config/data directory (see Design doc) — no external database server required.
 - FR-9: Response handling: status, headers, body, timing (DNS/connect/TLS/TTFB/total), size; pretty-print JSON/XML/HTML; raw view toggle.
 - FR-10: Post-response variable extraction (done, declaratively — see DESIGN.md §4/§9): pull a value from a response body (JSON path) or header, or compute one from a template, and persist it as a session variable for later requests. No scripting language — "none in v1" won out over embedding Rhai, since a declarative rule set covers the actual use case (chaining an auth token into the next request). Pre-request scripts remain out of scope.

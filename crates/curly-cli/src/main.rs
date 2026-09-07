@@ -45,6 +45,12 @@ enum Command {
     },
     /// Browse request history
     History(commands::history::HistoryArgs),
+    /// Inspect or clear session variables extracted by `run` (see collections
+    /// add-request's --extract-* flags)
+    Session {
+        #[command(subcommand)]
+        action: commands::session::SessionCommand,
+    },
 }
 
 #[tokio::main]
@@ -65,6 +71,7 @@ async fn main() -> Result<()> {
         Some(Command::Env { action }) => commands::env::run(action, &storage),
         Some(Command::Collections { action }) => commands::collections::run(action, &storage),
         Some(Command::History(args)) => commands::history::run(args, &storage),
+        Some(Command::Session { action }) => commands::session::run(action, &storage),
         None => one_shot::run(&cli.one_shot, &storage).await,
     }
 }

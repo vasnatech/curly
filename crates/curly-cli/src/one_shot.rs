@@ -165,7 +165,9 @@ fn build_request(args: &OneShotArgs) -> Result<Request> {
     let url = args
         .url
         .as_deref()
-        .ok_or_else(|| anyhow!("a URL is required (or use a subcommand: env, collections, run, history)"))?;
+        .ok_or_else(|| {
+            anyhow!("a URL is required (or use a subcommand: init, env, collections, run, history, session)")
+        })?;
 
     let body = build_body(args)?;
     let auth = build_auth(args)?;
@@ -202,7 +204,7 @@ fn build_request(args: &OneShotArgs) -> Result<Request> {
 
 pub async fn run(args: &OneShotArgs, storage: &curly_core::storage::Storage) -> Result<()> {
     let request = build_request(args)?;
-    execute::run(&request, &args.connection, &args.output, storage).await
+    execute::run(&request, &args.connection, &args.output, storage, |_| Ok(())).await
 }
 
 #[cfg(test)]

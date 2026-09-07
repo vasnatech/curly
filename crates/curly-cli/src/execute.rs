@@ -6,17 +6,30 @@
 use std::fs;
 
 use anyhow::{bail, Context, Result};
+use curly_core::exec::ResponseSummary;
 use curly_core::model::Request;
 use curly_core::storage::{HistoryEntry, Storage};
 
 use crate::args::{build_client, render_body, ConnectionArgs, OutputArgs};
 
-pub async fn run(
+/// `after_send` runs once the response has been fully printed/written —
+/// `curly run` uses it to apply the saved request's extraction rules (see
+/// `commands::run`); one-shot mode has no rules, so it passes a no-op. Kept
+/// as a generic hook rather than baking extraction into this function so
+/// execute.rs stays agnostic of what "extraction" even is. Deliberately
+/// runs *after* output is shown, not before: if an extraction rule fails
+/// (bad path, missing header), you still want to see the response you're
+/// debugging that failure against, not have it swallowed by the error.
+pub async fn run<F>(
     request: &Request,
     connection: &ConnectionArgs,
     output: &OutputArgs,
     storage: &Storage,
-) -> Result<()> {
+    after_send: F,
+) -> Result<()>
+where
+    F: FnOnce(&ResponseSummary) -> Result<()>,
+{
     if output.verbose {
         eprintln!("> {} {}", request.method, request.url);
         for (name, value) in &request.headers {
@@ -52,6 +65,8 @@ pub async fn run(
         }
         None => println!("{}", rendered),
     }
+
+    after_send(&response)?;
 
     if output.fail && response.status >= 400 {
         bail!("server returned HTTP {}", response.status);

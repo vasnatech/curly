@@ -8,6 +8,7 @@ use std::path::PathBuf;
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Subcommand};
+use curly_core::extraction::Extraction;
 use curly_core::storage::{
     Collection, Folder, KvPair, SavedAuth, SavedBody, SavedMultipartField, SavedRequest, Storage,
 };
@@ -96,6 +97,23 @@ pub struct AddRequestArgs {
     /// Bearer token
     #[arg(long = "bearer")]
     pub bearer: Option<String>,
+
+    /// Extract a variable from the JSON response body: "NAME=path.in.body" (repeatable)
+    #[arg(long = "extract-body")]
+    pub extract_body: Vec<String>,
+
+    /// Extract a variable from a response header: "NAME=Header-Name" (repeatable)
+    #[arg(long = "extract-header")]
+    pub extract_header: Vec<String>,
+
+    /// Compute a variable from a template referencing other variables: "NAME=Bearer {{TOKEN}}" (repeatable)
+    #[arg(long = "extract-template")]
+    pub extract_template: Vec<String>,
+
+    /// Mask an extracted variable's value in `session show` (name must match one defined by
+    /// --extract-body/--extract-header/--extract-template above; repeatable)
+    #[arg(long = "extract-secret")]
+    pub extract_secret: Vec<String>,
 }
 
 fn parse_saved_form_field(raw: &str) -> Result<SavedMultipartField> {
@@ -172,9 +190,54 @@ fn build_saved_auth(args: &AddRequestArgs) -> Result<Option<SavedAuth>> {
     }
 }
 
+fn build_extractions(args: &AddRequestArgs) -> Result<Vec<Extraction>> {
+    let mut rules = Vec::new();
+
+    for raw in &args.extract_body {
+        let (name, path) = parse_kv(raw, "--extract-body")?;
+        rules.push(Extraction::Body {
+            name,
+            path,
+            secret: false,
+        });
+    }
+    for raw in &args.extract_header {
+        let (name, header) = parse_kv(raw, "--extract-header")?;
+        rules.push(Extraction::Header {
+            name,
+            header,
+            secret: false,
+        });
+    }
+    for raw in &args.extract_template {
+        let (name, template) = parse_kv(raw, "--extract-template")?;
+        rules.push(Extraction::Template {
+            name,
+            template,
+            secret: false,
+        });
+    }
+
+    for secret_name in &args.extract_secret {
+        let rule = rules
+            .iter_mut()
+            .find(|r| r.name() == secret_name)
+            .ok_or_else(|| {
+                anyhow!(
+                    "--extract-secret {secret_name}: no --extract-body/--extract-header/\
+                     --extract-template above defines a variable named \"{secret_name}\""
+                )
+            })?;
+        rule.set_secret(true);
+    }
+
+    Ok(rules)
+}
+
 fn build_saved_request(name: &str, args: &AddRequestArgs) -> Result<SavedRequest> {
     let body = build_saved_body(args)?;
     let auth = build_saved_auth(args)?;
+    let extract = build_extractions(args)?;
 
     let method = match &args.method {
         Some(m) => Method::from_bytes(m.to_uppercase().as_bytes())
@@ -195,6 +258,7 @@ fn build_saved_request(name: &str, args: &AddRequestArgs) -> Result<SavedRequest
     }
     saved.body = body;
     saved.auth = auth;
+    saved.extract = extract;
 
     Ok(saved)
 }
@@ -298,6 +362,11 @@ fn print_tree(folders: &[Folder], requests: &[SavedRequest], depth: usize) {
         print_tree(&folder.folders, &folder.requests, depth + 1);
     }
     for r in requests {
-        println!("{indent}{:<7} {}", r.method, r.name);
+        if r.extract.is_empty() {
+            println!("{indent}{:<7} {}", r.method, r.name);
+        } else {
+            let names: Vec<&str> = r.extract.iter().map(|e| e.name()).collect();
+            println!("{indent}{:<7} {}  [extracts: {}]", r.method, r.name, names.join(", "));
+        }
     }
 }

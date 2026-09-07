@@ -1,7 +1,11 @@
 //! `curly env` — manage environments (named {{variable}} sets, FR-4/FR-13).
 
-use anyhow::{bail, Result};
+use std::fs;
+use std::path::PathBuf;
+
+use anyhow::{bail, Context, Result};
 use clap::Subcommand;
+use curly_core::import::postman;
 use curly_core::storage::{Environment, Storage};
 
 use crate::one_shot::parse_kv;
@@ -25,6 +29,15 @@ pub enum EnvCommand {
     Unset { name: String, key: String },
     /// Delete an environment and all its variables
     Delete { name: String },
+    /// Import a Postman Environment or Globals export (FR-7 / M3)
+    ImportPostman {
+        /// Path to the exported environment/globals JSON file
+        path: PathBuf,
+        /// Name for the imported environment (defaults to the file's own name,
+        /// or "global" for a Globals export — curly's own always-merged-in scope)
+        #[arg(long = "as")]
+        name: Option<String>,
+    },
 }
 
 pub fn run(command: EnvCommand, storage: &Storage) -> Result<()> {
@@ -79,6 +92,22 @@ pub fn run(command: EnvCommand, storage: &Storage) -> Result<()> {
         EnvCommand::Delete { name } => {
             storage.delete_environment(&name)?;
             println!("deleted environment \"{name}\"");
+        }
+
+        EnvCommand::ImportPostman { path, name } => {
+            let json = fs::read_to_string(&path)
+                .with_context(|| format!("failed to read {}", path.display()))?;
+            let env = postman::import_environment(&json, name.as_deref())?;
+            if storage.load_environment_opt(&env.name)?.is_some() {
+                bail!(
+                    "environment \"{}\" already exists (delete it first to re-import)",
+                    env.name
+                );
+            }
+            let count = env.variables.len();
+            let name = env.name.clone();
+            storage.save_environment(&env)?;
+            println!("imported {count} variable(s) into environment \"{name}\"");
         }
     }
 

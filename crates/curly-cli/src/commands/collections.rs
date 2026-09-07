@@ -4,11 +4,13 @@
 //! ...` is a matter of re-running the same flags under `collections
 //! add-request`, not learning a second flag vocabulary.
 
+use std::fs;
 use std::path::PathBuf;
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Subcommand};
 use curly_core::extraction::Extraction;
+use curly_core::import::{curl as curl_import, postman};
 use curly_core::storage::{
     Collection, Folder, KvPair, SavedAuth, SavedBody, SavedMultipartField, SavedRequest, Storage,
 };
@@ -54,6 +56,31 @@ pub enum CollectionsCommand {
         /// Required if the folder still has requests or sub-folders in it
         #[arg(long = "force")]
         force: bool,
+    },
+    /// Import requests from an external format (FR-7 / M3)
+    Import {
+        #[command(subcommand)]
+        source: ImportSource,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ImportSource {
+    /// Import a Postman Collection Format v2.1 export as a new collection
+    Postman {
+        /// Name for the imported collection (overrides the file's own "info.name")
+        collection: String,
+        /// Path to the exported collection JSON file
+        path: PathBuf,
+    },
+    /// Import a curl command as a single saved request
+    Curl {
+        collection: String,
+        /// May be nested, e.g. "Auth/login"; creates the collection/folders if needed
+        request_path: String,
+        /// The curl command as a single argument — quote it. Omit to read from stdin
+        /// (handy for pasting a multi-line "Copy as cURL" export).
+        command: Option<String>,
     },
 }
 
@@ -350,9 +377,66 @@ pub fn run(command: CollectionsCommand, storage: &Storage) -> Result<()> {
             storage.save_collection(&coll)?;
             println!("removed folder \"{folder_path}\" from collection \"{collection}\"");
         }
+
+        CollectionsCommand::Import { source } => match source {
+            ImportSource::Postman { collection, path } => {
+                if storage.load_collection_opt(&collection)?.is_some() {
+                    bail!("collection \"{collection}\" already exists (delete it first to re-import)");
+                }
+                let json = fs::read_to_string(&path)
+                    .with_context(|| format!("failed to read {}", path.display()))?;
+                let mut imported = postman::import_collection(&json)?;
+                imported.name = collection.clone();
+                let count = count_requests(&imported);
+                storage.save_collection(&imported)?;
+                println!("imported {count} request(s) into collection \"{collection}\"");
+            }
+
+            ImportSource::Curl {
+                collection,
+                request_path,
+                command,
+            } => {
+                let command_text = match command {
+                    Some(c) => c,
+                    None => {
+                        use std::io::Read;
+                        let mut buf = String::new();
+                        std::io::stdin()
+                            .read_to_string(&mut buf)
+                            .context("failed to read curl command from stdin")?;
+                        buf
+                    }
+                };
+                let leaf_name = request_path.rsplit('/').next().unwrap_or(&request_path);
+                let saved = curl_import::import_curl(leaf_name, &command_text)?;
+
+                let mut coll = storage
+                    .load_collection_opt(&collection)?
+                    .unwrap_or_else(|| Collection::new(&collection));
+                coll.add_request(&request_path, saved).with_context(|| {
+                    format!(
+                        "in collection \"{collection}\" (remove it first with collections remove-request)"
+                    )
+                })?;
+                storage.save_collection(&coll)?;
+                println!("imported \"{request_path}\" into collection \"{collection}\"");
+            }
+        },
     }
 
     Ok(())
+}
+
+fn count_requests(collection: &Collection) -> usize {
+    fn count_in(folders: &[Folder], requests: &[SavedRequest]) -> usize {
+        requests.len()
+            + folders
+                .iter()
+                .map(|f| count_in(&f.folders, &f.requests))
+                .sum::<usize>()
+    }
+    count_in(&collection.folders, &collection.requests)
 }
 
 fn print_tree(folders: &[Folder], requests: &[SavedRequest], depth: usize) {

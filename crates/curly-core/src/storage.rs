@@ -97,6 +97,11 @@ pub struct SavedRequest {
     pub body: Option<SavedBody>,
     #[serde(default)]
     pub auth: Option<SavedAuth>,
+    /// Rules for pulling variables out of this request's response — see
+    /// [`crate::extraction`]. Applied by `curly run` after a 2xx response,
+    /// written into the active session (never the environment file itself).
+    #[serde(default)]
+    pub extract: Vec<crate::extraction::Extraction>,
 }
 
 impl SavedRequest {
@@ -110,6 +115,7 @@ impl SavedRequest {
             headers: Vec::new(),
             body: None,
             auth: None,
+            extract: Vec::new(),
         }
     }
 }
@@ -529,12 +535,20 @@ impl Storage {
         self.root.join("history")
     }
 
+    fn session_dir(&self) -> PathBuf {
+        self.root.join("session")
+    }
+
     fn collection_path(&self, slug: &str) -> PathBuf {
         self.collections_dir().join(format!("{slug}.json"))
     }
 
     fn environment_path(&self, slug: &str) -> PathBuf {
         self.environments_dir().join(format!("{slug}.json"))
+    }
+
+    fn session_path(&self, slug: &str) -> PathBuf {
+        self.session_dir().join(format!("{slug}.json"))
     }
 
     pub fn list_collections(&self) -> Result<Vec<String>> {
@@ -613,6 +627,54 @@ impl Storage {
         std::fs::remove_file(&path).with_context(|| {
             format!("no environment named \"{name}\" (looked in {})", path.display())
         })
+    }
+
+    /// Load the session for `env_name` — the machine-written variable store
+    /// `curly run`'s extraction rules write into (see [`crate::extraction`]),
+    /// kept separate from the environment file itself. Unlike
+    /// [`Storage::load_environment`], a missing session isn't an error: it
+    /// just means nothing has been extracted into it yet, so this returns an
+    /// empty [`Environment`] rather than `Option`/erroring.
+    pub fn load_session(&self, env_name: &str) -> Result<Environment> {
+        let path = self.session_path(&slugify(env_name));
+        if !path.exists() {
+            return Ok(Environment::new(env_name));
+        }
+        let bytes = std::fs::read(&path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        serde_json::from_slice(&bytes)
+            .with_context(|| format!("failed to parse session file: {}", path.display()))
+    }
+
+    pub fn save_session(&self, session: &Environment) -> Result<()> {
+        let dir = self.session_dir();
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("failed to create {}", dir.display()))?;
+        let path = self.session_path(&slugify(&session.name));
+        let json = serde_json::to_string_pretty(session)?;
+        std::fs::write(&path, json)
+            .with_context(|| format!("failed to write {}", path.display()))
+    }
+
+    /// Clear the session for one environment. A no-op (not an error) if
+    /// there was nothing to clear.
+    pub fn clear_session(&self, env_name: &str) -> Result<()> {
+        let path = self.session_path(&slugify(env_name));
+        if path.exists() {
+            std::fs::remove_file(&path)
+                .with_context(|| format!("failed to remove {}", path.display()))?;
+        }
+        Ok(())
+    }
+
+    /// Clear every environment's session. A no-op if there are none.
+    pub fn clear_all_sessions(&self) -> Result<()> {
+        let dir = self.session_dir();
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir)
+                .with_context(|| format!("failed to remove {}", dir.display()))?;
+        }
+        Ok(())
     }
 
     pub fn append_history(&self, entry: &HistoryEntry) -> Result<()> {

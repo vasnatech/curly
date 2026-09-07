@@ -448,3 +448,104 @@ fn collection_without_folders_key_still_parses() {
     assert!(collection.folders.is_empty());
     assert!(collection.find_request("login").is_some());
 }
+
+#[test]
+fn load_session_missing_returns_empty_environment_not_an_error() {
+    let dir = tempdir().unwrap();
+    let storage = Storage::new(dir.path());
+    let session = storage.load_session("dev").unwrap();
+    assert_eq!(session.name, "dev");
+    assert!(session.variables.is_empty());
+}
+
+#[test]
+fn session_round_trips_through_disk() {
+    let dir = tempdir().unwrap();
+    let storage = Storage::new(dir.path());
+
+    let mut session = storage.load_session("dev").unwrap();
+    session.set("TOKEN", "abc123", true);
+    storage.save_session(&session).unwrap();
+
+    let loaded = storage.load_session("dev").unwrap();
+    assert_eq!(loaded.variables.len(), 1);
+    assert_eq!(loaded.variables[0].key, "TOKEN");
+    assert_eq!(loaded.variables[0].value, "abc123");
+    assert!(loaded.variables[0].secret);
+}
+
+#[test]
+fn session_is_independent_of_environment_of_the_same_name() {
+    let dir = tempdir().unwrap();
+    let storage = Storage::new(dir.path());
+
+    let mut env = Environment::new("dev");
+    env.set("HOST", "example.com", false);
+    storage.save_environment(&env).unwrap();
+
+    let mut session = storage.load_session("dev").unwrap();
+    session.set("TOKEN", "abc123", false);
+    storage.save_session(&session).unwrap();
+
+    // Each file only has its own variable — writing the session didn't
+    // touch environments/dev.json or vice versa.
+    let reloaded_env = storage.load_environment("dev").unwrap();
+    assert_eq!(reloaded_env.variables.len(), 1);
+    assert_eq!(reloaded_env.variables[0].key, "HOST");
+
+    let reloaded_session = storage.load_session("dev").unwrap();
+    assert_eq!(reloaded_session.variables.len(), 1);
+    assert_eq!(reloaded_session.variables[0].key, "TOKEN");
+}
+
+#[test]
+fn clear_session_removes_only_that_environments_session() {
+    let dir = tempdir().unwrap();
+    let storage = Storage::new(dir.path());
+
+    let mut dev_session = storage.load_session("dev").unwrap();
+    dev_session.set("TOKEN", "a", false);
+    storage.save_session(&dev_session).unwrap();
+
+    let mut staging_session = storage.load_session("staging").unwrap();
+    staging_session.set("TOKEN", "b", false);
+    storage.save_session(&staging_session).unwrap();
+
+    storage.clear_session("dev").unwrap();
+
+    assert!(storage.load_session("dev").unwrap().variables.is_empty());
+    assert_eq!(storage.load_session("staging").unwrap().variables.len(), 1);
+}
+
+#[test]
+fn clear_session_on_nothing_is_a_no_op() {
+    let dir = tempdir().unwrap();
+    let storage = Storage::new(dir.path());
+    assert!(storage.clear_session("dev").is_ok());
+}
+
+#[test]
+fn clear_all_sessions_removes_every_environments_session() {
+    let dir = tempdir().unwrap();
+    let storage = Storage::new(dir.path());
+
+    let mut dev_session = storage.load_session("dev").unwrap();
+    dev_session.set("TOKEN", "a", false);
+    storage.save_session(&dev_session).unwrap();
+
+    let mut staging_session = storage.load_session("staging").unwrap();
+    staging_session.set("TOKEN", "b", false);
+    storage.save_session(&staging_session).unwrap();
+
+    storage.clear_all_sessions().unwrap();
+
+    assert!(storage.load_session("dev").unwrap().variables.is_empty());
+    assert!(storage.load_session("staging").unwrap().variables.is_empty());
+}
+
+#[test]
+fn clear_all_sessions_on_nothing_is_a_no_op() {
+    let dir = tempdir().unwrap();
+    let storage = Storage::new(dir.path());
+    assert!(storage.clear_all_sessions().is_ok());
+}

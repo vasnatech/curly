@@ -37,7 +37,7 @@ Curly is a REST API testing tool, positioned as a lighter, self-contained altern
 - FR-7: Import: at minimum, Postman Collection v2.1 JSON and curl command strings. Export: Curly's own format at minimum; Postman-compatible export as a stretch goal.
 - FR-8: Local persistence in plain files under a user config/data directory (see Design doc) — no external database server required.
 - FR-9: Response handling: status, headers, body, timing (DNS/connect/TLS/TTFB/total), size; pretty-print JSON/XML/HTML; raw view toggle.
-- FR-10: Scripting hooks (stretch, v1.5+): pre-request and post-response scripts (e.g., set a variable from a response field) — exact scripting language TBD (candidates: a small Rust-embeddable language like Rhai, or none in v1).
+- FR-10: Post-response variable extraction (done, declaratively — see DESIGN.md §4/§9): pull a value from a response body (JSON path) or header, or compute one from a template, and persist it as a session variable for later requests. No scripting language — "none in v1" won out over embedding Rhai, since a declarative rule set covers the actual use case (chaining an auth token into the next request). Pre-request scripts remain out of scope.
 
 ### 5.2 CLI (`curly`)
 
@@ -78,6 +78,6 @@ Curly is a REST API testing tool, positioned as a lighter, self-contained altern
 ## 8. Open Questions
 
 - One combined binary (`curly` vs `curly gui`) vs. two separate binaries (`curly` + `curly-gui`)? Leaning combined for distribution simplicity — see Design doc §3.
-- Scripting language for pre-request/post-response hooks, and whether it's in v1 scope at all.
+- Pre-request scripts remain unaddressed (post-response is done declaratively, no scripting language — see FR-10). Revisit only if a real need surfaces that the declarative extraction rules can't cover.
 - Exact storage format: single JSON/TOML file per collection vs. SQLite. Leaning plain files for git-friendliness and NFR-5; see Design doc.
 - OAuth2 flows requiring a local redirect listener — acceptable to spin up a temporary localhost server for the CLI's interactive login too, or GUI-only?

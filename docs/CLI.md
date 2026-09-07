@@ -413,11 +413,45 @@ curly collections delete "My API"
 - `curly collections create <name>` — create an empty collection. Errors if one with that name already exists.
 - `curly collections delete <name>` — delete a collection and everything saved in it.
 - `curly collections show <name>` — print a tree of its folders and saved requests (method + name; nested requests indented under their folder).
-- `curly collections add-request <collection> <request-path> <url> [flags...]` — save a request. Creates the collection first if it doesn't exist yet. `<request-path>` is either a bare name (`login`) for a top-level request, or a `/`-separated path (`Auth/OAuth/login`) to nest it — any folders in the path that don't exist yet are created automatically, and an existing folder with the same name is reused rather than duplicated. The flags are **exactly the same body/header/auth flags as one-shot mode** (`-X`, `-H`, `-Q`, `-d`, `--data-urlencode`, `--data-binary`, `-F`, `-u`, `--bearer`) — so the easiest workflow is: get a request working with plain `curly <url> ...`, then re-run the same flags under `collections add-request <collection> <path> <url> ...` to save it. `{{variable}}` tokens are stored literally — they're not resolved until `run`. Errors if the collection already has a request at that exact path (remove it first).
+- `curly collections add-request <collection> <request-path> <url> [flags...]` — save a request. Creates the collection first if it doesn't exist yet. `<request-path>` is either a bare name (`login`) for a top-level request, or a `/`-separated path (`Auth/OAuth/login`) to nest it — any folders in the path that don't exist yet are created automatically, and an existing folder with the same name is reused rather than duplicated. The flags are **exactly the same body/header/auth flags as one-shot mode** (`-X`, `-H`, `-Q`, `-d`, `--data-urlencode`, `--data-binary`, `-F`, `-u`, `--bearer`) — so the easiest workflow is: get a request working with plain `curly <url> ...`, then re-run the same flags under `collections add-request <collection> <path> <url> ...` to save it. `{{variable}}` tokens are stored literally — they're not resolved until `run`. Errors if the collection already has a request at that exact path (remove it first). See **Extracting variables from a response** below for the `--extract-*` flags.
 - `curly collections remove-request <collection> <request-path>` — same path syntax as `add-request`. Removing a request doesn't remove its (possibly now-empty) parent folder — use `remove-folder` for that.
 - `curly collections add-folder <collection> <folder-path>` — create a folder (and any missing parent folders) without adding a request to it yet, e.g. to set up structure ahead of time. Idempotent: running it again for a folder that already exists is a no-op, not an error.
 - `curly collections remove-folder <collection> <folder-path> [--force]` — remove a folder. Errors if it still contains requests or sub-folders unless `--force` is given, which deletes everything inside it too.
-- `curly collections remove-request <collection> <request-name>` — delete one saved request from a collection.
+
+### Extracting variables from a response
+
+A saved request can pull values out of its own response and stash them as variables for later requests to use — the declarative alternative to Postman's post-response scripts (no scripting language; see DESIGN.md FR-10). Add rules when saving the request:
+
+```sh
+curly collections add-request "My API" login "{{BASE_URL}}/api/auth/login" \
+  -X POST -H "Content-Type: application/json" -d '{"email":"{{EMAIL}}","password":"{{PASSWORD}}"}' \
+  --extract-body "TOKEN=token" \
+  --extract-secret TOKEN
+```
+
+Now every `curly run "My API/login" --env dev` automatically stashes `TOKEN` — no more copying it out of the response and running `env set` by hand. Any later request whose header/URL/body uses `{{TOKEN}}` picks it up automatically, including in a completely separate `curly run` invocation (this is what makes it useful — see **Sessions** below for where it's actually stored).
+
+- `--extract-body "NAME=path.in.body"` — pull a value out of the JSON response body. `path` is a small dot/bracket syntax, not full JSONPath: `token`, `data.user.id`, `items[0].id` all work; wildcards/filters don't exist. If the extracted JSON value is a string, the variable is that string's bare content; for anything else (number, bool, object, array) it's that value's JSON text.
+- `--extract-header "NAME=Header-Name"` — pull a response header's value (case-insensitive match).
+- `--extract-template "NAME=some text with {{OTHER}}"` — compute a value purely from template substitution, no response access. Can reference variables the request ran with *or* variables extracted by an earlier `--extract-*` flag on the same request (rules apply in the order given) — e.g. `--extract-body "TOKEN=token" --extract-template "AUTH=Bearer {{TOKEN}}"` builds `AUTH` from the `TOKEN` extracted moments earlier.
+- `--extract-secret NAME` — mask that variable's value in `curly session show` (repeatable; `NAME` must match one already defined by `--extract-body`/`--extract-header`/`--extract-template` on the same command).
+
+Extraction only runs on a **2xx response** — a failed login has no token to extract, and that's an expected absence, not a bug, so non-2xx responses skip extraction silently. On a 2xx response, an unsatisfiable rule (path not found, header missing) *is* an error — but only after the response has already been printed, so you can see what you're debugging.
+
+### Sessions — where extracted variables live
+
+Extracted variables don't go into the environment file you edit by hand (`environments/dev.json`) — they go into a separate, machine-written **session**, one per environment (`session/dev.json`; `session/global.json` when `run` is called without `--env`). This keeps a token pulled while testing against `dev` from silently leaking into a `staging` run, and keeps your hand-curated environment values untouched by anything automatic.
+
+The full variable resolution order for `run`, low to high precedence: **`global` environment → `--env`'s environment → `--env`'s session → `--var` overrides.**
+
+```sh
+curly session show                  # the "global" session (no --env)
+curly session show --env dev        # the "dev" session
+curly session clear --env dev       # forget everything extracted under dev (e.g. an expired token)
+curly session clear --all           # forget every session
+```
+
+Sessions are gitignored by `curly init`, same as environments and history.
 
 ### Running a saved request — `curly run`
 
@@ -426,9 +460,9 @@ curly run "My API/get-user" --env dev
 curly run "My API/get-user" --env dev --var USER_ID=42
 ```
 
-`curly run <collection>/<request-path>` (`<request-path>` may be nested, e.g. `curly run "My API/Auth/login"`) resolves `{{variable}}` tokens against the merged variable scope (`global` + `--env`'s environment + any `--var key=value` overrides, in that precedence order — later wins) and sends the result. **Any variable left unresolved is a hard error** naming every undefined variable found, not a silently-sent literal `{{var}}` — that's a deliberate difference from Postman's GUI behavior, since a CLI/CI tool sending garbage to a server is almost always a bug worth catching immediately.
+`curly run <collection>/<request-path>` (`<request-path>` may be nested, e.g. `curly run "My API/Auth/login"`) resolves `{{variable}}` tokens against the merged variable scope described above and sends the result. **Any variable left unresolved is a hard error** naming every undefined variable found, not a silently-sent literal `{{var}}` — that's a deliberate difference from Postman's GUI behavior, since a CLI/CI tool sending garbage to a server is almost always a bug worth catching immediately.
 
-`run` accepts the same connection/output flags as one-shot mode — `-i`, `-v`, `-k`, `--fail`, `-o`, `--json`, `-p`, `-L`, `--max-redirects`, `--max-time`, `-x`, `--cacert`, `--cert`, `--key` — everything from [§4](#4-argument-reference) except the request-building flags (those come from the saved request, not the command line).
+`run` accepts the same connection/output flags as one-shot mode — `-i`, `-v`, `-k`, `--fail`, `-o`, `--json`, `-p`, `-L`, `--max-redirects`, `--max-time`, `-x`, `--cacert`, `--cert`, `--key` — everything from [§4](#4-argument-reference) except the request-building flags (those come from the saved request, not the command line). `-v` also traces each variable this run's extraction rules pulled out.
 
 ```sh
 curly run "My API/get-user" --env dev -i -v --fail

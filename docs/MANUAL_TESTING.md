@@ -156,35 +156,52 @@ alias curly=./target/release/curly   # or use cargo run -- ... directly
 | 11.7 | `curly run "no-slash-in-target"` | Fails with "invalid run target (expected \"collection/request-name\")" — before touching storage or the network. |
 | 11.8 | After 11.1/11.2/11.4 (3 successful sends), `curly history --limit 3` | All three appear, most recent first. 11.3's failure (undefined variable, never reached execute) does *not* appear. |
 
-## 12. History — `curly history`
+## 12. Extraction and sessions
 
 | # | Steps | Expected |
 |---|---|---|
-| 12.1 | `curly history` (clean state) | "no history yet" |
-| 12.2 | `curly https://httpbin.org/get`, then `curly -X POST -d '{}' -H "Content-Type: application/json" https://httpbin.org/post`, then `curly history` | Both appear, most recent (POST) first, with correct method/status/URL/elapsed_ms. |
-| 12.3 | `curly history --limit 1` | Only the most recent entry. |
-| 12.4 | `curly -H "Authorization: Bearer sekrit" https://httpbin.org/get`, then inspect `$XDG_DATA_HOME/curly/history/*.jsonl` directly | The stored `request_headers` entry for `Authorization` reads `"***redacted***"`, not the real token — confirms NFR-4 redaction independent of what `curly history`'s own summary view shows (it doesn't print headers at all). |
+| 12.1 | `curly collections add-request "Test" get-echo "https://httpbin.org/get?token=abc123" --extract-body "ORIGIN=origin" --extract-header "CT=Content-Type" --extract-template "GREETING=hello {{ORIGIN}}" --extract-secret ORIGIN` then `curly collections show "Test"` | Saves the rules; show marks the request `[extracts: ORIGIN, CT, GREETING]`. |
+| 12.2 | `curly session show` (before running) | "session \"global\" is empty" |
+| 12.3 | `curly run "Test/get-echo" -v` | Prints `~ extracted ORIGIN into session "global"` (and CT, GREETING) on stderr; response body still prints normally. |
+| 12.4 | `curly session show` | `ORIGIN=***` (masked, `--extract-secret`), `CT=application/json`, `GREETING=hello <the real origin ip>` (template correctly referenced the ORIGIN extracted moments earlier). |
+| 12.5 | `curly collections add-request "Test" get-user "https://httpbin.org/get?from={{ORIGIN}}"` then `curly run "Test/get-user"` (no `--var ORIGIN=...` anywhere) | Succeeds — `{{ORIGIN}}` resolves from the session written by 12.3, with no manual `env set` step. This is the actual point of the feature. |
+| 12.6 | `curly collections add-request "Test" bad-path "https://httpbin.org/get" --extract-body "X=nonexistent.path"` then `curly run "Test/bad-path"` | The response body prints first, *then* `Error: path "nonexistent.path" not found in response body (extracting "X")`, exit 1 — confirms extraction failure never swallows the response. |
+| 12.7 | `curly collections add-request "Test" not-found "https://httpbin.org/status/404" --extract-body "X=nonexistent.path"` then `curly run "Test/not-found"` | Succeeds (exit 0), no extraction error — non-2xx responses skip extraction rules entirely. |
+| 12.8 | `curly run "Test/get-echo" --env dev` (with a `dev` environment already created) then `curly session show --env dev` and `curly session show` | `dev`'s session has the extracted variables; the `global` session from 12.3 is untouched — sessions are isolated per environment. |
+| 12.9 | `curly session clear` then `curly session show` | Clears the `global` session only; back to "is empty". |
+| 12.10 | `curly session clear --all` | Clears every environment's session (verify with `session show --env dev` too). |
+| 12.11 | `curly collections add-request "Test" x "https://httpbin.org/get" --extract-secret NOPE` (no matching `--extract-body/--extract-header/--extract-template`) | Fails immediately with "no --extract-body/--extract-header/--extract-template above defines a variable named \"NOPE\"" — before saving anything. |
+| 12.12 | Inspect `$XDG_DATA_HOME/curly/session/global.json` directly after 12.3 | Same shape as an environment file (`name`, `variables: [{key, value, secret}]`) — confirms sessions reuse the Environment format. |
 
-## 13. Project-local storage — `curly init`, `--data-dir`
-
-| # | Steps | Expected |
-|---|---|---|
-| 13.1 | `mkdir -p /tmp/proj/backend/src/main && cd /tmp/proj/backend && curly init` | "initialized curly project at /tmp/proj/backend/.curly"; `.curly/.gitignore` exists containing `environments/` and `history/` (only `collections/` is meant to be committed). |
-| 13.2 | Run `curly init` again in the same directory | "curly project already initialized at ..." — idempotent, not an error. |
-| 13.3 | `cd /tmp/proj/backend/src/main && curly env set dev X=1` (three levels below where `.curly` was created) | Succeeds; `/tmp/proj/backend/.curly/environments/dev.json` is what got written — confirms auto-detection walks *up* from the current directory, not just checks it. |
-| 13.4 | From anywhere outside `/tmp/proj`, `curly --data-dir /tmp/other env list` | Uses `/tmp/other`, not the OS default and not any `.curly` that happens to be an ancestor of the current directory — `--data-dir` wins outright. |
-| 13.5 | `CURLY_DATA_DIR=/tmp/other2 curly env list` (run from inside `/tmp/proj/backend`, which has its own `.curly`) | Uses `/tmp/other2` — the env var beats auto-detection, even though a `.curly` is sitting right there. |
-| 13.6 | From a directory with no `.curly` anywhere in its ancestry and no `--data-dir`/`CURLY_DATA_DIR` set, `curly env list` | Falls back to the OS default (`~/.local/share/curly` on Linux) — unchanged pre-M2 behavior. |
-
-## 14. Cross-platform sanity (when releasing)
+## 13. History — `curly history`
 
 | # | Steps | Expected |
 |---|---|---|
-| 13.1 | `cargo build --release` on Linux, macOS, and Windows | Each produces a working binary with no OS-specific build errors. |
-| 13.2 | Run scenario 1.1 and 4.1 on each OS | Same output shape on all three (path separators in `-o`/`--data-binary`/`--cacert` examples are the main thing to sanity-check on Windows). |
-| 13.3 | Run scenario 10.6 (inspect the collection JSON file) on each OS | Confirms the data directory resolves correctly per-OS (`~/.local/share/curly`, `~/Library/Application Support/curly`, `%APPDATA%\curly`). |
+| 13.1 | `curly history` (clean state) | "no history yet" |
+| 13.2 | `curly https://httpbin.org/get`, then `curly -X POST -d '{}' -H "Content-Type: application/json" https://httpbin.org/post`, then `curly history` | Both appear, most recent (POST) first, with correct method/status/URL/elapsed_ms. |
+| 13.3 | `curly history --limit 1` | Only the most recent entry. |
+| 13.4 | `curly -H "Authorization: Bearer sekrit" https://httpbin.org/get`, then inspect `$XDG_DATA_HOME/curly/history/*.jsonl` directly | The stored `request_headers` entry for `Authorization` reads `"***redacted***"`, not the real token — confirms NFR-4 redaction independent of what `curly history`'s own summary view shows (it doesn't print headers at all). |
 
-## 15. Regression checklist for new flags/subcommands
+## 14. Project-local storage — `curly init`, `--data-dir`
+
+| # | Steps | Expected |
+|---|---|---|
+| 14.1 | `mkdir -p /tmp/proj/backend/src/main && cd /tmp/proj/backend && curly init` | "initialized curly project at /tmp/proj/backend/.curly"; `.curly/.gitignore` exists containing `environments/`, `session/`, and `history/` (only `collections/` is meant to be committed). |
+| 14.2 | Run `curly init` again in the same directory | "curly project already initialized at ..." — idempotent, not an error. |
+| 14.3 | `cd /tmp/proj/backend/src/main && curly env set dev X=1` (three levels below where `.curly` was created) | Succeeds; `/tmp/proj/backend/.curly/environments/dev.json` is what got written — confirms auto-detection walks *up* from the current directory, not just checks it. |
+| 14.4 | From anywhere outside `/tmp/proj`, `curly --data-dir /tmp/other env list` | Uses `/tmp/other`, not the OS default and not any `.curly` that happens to be an ancestor of the current directory — `--data-dir` wins outright. |
+| 14.5 | `CURLY_DATA_DIR=/tmp/other2 curly env list` (run from inside `/tmp/proj/backend`, which has its own `.curly`) | Uses `/tmp/other2` — the env var beats auto-detection, even though a `.curly` is sitting right there. |
+| 14.6 | From a directory with no `.curly` anywhere in its ancestry and no `--data-dir`/`CURLY_DATA_DIR` set, `curly env list` | Falls back to the OS default (`~/.local/share/curly` on Linux) — unchanged pre-M2 behavior. |
+
+## 15. Cross-platform sanity (when releasing)
+
+| # | Steps | Expected |
+|---|---|---|
+| 15.1 | `cargo build --release` on Linux, macOS, and Windows | Each produces a working binary with no OS-specific build errors. |
+| 15.2 | Run scenario 1.1 and 4.1 on each OS | Same output shape on all three (path separators in `-o`/`--data-binary`/`--cacert` examples are the main thing to sanity-check on Windows). |
+| 15.3 | Run scenario 10.6 (inspect the collection JSON file) on each OS | Confirms the data directory resolves correctly per-OS (`~/.local/share/curly`, `~/Library/Application Support/curly`, `%APPDATA%\curly`). |
+
+## 16. Regression checklist for new flags/subcommands
 
 When adding a new flag or subcommand, add at minimum:
 - A unit test covering the pure parsing/building logic — `crates/curly-cli/src/one_shot.rs`, `args.rs`, or `commands/*.rs`'s `#[cfg(test)] mod tests` depending on where the logic lives, plus `crates/curly-core/tests/` for anything storage- or substitution-related.

@@ -58,6 +58,8 @@ curly/
 │           └── <request-id>.json
 ├── environments/
 │   └── <env-slug>.json
+├── session/                     # post-M2: machine-written, extraction writes here — see §9 FR-10
+│   └── <env-slug>.json          # same shape as an environment; never hand-edited
 ├── history/
 │   └── <yyyy-mm-dd>.jsonl       # append-only, one JSON object per sent request+response
 └── config.toml                  # app-level settings: theme, default timeout, active environment
@@ -154,8 +156,10 @@ Single window, `egui` immediate-mode layout:
    - FR-12 (`curly run <collection>/<request-name> --env --var`): done.
    - FR-13 (collection/environment management subcommands): done for list/create-or-set/delete/show; `import`/`export` subcommands from this doc's §5 CLI sketch are M3's job (Postman import) and not yet implemented. No `$EDITOR`-based editing — editing a saved request is currently remove-request + add-request again.
    - NFR-4 (secrets not logged in plaintext): `env set --secret` masks values in `env show`; history entries redact `Authorization`/`X-Api-Key`/`Cookie` header values. Not done: OS-keychain storage (`--secret` values are still plain JSON on disk) — deferred to M5 per this doc's tech-choices table.
-   - NFR-6: 57 tests total — `curly-core` unit+integration (32: substitution, storage via `tempfile`, `wiremock` exec) + `curly-cli` unit (25: request/client building, collections add-request body/auth parsing).
-   - Not done / explicitly out of scope for M2: Postman/curl import (M3), editing saved requests in place, re-running from history, OS keychain.
+   - NFR-6: 102 tests total across the workspace (grows each commit; see individual test files rather than trusting this number to stay current).
+   - **Post-M2 addition — FR-10** (declarative post-response extraction, no scripting language; see REQUIREMENTS.md FR-10): new `curly-core::extraction` module — an `Extraction` rule pulls a value from the JSON response body (hand-rolled dot/bracket path, e.g. `data.items[0].id`, not full JSONPath), a response header, or computes one via `{{template}}` substitution against already-known variables (including earlier extractions in the same rule list). `SavedRequest.extract: Vec<Extraction>` (default empty, backward compatible). Rules only run on a 2xx response (non-2xx is an expected absence — e.g. a failed login has no token — not an error); on 2xx, an unsatisfiable rule errors, but only *after* the response has already been printed (`execute.rs`'s `after_send` hook runs post-render, deliberately, so a bad path doesn't swallow the response you'd need to debug it). Results are written to a **session** (`Storage::load_session`/`save_session`), not the environment file — see next bullet. Authored via `collections add-request --extract-body/--extract-header/--extract-template/--extract-secret`.
+   - **Post-M2 addition — sessions**: a session is a machine-written variable store, one per environment name (`session/<slug>.json`, reusing the `Environment` type for its shape), separate from the hand-curated `environments/<slug>.json` — so an extracted token can't mix with values you set yourself, and a token pulled while running against `dev` can't leak into a `staging` run. `curly run`'s variable resolution gained a fourth layer: `global` env → `--env`'s environment → `--env`'s session → `--var`. New `curly session show/clear [--env] [--all]`. `curly init` gitignores `session/` alongside `environments/` and `history/`, for the same "holds real credentials" reason.
+   - Not done / explicitly out of scope for M2: Postman/curl import (M3), editing saved requests in place, re-running from history, OS keychain, pre-request scripts.
 3. **M3 — Postman import**: FR-7.
 4. **M4 — GUI v1**: FR-17..24 against the by-then-stable core.
 5. **M5 — polish**: OAuth2 flows, secret storage via keychain, packaging/CI release pipeline.

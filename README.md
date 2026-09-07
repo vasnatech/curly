@@ -9,7 +9,7 @@ Both ship as native, single-binary executables for Linux, macOS, and Windows.
 
 ## Status
 
-M1 (core + CLI one-shot mode) and M2 (local storage — saved requests, collections, environments, `{{variable}}` substitution, history) are implemented. Postman/curl import and the GUI are not built yet. See [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) and [docs/DESIGN.md](docs/DESIGN.md) for scope and roadmap.
+M1 (core + CLI one-shot mode) and M2 (local storage — saved requests, collections, environments, `{{variable}}` substitution, history) are implemented, plus several post-M2 additions (folders/sub-folders, project-local storage via `curly init`, post-response variable extraction + sessions). Postman/curl import and the GUI are not built yet. See [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) and [docs/DESIGN.md](docs/DESIGN.md) for scope and shipped-milestone status, and [docs/ROADMAP.md](docs/ROADMAP.md) for not-yet-committed feature ideas.
 
 ## Using the CLI
 

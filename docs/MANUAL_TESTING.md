@@ -307,6 +307,19 @@ Requires an actual display (X11 or Wayland) — not scriptable the way the rest 
 | 16.61 | With the session cleared, switch to a different environment, then switch back to `local` | The Session panel reflects `local`'s (now-empty) session each time — the display follows whichever environment is currently selected, not whatever was last extracted. |
 | 16.62 | Load a request with extraction rules, but with **no environment selected** ("(none selected)"), and send successfully | The extraction note above the editor says `into session "global"`, and after sending, `curly session show` (no `--env`, defaults to global) shows the extracted variable — confirms the no-environment-selected default matches `curly run`'s own. |
 | 16.63 | Load a request with **no** extraction rules (most requests) | No extraction note appears above the editor at all — the line only shows up when there's actually something to extract. |
+| 16.64 | Click **"Open Project…"** and watch the window (title bar / try dragging it) while the native picker is open | Window keeps responding — no OS "Not Responding" indicator, title bar redraws normally, you can move the window. Button reads "Choosing…" and is disabled for as long as the picker is open. |
+| 16.65 | Cancel that folder picker (Escape or its own Cancel) | Nothing changes — same as before (16.21), still true with the async picker. |
+| 16.66 | With no request loaded ("New request (not saved)" showing), fill in a URL/headers/body, click **Save** | Opens the Save dialog (no loaded request to overwrite) — Collection/Folder/Name fields, Folder empty by default. |
+| 16.67 | In that dialog, type a new collection name (one that doesn't exist yet) plus a name, click **Save** | Dialog closes; the new collection appears in the sidebar's Collections list with the one request in it; the "Editing…" label updates to the new collection/path; `curly collections show <name>` from a terminal confirms it. |
+| 16.68 | Click that request in the tree to reload it, change the URL, click **Save** (not Save As) | No dialog — overwrites immediately; `curly collections show` still shows it at the same path, `curly run <collection>/<path>` (or reloading it in the GUI) shows the updated URL. |
+| 16.69 | With that same request loaded, press **Ctrl+S** (Cmd+S on macOS) instead of clicking Save | Same as clicking Save — overwrites in place. |
+| 16.70 | With a request loaded, click **Save As…**, change only the Name field, click Save | A second request appears in the tree at the same folder, under the new name — the original is untouched (a "duplicate" via Save As). |
+| 16.71 | Click **Save As…** on a loaded request, don't change anything, click Save | Fails with an error in the dialog ("a request already exists at ...") — the dialog stays open, nothing is overwritten; use plain Save if overwriting was the goal. |
+| 16.72 | Leave Collection or Name blank in the Save dialog and click Save | A clear validation error appears in the dialog ("collection name is required" / "request name is required") — nothing is written, dialog stays open. |
+| 16.73 | Click **Cancel** in the Save dialog (or its window-close ✕) | Dialog closes, nothing is written, editor content is unchanged. |
+| 16.74 | Click **New**, then build a request from scratch, Send it | Works normally — Save/New/Delete are independent of Send; a from-scratch request with nothing loaded sends exactly as before this feature existed. |
+| 16.75 | Load a request, click a *different* request's **✕** in the tree (not the loaded one) | Deletes that other request; the "Editing…" label and loaded editor content are unaffected. |
+| 16.76 | Load a request, then click **its own ✕** in the tree | Deletes it; "Editing…" reverts to "New request (not saved)" — Save would now open the dialog instead of trying to overwrite something gone. |
 
 ## 17. Cross-platform sanity (when releasing)
 

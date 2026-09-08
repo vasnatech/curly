@@ -1,12 +1,11 @@
-//! The GUI's slices so far: FR-17's core loop (method/URL bar, Send,
-//! Headers/Body panels, a response pane), the start of FR-18 (a project
-//! picker plus browsing a collection's tree and clicking a request to load
-//! it into the editor), and all of FR-21 — an environment switcher,
-//! creating/editing/deleting environments, ad-hoc `--var`-style overrides,
-//! and now a loaded request's extraction rules running on a successful send
-//! and writing into a session, same as `curly run`. Still not built: saving
-//! requests, or multiple simultaneously-open projects (see project.rs's doc
-//! comment for why the data model already supports the last one).
+//! The GUI's slices so far: FR-17's core loop, browsing/loading/saving/
+//! deleting requests (FR-18/20), all of FR-21 (environments, overrides,
+//! extraction-into-session), most of FR-22 (JSON syntax highlighting,
+//! search, save-to-file — not image preview, see docs/DESIGN.md), most of
+//! FR-23 (send/save/new-tab shortcuts), a toolbar with real zoom, and now
+//! FR-19 — multiple request tabs. Still not built: multiple
+//! simultaneously-open projects (see project.rs's doc comment for why the
+//! data model already supports it) and image preview.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -157,6 +156,68 @@ struct SaveDialog {
     error: Option<String>,
 }
 
+/// One request tab's worth of editor + response state (FR-19) — every
+/// field that used to live directly on `CurlyApp` before tabs existed.
+/// Environment/project selection stays on `CurlyApp` itself, shared across
+/// all tabs (matching how Postman-style tools treat "environment" as a
+/// workspace-level concept, not a per-request one), as does the Save
+/// dialog (only one can be open at a time; switching tabs cancels it
+/// rather than risk it silently saving the wrong tab's content — see
+/// `switch_to_tab`'s doc comment).
+///
+/// `CurlyApp`'s own top-level fields of the same names *are* the active
+/// tab's live state — `tabs[active_tab_idx]` is a stale placeholder while
+/// that tab is active, only ever read for its label (`tab_label` special-
+/// cases the active index to read the real top-level fields instead) and
+/// overwritten wholesale the moment a switch actually happens. This
+/// swap-based design — rather than converting every method to route
+/// through `self.active_tab_mut().field` — was deliberate: it means
+/// `build_request`/`send`/`poll_response`/`load_saved_request`/
+/// `merged_variables`/every existing test/etc. needed zero changes to
+/// support tabs; only tab *management* (open/close/switch) is new code.
+///
+/// One consequence worth knowing: `rx`/`response_save_rx`/
+/// `pending_extraction` move with their tab when you switch away — an
+/// in-flight send on tab A keeps running in the background (the async
+/// task itself doesn't care which tab is visible), but its result just
+/// waits unpolled in `tabs[A]` until you switch back to tab A, rather
+/// than completing while some other tab is in view. No response is ever
+/// lost, just not delivered until that tab is visible again.
+#[derive(Default)]
+struct RequestTab {
+    method: String,
+    url: String,
+    headers: Vec<HeaderRow>,
+    body: String,
+    response: Option<Result<ResponseSummary, String>>,
+    in_flight: bool,
+    rx: Option<mpsc::Receiver<SendOutcome>>,
+    var_overrides: Vec<OverrideRow>,
+    extract_rules: Vec<Extraction>,
+    pending_extraction: Option<PendingExtraction>,
+    session_notice: Option<String>,
+    load_notice: Option<String>,
+    loaded_request: Option<LoadedRequestRef>,
+    response_search: String,
+    response_save_rx: Option<mpsc::Receiver<Option<String>>>,
+    response_save_notice: Option<String>,
+}
+
+impl RequestTab {
+    /// A blank tab — method defaults to GET and headers start with one
+    /// empty editable row, matching `CurlyApp::default_state`'s own
+    /// pre-tabs defaults exactly (deriving `Default` alone would give
+    /// `method: ""` and `headers: vec![]`, neither of which match what a
+    /// freshly opened tab looked like before this struct existed).
+    fn blank() -> Self {
+        Self {
+            method: "GET".to_string(),
+            headers: vec![HeaderRow::empty()],
+            ..Default::default()
+        }
+    }
+}
+
 pub struct CurlyApp {
     method: String,
     url: String,
@@ -273,6 +334,13 @@ pub struct CurlyApp {
     /// `None` after a cancelled dialog, deliberately — cancelling isn't
     /// worth a notice.
     response_save_notice: Option<String>,
+    /// Every tab's state (FR-19) — see `RequestTab`'s own doc comment for
+    /// the swap-based design: `tabs[active_tab_idx]` is a stale placeholder
+    /// while `CurlyApp`'s own top-level fields above hold that tab's real,
+    /// live state. Never empty — closing the last tab resets it in place
+    /// instead of leaving zero tabs open.
+    tabs: Vec<RequestTab>,
+    active_tab_idx: usize,
 }
 
 impl CurlyApp {
@@ -337,6 +405,8 @@ impl CurlyApp {
             response_search: String::new(),
             response_save_rx: None,
             response_save_notice: None,
+            tabs: vec![RequestTab::blank()],
+            active_tab_idx: 0,
         }
     }
 
@@ -919,14 +989,149 @@ impl CurlyApp {
     /// request, so starting a new one doesn't risk a later "Save"
     /// overwriting whatever was loaded before.
     fn new_request(&mut self) {
-        self.method = "GET".to_string();
-        self.url.clear();
-        self.headers = vec![HeaderRow::empty()];
-        self.body.clear();
-        self.extract_rules.clear();
-        self.loaded_request = None;
-        self.load_notice = None;
-        self.response = None;
+        self.restore_active_tab(RequestTab::blank());
+    }
+
+    /// Move every per-request field out of `self` into an owned
+    /// `RequestTab` — see `RequestTab`'s doc comment for why this
+    /// move-based swap, rather than a `self.active_tab_mut().field` style,
+    /// is how tabs work here. Leaves `self`'s own fields at their `Default`
+    /// (mostly empty/`None`) until `restore_active_tab` is called with
+    /// something to put back — a caller that forgets to immediately follow
+    /// up would leave the editor looking blank, same visible failure mode
+    /// as any other bug, not a silent one.
+    fn take_active_tab(&mut self) -> RequestTab {
+        RequestTab {
+            method: std::mem::take(&mut self.method),
+            url: std::mem::take(&mut self.url),
+            headers: std::mem::take(&mut self.headers),
+            body: std::mem::take(&mut self.body),
+            response: self.response.take(),
+            in_flight: std::mem::take(&mut self.in_flight),
+            rx: self.rx.take(),
+            var_overrides: std::mem::take(&mut self.var_overrides),
+            extract_rules: std::mem::take(&mut self.extract_rules),
+            pending_extraction: self.pending_extraction.take(),
+            session_notice: self.session_notice.take(),
+            load_notice: self.load_notice.take(),
+            loaded_request: self.loaded_request.take(),
+            response_search: std::mem::take(&mut self.response_search),
+            response_save_rx: self.response_save_rx.take(),
+            response_save_notice: self.response_save_notice.take(),
+        }
+    }
+
+    /// The inverse of `take_active_tab` — moves `tab`'s fields back onto
+    /// `self`, making it the live, active state.
+    fn restore_active_tab(&mut self, tab: RequestTab) {
+        self.method = tab.method;
+        self.url = tab.url;
+        self.headers = tab.headers;
+        self.body = tab.body;
+        self.response = tab.response;
+        self.in_flight = tab.in_flight;
+        self.rx = tab.rx;
+        self.var_overrides = tab.var_overrides;
+        self.extract_rules = tab.extract_rules;
+        self.pending_extraction = tab.pending_extraction;
+        self.session_notice = tab.session_notice;
+        self.load_notice = tab.load_notice;
+        self.loaded_request = tab.loaded_request;
+        self.response_search = tab.response_search;
+        self.response_save_rx = tab.response_save_rx;
+        self.response_save_notice = tab.response_save_notice;
+    }
+
+    /// Open a new blank tab and make it active — the editor equivalent of
+    /// `new_request`, except the tab you were on is kept (parked in
+    /// `tabs`) rather than overwritten. Bound to the toolbar's `+` and
+    /// Ctrl/Cmd+T (FR-23).
+    fn open_new_tab(&mut self) {
+        let outgoing = self.take_active_tab();
+        self.tabs[self.active_tab_idx] = outgoing;
+        self.restore_active_tab(RequestTab::blank());
+        self.tabs.push(RequestTab::blank());
+        self.active_tab_idx = self.tabs.len() - 1;
+        self.save_dialog = None;
+    }
+
+    /// Switch the active tab — parks the current tab's live state into
+    /// `tabs[active_tab_idx]` and loads `tabs[idx]`'s state back onto
+    /// `self`. A no-op for an out-of-range or already-active `idx`.
+    /// Cancels any open Save dialog: it was pre-filled from whichever tab
+    /// was active when it opened, and confirming it after switching tabs
+    /// would save the *new* active tab's content under that stale
+    /// pre-fill — safer to just close it than risk that mismatch.
+    fn switch_to_tab(&mut self, idx: usize) {
+        if idx >= self.tabs.len() || idx == self.active_tab_idx {
+            return;
+        }
+        let outgoing = self.take_active_tab();
+        self.tabs[self.active_tab_idx] = outgoing;
+        let incoming = std::mem::take(&mut self.tabs[idx]);
+        self.restore_active_tab(incoming);
+        self.active_tab_idx = idx;
+        self.save_dialog = None;
+    }
+
+    /// Close the tab at `idx`. Closing the last remaining tab resets it to
+    /// blank in place instead — there's always at least one tab open, same
+    /// as there's always a Response pane even with nothing sent yet.
+    /// Closing the active tab picks a neighbor (the same index if
+    /// possible, otherwise the new last tab) to become active; closing an
+    /// *inactive* tab just drops its slot and shifts `active_tab_idx` down
+    /// by one if it came after the closed tab.
+    fn close_tab(&mut self, idx: usize) {
+        if idx >= self.tabs.len() {
+            return;
+        }
+        if self.tabs.len() == 1 {
+            self.new_request();
+            return;
+        }
+        if idx == self.active_tab_idx {
+            self.tabs.remove(idx);
+            let new_active = idx.min(self.tabs.len() - 1);
+            let incoming = std::mem::take(&mut self.tabs[new_active]);
+            self.restore_active_tab(incoming);
+            self.active_tab_idx = new_active;
+        } else {
+            self.tabs.remove(idx);
+            if idx < self.active_tab_idx {
+                self.active_tab_idx -= 1;
+            }
+        }
+        self.save_dialog = None;
+    }
+
+    /// A short display label for the tab at `idx` — the loaded request's
+    /// path if it has one, else "METHOD url", else "New Request". Reads
+    /// the *live* top-level fields for the active tab rather than
+    /// `tabs[active_tab_idx]` (a stale placeholder while active — see
+    /// `RequestTab`'s doc comment), so the tab bar reflects what you're
+    /// typing right now, not what was there before you last switched away.
+    fn tab_label(&self, idx: usize) -> String {
+        let (loaded, method, url) = if idx == self.active_tab_idx {
+            (&self.loaded_request, self.method.as_str(), self.url.as_str())
+        } else {
+            let tab = &self.tabs[idx];
+            (&tab.loaded_request, tab.method.as_str(), tab.url.as_str())
+        };
+
+        let label = if let Some(loaded) = loaded {
+            loaded.path.clone()
+        } else if !url.trim().is_empty() {
+            format!("{method} {url}")
+        } else {
+            "New Request".to_string()
+        };
+
+        const MAX_LEN: usize = 24;
+        if label.chars().count() > MAX_LEN {
+            format!("{}…", label.chars().take(MAX_LEN).collect::<String>())
+        } else {
+            label
+        }
     }
 
     /// Pre-fill the Save dialog from `loaded_request` if there is one (so
@@ -1516,6 +1721,7 @@ impl eframe::App for CurlyApp {
 
         let mut zoom_delta: Option<f32> = None;
         let mut zoom_reset = false;
+        let mut new_tab_shortcut = false;
         ui.input(|i| {
             if i.modifiers.command {
                 if i.key_pressed(egui::Key::Plus) || i.key_pressed(egui::Key::Equals) {
@@ -1527,6 +1733,9 @@ impl eframe::App for CurlyApp {
                 if i.key_pressed(egui::Key::Num0) {
                     zoom_reset = true;
                 }
+                if i.key_pressed(egui::Key::T) {
+                    new_tab_shortcut = true;
+                }
             }
         });
         if let Some(delta) = zoom_delta {
@@ -1534,6 +1743,9 @@ impl eframe::App for CurlyApp {
         }
         if zoom_reset {
             set_zoom_factor(ui.ctx(), 1.0);
+        }
+        if new_tab_shortcut {
+            self.open_new_tab();
         }
 
         egui::Panel::left("project_sidebar")
@@ -1702,6 +1914,34 @@ impl eframe::App for CurlyApp {
         egui::CentralPanel::default().show(ui, |ui| {
             let ctx = ui.ctx().clone();
             let mut should_send = false;
+
+            egui::ScrollArea::horizontal().id_salt("tab_bar").show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let mut switch_to: Option<usize> = None;
+                    let mut close: Option<usize> = None;
+                    for i in 0..self.tabs.len() {
+                        let selected = i == self.active_tab_idx;
+                        ui.horizontal(|ui| {
+                            if ui.selectable_label(selected, self.tab_label(i)).clicked() {
+                                switch_to = Some(i);
+                            }
+                            if ui.small_button("✕").clicked() {
+                                close = Some(i);
+                            }
+                        });
+                    }
+                    if ui.button("+").on_hover_text("New tab (Ctrl+T)").clicked() {
+                        self.open_new_tab();
+                    }
+                    if let Some(i) = switch_to {
+                        self.switch_to_tab(i);
+                    }
+                    if let Some(i) = close {
+                        self.close_tab(i);
+                    }
+                });
+            });
+            ui.separator();
 
             if let Some(notice) = &self.load_notice {
                 ui.colored_label(egui::Color32::from_rgb(230, 190, 60), notice);
@@ -3616,5 +3856,205 @@ mod tests {
         let zoomed_in = clamp_zoom(1.0 * ZOOM_STEP);
         let back_out = clamp_zoom(zoomed_in / ZOOM_STEP);
         assert!((back_out - 1.0).abs() < 1e-5);
+    }
+
+    // --- FR-19: multiple request tabs ---
+
+    #[test]
+    fn default_state_has_exactly_one_tab() {
+        let app = CurlyApp::default_state();
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.active_tab_idx, 0);
+    }
+
+    #[test]
+    fn open_new_tab_adds_a_second_tab_and_makes_it_active() {
+        let mut app = CurlyApp::default_state();
+        app.url = "https://example.com/original".to_string();
+
+        app.open_new_tab();
+
+        assert_eq!(app.tabs.len(), 2);
+        assert_eq!(app.active_tab_idx, 1);
+        assert!(app.url.is_empty());
+        assert_eq!(app.method, "GET");
+    }
+
+    #[test]
+    fn switching_tabs_round_trips_editor_state() {
+        let mut app = CurlyApp::default_state();
+        app.url = "https://example.com/first".to_string();
+        app.method = "POST".to_string();
+        app.body = "first-body".to_string();
+
+        app.open_new_tab();
+        app.url = "https://example.com/second".to_string();
+        app.method = "DELETE".to_string();
+
+        app.switch_to_tab(0);
+        assert_eq!(app.url, "https://example.com/first");
+        assert_eq!(app.method, "POST");
+        assert_eq!(app.body, "first-body");
+
+        app.switch_to_tab(1);
+        assert_eq!(app.url, "https://example.com/second");
+        assert_eq!(app.method, "DELETE");
+    }
+
+    #[test]
+    fn switch_to_tab_is_a_no_op_for_the_already_active_tab() {
+        let mut app = CurlyApp::default_state();
+        app.url = "https://example.com".to_string();
+
+        app.switch_to_tab(0);
+
+        assert_eq!(app.url, "https://example.com");
+    }
+
+    #[test]
+    fn switch_to_tab_is_a_no_op_for_an_out_of_range_index() {
+        let mut app = CurlyApp::default_state();
+        app.url = "https://example.com".to_string();
+
+        app.switch_to_tab(5);
+
+        assert_eq!(app.active_tab_idx, 0);
+        assert_eq!(app.url, "https://example.com");
+    }
+
+    #[test]
+    fn closing_the_only_tab_resets_it_instead_of_removing_it() {
+        let mut app = CurlyApp::default_state();
+        app.url = "https://example.com".to_string();
+
+        app.close_tab(0);
+
+        assert_eq!(app.tabs.len(), 1);
+        assert!(app.url.is_empty());
+    }
+
+    #[test]
+    fn closing_an_inactive_tab_leaves_the_active_one_untouched() {
+        let mut app = CurlyApp::default_state();
+        app.url = "https://example.com/first".to_string();
+        app.open_new_tab();
+        app.url = "https://example.com/second".to_string();
+
+        app.close_tab(0);
+
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.active_tab_idx, 0);
+        assert_eq!(app.url, "https://example.com/second");
+    }
+
+    #[test]
+    fn closing_an_inactive_tab_before_the_active_one_shifts_the_active_index_down() {
+        let mut app = CurlyApp::default_state();
+        app.open_new_tab();
+        app.open_new_tab();
+        // tabs: [0]=blank, [1]=blank, [2]=active
+        app.url = "https://example.com/active".to_string();
+
+        app.close_tab(0);
+
+        assert_eq!(app.tabs.len(), 2);
+        assert_eq!(app.active_tab_idx, 1);
+        assert_eq!(app.url, "https://example.com/active");
+    }
+
+    #[test]
+    fn closing_the_active_tab_switches_to_a_neighbor() {
+        let mut app = CurlyApp::default_state();
+        app.url = "https://example.com/first".to_string();
+        app.open_new_tab();
+        app.url = "https://example.com/second".to_string();
+
+        app.close_tab(1);
+
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.active_tab_idx, 0);
+        assert_eq!(app.url, "https://example.com/first");
+    }
+
+    #[test]
+    fn close_tab_is_a_no_op_for_an_out_of_range_index() {
+        let mut app = CurlyApp::default_state();
+        app.url = "https://example.com".to_string();
+
+        app.close_tab(9);
+
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.url, "https://example.com");
+    }
+
+    #[test]
+    fn tab_label_is_new_request_for_a_blank_tab() {
+        let app = CurlyApp::default_state();
+        assert_eq!(app.tab_label(0), "New Request");
+    }
+
+    #[test]
+    fn tab_label_shows_method_and_url_when_not_loaded_from_a_saved_request() {
+        let mut app = CurlyApp::default_state();
+        app.method = "POST".to_string();
+        app.url = "http://x.io/a".to_string();
+
+        assert_eq!(app.tab_label(0), "POST http://x.io/a");
+    }
+
+    #[test]
+    fn tab_label_shows_the_loaded_requests_path() {
+        let mut app = CurlyApp::default_state();
+        app.loaded_request = Some(LoadedRequestRef {
+            collection: "my-api".to_string(),
+            path: "Auth/login".to_string(),
+        });
+
+        assert_eq!(app.tab_label(0), "Auth/login");
+    }
+
+    #[test]
+    fn tab_label_truncates_a_long_url() {
+        let mut app = CurlyApp::default_state();
+        app.url = "https://example.com/a/very/long/path/that/goes/on".to_string();
+
+        let label = app.tab_label(0);
+        assert!(label.ends_with('…'));
+        assert!(label.chars().count() <= 30);
+    }
+
+    #[test]
+    fn tab_label_reflects_the_active_tabs_live_state_not_a_stale_snapshot() {
+        let mut app = CurlyApp::default_state();
+        app.open_new_tab();
+        // tabs[0] is a stale placeholder now that tab 1 is active; typing
+        // in the still-active tab 1 should show up in its own label
+        // immediately, without needing to switch away and back first.
+        app.url = "http://x.io/typing".to_string();
+
+        assert_eq!(app.tab_label(1), "GET http://x.io/typing");
+    }
+
+    #[test]
+    fn opening_a_new_tab_cancels_an_open_save_dialog() {
+        let mut app = CurlyApp::default_state();
+        app.open_save_dialog();
+        assert!(app.save_dialog.is_some());
+
+        app.open_new_tab();
+
+        assert!(app.save_dialog.is_none());
+    }
+
+    #[test]
+    fn switching_tabs_cancels_an_open_save_dialog() {
+        let mut app = CurlyApp::default_state();
+        app.open_new_tab();
+        app.open_save_dialog();
+        assert!(app.save_dialog.is_some());
+
+        app.switch_to_tab(0);
+
+        assert!(app.save_dialog.is_none());
     }
 }

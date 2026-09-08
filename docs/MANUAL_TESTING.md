@@ -292,6 +292,13 @@ Requires an actual display (X11 or Wayland) — not scriptable the way the rest 
 | 16.46 | Click a variable row's `✕` in the editor, then **Save** | That variable is gone from `curly env show staging` afterward — removal via the GUI persists the same as an addition does. |
 | 16.47 | Click **Delete environment** on `staging` | `staging` disappears from the sidebar's Environments list immediately, the editor panel closes, a green "deleted environment..." notice appears, and `curly env list` from a terminal no longer lists it. |
 | 16.48 | Click a different, pre-existing environment (e.g. `health-record-backend-spring`'s `global`), edit one of its real variable values in the editor, click **Save**, then click **`(none selected)`** without reloading anything, then re-click `global` | Editor reloads from disk showing your saved edit — confirms Save actually persisted rather than just updating the in-memory row. |
+| 16.49 | With no environment selected, expand **"Variable overrides"**, add a row `BASE_URL` / `http://localhost:8080`, load `Auth/login` | The undefined-variable notice no longer lists `BASE_URL` — an override satisfies the check the same as an environment variable would. |
+| 16.50 | With that override still set and `EMAIL`/`PASSWORD` still undefined, click **Send** | Fails with an error naming `EMAIL`/`PASSWORD` only — confirms overrides participate in substitution per-key, not all-or-nothing. |
+| 16.51 | Select an environment that already defines `BASE_URL` (e.g. `global`), then add an override row `BASE_URL` with a *different* value, and Send a request using `{{BASE_URL}}` | Request goes to the override's value, not the environment's — confirms override precedence beats the selected environment. |
+| 16.52 | Restart `curly gui` (or open a different project) after adding an override row | The override is gone — nothing under "Variable overrides" was ever written to any `.curly/environments/*.json` file; confirm with `curly env list`/`curly env show` that no new environment or variable appeared. |
+| 16.53 | Add an override row, uncheck its checkbox, then Send a request using that variable (with nothing else defining it) | Fails as undefined — an unchecked override row is excluded, same as an unchecked header. |
+| 16.54 | Re-check that same row's checkbox and Send again | Now resolves — re-enabling makes it apply again without needing to retype anything. |
+| 16.55 | Add two override rows with the same key, both enabled, different values | The later row's value wins (matches a map's own last-write-wins semantics, same as two `--var` flags with the same key on the CLI). |
 
 ## 17. Cross-platform sanity (when releasing)
 

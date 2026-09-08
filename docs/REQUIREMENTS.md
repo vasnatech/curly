@@ -14,7 +14,7 @@ Curly is a REST API testing tool, positioned as a lighter, self-contained altern
 ## 3. Non-goals (v1)
 
 - Team collaboration / cloud sync / shared workspaces.
-- Mock servers, API design/contract tooling (OpenAPI editing), or automated test-suite runners with assertions (may become a v2 goal).
+- Mock servers, API design/contract tooling (OpenAPI editing), or automated test-suite runners with assertions (may become a v2 goal) — pure multi-request *orchestration* without assertions is a separate, in-scope effort, see FR-25.
 - GraphQL/gRPC/WebSocket support (HTTP/1.1 and HTTP/2 REST only for v1).
 - Plugin/extension system.
 - Team/enterprise auth (SSO, RBAC).
@@ -38,6 +38,7 @@ Curly is a REST API testing tool, positioned as a lighter, self-contained altern
 - FR-8: Local persistence in plain files under a user config/data directory (see Design doc) — no external database server required.
 - FR-9: Response handling: status, headers, body, timing (DNS/connect/TLS/TTFB/total), size; pretty-print JSON/XML/HTML; raw view toggle.
 - FR-10: Post-response variable extraction (done, declaratively — see DESIGN.md §4/§9): pull a value from a response body (JSON path) or header, or compute one from a template, and persist it as a session variable for later requests. No scripting language — "none in v1" won out over embedding Rhai, since a declarative rule set covers the actual use case (chaining an auth token into the next request). Pre-request scripts remain out of scope.
+- FR-25: Scenarios — multi-request orchestration (not started, see DESIGN.md M6 / ROADMAP.md for the in-progress design): a named, nested sequence/parallel composition of saved requests, potentially spanning more than one collection (via an `imports` alias map), with conditional branching (`choice` nodes) on the previous response's status/header/body, chaining variables through the existing extraction/session mechanism (FR-10). Pure orchestration, no pass/fail assertions — stays inside this doc's own non-goal on test-suite runners. Stored as its own file per scenario (`.curly/scenarios/<name>.json`), JSON-only authoring for v1 (no CLI flag-based scenario builder — see ROADMAP.md for why); executed via `curly scenario run <name>`.
 
 ### 5.2 CLI (`curly`)
 

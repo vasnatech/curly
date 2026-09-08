@@ -1,6 +1,6 @@
 # Curly — Roadmap
 
-Not-yet-committed feature ideas, kept separate from [DESIGN.md](DESIGN.md) §9 (which tracks *decided/shipped* milestones — M1 through M5) so exploratory thinking doesn't get mixed in with settled status. When an idea here gets scoped and built, its outcome moves to DESIGN.md the way every other feature in this project has (a "done, here's what shipped vs. deviated" writeup), and its entry here is removed or marked superseded.
+Not-yet-committed feature ideas, kept separate from [DESIGN.md](DESIGN.md) §9 (which tracks *decided/shipped* milestones — M1 through M6, though M6 itself is still just a placeholder pointing back here until it's actually built) so exploratory thinking doesn't get mixed in with settled status. When an idea here gets scoped and built, its outcome moves to DESIGN.md the way every other feature in this project has (a "done, here's what shipped vs. deviated" writeup), and its entry here is removed or marked superseded.
 
 ## Scenarios — multi-request orchestration (linear + parallel)
 
@@ -154,9 +154,28 @@ If a second collection joined in (say a separate `billing-api`), only `imports` 
 { "request": "me/get" }
 ```
 
+### Decided (2026-09): failure semantics
+
+An ordinary `request` node's 4xx/5xx (or an extraction failure) **halts its own branch by default — unless it's explicitly handled**. "Explicitly handled" has a precise meaning, not a vibe: if the very next node in the same sequence is a `choice`, that `choice` gets first look at the response regardless of status — a matching `case` (or a `default`) means the failure was exactly what the `choice` was there for, so nothing halts; only a status that `choice` *also* doesn't handle (no case, no default — already decided above) halts. A halt at the scenario's own top level ends the whole scenario; a halt inside a `parallel` branch ends only that branch.
+
+**In a `parallel` block, one branch failing does not cancel its siblings** — every branch runs to completion (or its own halt) independently. Whatever comes after the block (typically a `choice`) sees the failed branch's response the same way it would see a plain sequential failure — a `parallel` block's failure is handled through the exact same mechanism as any other, not a special case bolted on.
+
+**Open sub-question, genuinely unresolved: what does "the next node" see when *more than one* branch fails?** There's no single obvious "the" response once two or more branches have failed independently and a subsequent `choice` needs something to inspect. Options considered:
+
+- **(A) First failure wins**, by completion order. Simplest, but "first" is a race against real network timing — scenario behavior becomes nondeterministic exactly when multiple things are going wrong at once, the worst time for that.
+- **(B) Name branches; let `choice` target one specifically.** Give a branch an optional `id`; `choice.when` gains the ability to ask about a *specific* branch (`{"branch": "doctor-track", "status": {"eq": 500}}`) plus an aggregate `{"any_branch_failed": true}` / `{"all_branches_failed": true}` for "did the block fail at all" without caring which one. Fully deterministic, and the only option that actually answers "use the failed response from *the* failed branch" precisely — that phrase only means something once you can say which branch you mean. Costs a real schema addition: an optional `id` per node, two new `when` condition shapes.
+- **(C) Synthesize one pseudo-response for the whole block** (e.g. "worst" status across branches, failures listed together). Avoids naming branches, but invents a data shape nothing else in curly has, and hides exactly which thing went wrong behind an aggregate.
+
+**Recommendation: (B).** Not adopted yet — flagged here for the next pass, not decided by default.
+
+### Decided (2026-09): authoring shape
+
+**JSON-only for v1** — hand-edit `.curly/scenarios/<name>.json` directly. No CLI flag-based scenario-authoring subcommand: nested `sequence`/`parallel`/`choice` trees plus `imports` don't map onto flat CLI flags the way a single request's headers/body do (where `curly collections add-request` flags work fine). `curly scenario run <name>` is the only CLI surface M6 needs to *execute* a scenario; `curly scenario list`/`show` (mirroring `collections list`/`show`) are natural to add alongside for parity, but creating/editing a scenario stays JSON-only.
+
+A **GUI scenario editor/designer** (a visual sequence/parallel/choice builder) is a real idea for later — raised by the user, explicitly not part of M6, not scoped or committed. Worth its own design pass whenever it's picked up, not backed into as a side effect of building the execution engine first.
+
 ### Open questions (unresolved — next session should raise these, not assume answers)
 
-1. **DAG vs. nesting, finally confirmed?** — every worked example so far (including the one above) has used nesting without objection, and the recursive node format above has been adopted, but the user hasn't explicitly ruled out needing arbitrary "step D depends on both A and C, not just the previous step" dependency edges for some future scenario. Treat nesting as the working default, not a closed decision, until a real scenario surfaces that it can't express.
-2. **General step failure semantics** — distinct from the `choice`-specific decision above, which only covers "no case matched." Does an ordinary `request` node's own 4xx/5xx (or an extraction failure) halt the whole scenario by default (matching `--fail`'s existing spirit and the "fail loud" reasoning used for `choice` above), or is that configurable per-scenario? What happens to a `parallel` block where one branch fails and others are still running — cancel the rest, or let them finish and report all failures together?
+1. **DAG vs. nesting, finally confirmed?** — every worked example so far has used nesting without objection, and the recursive node format above has been adopted, but the user hasn't explicitly ruled out needing arbitrary "step D depends on both A and C, not just the previous step" dependency edges for some future scenario. Treat nesting as the working default, not a closed decision, until a real scenario surfaces that it can't express.
+2. **Multiple parallel branches failing at once** — see "Decided: failure semantics" above; option (B) (named branches) is recommended but not adopted.
 3. **Output**: a per-step summary (status/ms/pass-fail, test-report-style) vs. each step's normal `run` output back-to-back vs. something configurable?
-4. **CLI shape**: `curly scenario run <scenario-name>` (no collection prefix — a scenario is no longer inside one, it's its own top-level named thing, same as `curly env show <name>` or `curly session show --env <name>`)? How are scenarios authored — `curly scenario add-step`-style flags, or JSON-only (nested sequence/parallel/choice trees, and now `imports`, don't map cleanly onto flat CLI flags the way a single request's headers/body do, so JSON-only may be the more honest answer here even though extraction rules support flags)?

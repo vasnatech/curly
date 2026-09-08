@@ -5,8 +5,10 @@
 //! or via `curly gui` (DESIGN.md §3).
 
 mod app;
+mod project;
 
 pub use app::CurlyApp;
+pub use project::Project;
 
 /// Launch the GUI. Blocks until the window is closed.
 pub fn run() -> anyhow::Result<()> {

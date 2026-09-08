@@ -249,6 +249,21 @@ pub struct CurlyApp {
     /// from `load_notice` (about the editor's own content) and
     /// `env_notice`/`session_notice` (environments/sessions).
     collection_notice: Option<String>,
+    /// The Response pane's search box contents — highlights every
+    /// case-insensitive match in the body regardless of whether it's JSON
+    /// (FR-22). Persists across sends deliberately, so re-sending the same
+    /// request keeps the same search highlighted.
+    response_search: String,
+    /// The "Save Response…" async file dialog's result channel — same
+    /// fire-and-poll shape as `project_dialog_rx`, but the spawned task
+    /// also writes the file itself before reporting back, so there's only
+    /// one round trip instead of picking a path here and writing
+    /// separately once poll sees it.
+    response_save_rx: Option<mpsc::Receiver<Option<String>>>,
+    /// Feedback from the last "Save Response…" (success or failure);
+    /// `None` after a cancelled dialog, deliberately — cancelling isn't
+    /// worth a notice.
+    response_save_notice: Option<String>,
 }
 
 impl CurlyApp {
@@ -310,6 +325,9 @@ impl CurlyApp {
             loaded_request: None,
             save_dialog: None,
             collection_notice: None,
+            response_search: String::new(),
+            response_save_rx: None,
+            response_save_notice: None,
         }
     }
 
@@ -356,6 +374,43 @@ impl CurlyApp {
             self.project_dialog_rx = None;
             if let Some(dir) = picked {
                 self.open_project_at(&dir);
+            }
+        }
+    }
+
+    /// Show a native "Save As" dialog (async, same reason `open_project_dialog`
+    /// is — see its doc comment) and write `body` to wherever the user
+    /// picks. `default_name` seeds the dialog's filename (e.g.
+    /// `response.json` vs `response.txt`) — purely a starting suggestion,
+    /// the user can change it. A cancelled dialog reports nothing; a write
+    /// failure or success both set `response_save_notice`.
+    fn save_response_to_file(&mut self, ctx: &egui::Context, body: String, default_name: &str) {
+        let (tx, rx) = mpsc::channel();
+        self.response_save_rx = Some(rx);
+        let ctx = ctx.clone();
+        let default_name = default_name.to_string();
+        self.runtime.spawn(async move {
+            let picked = rfd::AsyncFileDialog::new().set_file_name(&default_name).save_file().await;
+            let message = match picked {
+                Some(handle) => match tokio::fs::write(handle.path(), body.as_bytes()).await {
+                    Ok(()) => Some(format!("saved response to {}", handle.path().display())),
+                    Err(e) => Some(format!("failed to save response: {e}")),
+                },
+                None => None,
+            };
+            let _ = tx.send(message);
+            ctx.request_repaint();
+        });
+    }
+
+    fn poll_response_save(&mut self) {
+        let Some(rx) = &self.response_save_rx else {
+            return;
+        };
+        if let Ok(message) = rx.try_recv() {
+            self.response_save_rx = None;
+            if let Some(message) = message {
+                self.response_save_notice = Some(message);
             }
         }
     }
@@ -1132,10 +1187,243 @@ fn parse_gnome_color_scheme(raw: &str) -> Option<egui::Theme> {
     }
 }
 
+// --- FR-22: JSON syntax highlighting + in-body search (Response pane) ---
+
+/// A JSON token's category, for coloring — keys and string values share
+/// `String` rather than getting their own colors; distinguishing them
+/// would mean peeking ahead for a following `:`, which isn't worth the
+/// complexity for what's meant to be a readability aid, not a full editor.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum JsonTokenKind {
+    String,
+    Number,
+    Keyword,
+    Punct,
+    Other,
+}
+
+/// Split `text` into `(byte_range, kind)` spans covering the whole string
+/// with no gaps — including whitespace, folded into `Other` along with
+/// anything unrecognized. Byte-indexed rather than char-indexed, but safe
+/// to slice on those boundaries regardless: every match pattern here is an
+/// ASCII byte, which can never appear as a continuation byte of a
+/// multi-byte UTF-8 sequence, so `i` only ever advances to real char
+/// boundaries.
+fn tokenize_json(text: &str) -> Vec<(std::ops::Range<usize>, JsonTokenKind)> {
+    let bytes = text.as_bytes();
+    let len = bytes.len();
+    let mut spans = Vec::new();
+    let mut i = 0;
+
+    while i < len {
+        let start = i;
+        match bytes[i] {
+            b'"' => {
+                i += 1;
+                while i < len {
+                    if bytes[i] == b'\\' && i + 1 < len {
+                        i += 2;
+                        continue;
+                    }
+                    let is_close = bytes[i] == b'"';
+                    i += 1;
+                    if is_close {
+                        break;
+                    }
+                }
+                spans.push((start..i, JsonTokenKind::String));
+            }
+            b'{' | b'}' | b'[' | b']' | b':' | b',' => {
+                i += 1;
+                spans.push((start..i, JsonTokenKind::Punct));
+            }
+            b'-' | b'0'..=b'9' => {
+                i += 1;
+                while i < len && matches!(bytes[i], b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-') {
+                    i += 1;
+                }
+                spans.push((start..i, JsonTokenKind::Number));
+            }
+            b't' | b'f' | b'n' if text[i..].starts_with("true")
+                || text[i..].starts_with("false")
+                || text[i..].starts_with("null") =>
+            {
+                let word_len = if text[i..].starts_with("false") { 5 } else { 4 };
+                i += word_len;
+                spans.push((start..i, JsonTokenKind::Keyword));
+            }
+            _ => {
+                i += 1;
+                while i < len
+                    && !matches!(
+                        bytes[i],
+                        b'"' | b'{' | b'}' | b'[' | b']' | b':' | b',' | b'-' | b'0'..=b'9' | b't' | b'f' | b'n'
+                    )
+                {
+                    i += 1;
+                }
+                spans.push((start..i, JsonTokenKind::Other));
+            }
+        }
+    }
+
+    spans
+}
+
+struct JsonColors {
+    string: egui::Color32,
+    number: egui::Color32,
+    keyword: egui::Color32,
+    punct: egui::Color32,
+    default: egui::Color32,
+    highlight_bg: egui::Color32,
+    highlight_fg: egui::Color32,
+}
+
+fn json_colors(dark_mode: bool) -> JsonColors {
+    if dark_mode {
+        JsonColors {
+            string: egui::Color32::from_rgb(152, 195, 121),
+            number: egui::Color32::from_rgb(209, 154, 102),
+            keyword: egui::Color32::from_rgb(198, 120, 221),
+            punct: egui::Color32::from_rgb(150, 150, 150),
+            default: egui::Color32::from_rgb(220, 220, 220),
+            highlight_bg: egui::Color32::from_rgb(255, 220, 90),
+            highlight_fg: egui::Color32::BLACK,
+        }
+    } else {
+        JsonColors {
+            string: egui::Color32::from_rgb(60, 120, 50),
+            number: egui::Color32::from_rgb(170, 90, 20),
+            keyword: egui::Color32::from_rgb(130, 60, 150),
+            punct: egui::Color32::from_rgb(100, 100, 100),
+            default: egui::Color32::from_rgb(30, 30, 30),
+            highlight_bg: egui::Color32::from_rgb(255, 230, 120),
+            highlight_fg: egui::Color32::BLACK,
+        }
+    }
+}
+
+/// Append `text` to `job` in `color`, splitting further at every
+/// case-insensitive occurrence of `search_lower` (already lowercased by
+/// the caller, once, rather than per-call) to give matches a highlighted
+/// background — a no-op split when `search_lower` is empty. Byte-slicing
+/// `text`/`text.to_lowercase()` in lockstep is exact for ASCII search
+/// terms (the overwhelming common case — field names, tokens); a
+/// non-ASCII search term whose lowercasing changes byte length could
+/// mis-slice, an accepted approximation rather than pulling in a full
+/// Unicode-aware search library for a highlight-only feature.
+fn append_with_search_highlight(
+    job: &mut egui::text::LayoutJob,
+    text: &str,
+    color: egui::Color32,
+    font_id: egui::FontId,
+    search_lower: &str,
+    highlight_bg: egui::Color32,
+    highlight_fg: egui::Color32,
+) {
+    if search_lower.is_empty() {
+        job.append(text, 0.0, egui::text::TextFormat {
+            font_id,
+            color,
+            ..Default::default()
+        });
+        return;
+    }
+
+    let text_lower = text.to_lowercase();
+    let mut pos = 0;
+    while let Some(rel) = text_lower.get(pos..).and_then(|s| s.find(search_lower)) {
+        let match_start = pos + rel;
+        let match_end = match_start + search_lower.len();
+        if match_start > pos {
+            job.append(&text[pos..match_start], 0.0, egui::text::TextFormat {
+                font_id: font_id.clone(),
+                color,
+                ..Default::default()
+            });
+        }
+        if let Some(matched) = text.get(match_start..match_end) {
+            job.append(matched, 0.0, egui::text::TextFormat {
+                font_id: font_id.clone(),
+                color: highlight_fg,
+                background: highlight_bg,
+                ..Default::default()
+            });
+        }
+        pos = match_end;
+    }
+    if pos < text.len() {
+        job.append(&text[pos..], 0.0, egui::text::TextFormat {
+            font_id,
+            color,
+            ..Default::default()
+        });
+    }
+}
+
+/// Build a syntax-highlighted (+ search-highlighted) `LayoutJob` for a JSON
+/// response body.
+fn json_layout_job(text: &str, dark_mode: bool, search_lower: &str) -> egui::text::LayoutJob {
+    let colors = json_colors(dark_mode);
+    let font_id = egui::FontId::monospace(13.0);
+    let mut job = egui::text::LayoutJob::default();
+
+    for (range, kind) in tokenize_json(text) {
+        let color = match kind {
+            JsonTokenKind::String => colors.string,
+            JsonTokenKind::Number => colors.number,
+            JsonTokenKind::Keyword => colors.keyword,
+            JsonTokenKind::Punct => colors.punct,
+            JsonTokenKind::Other => colors.default,
+        };
+        append_with_search_highlight(
+            &mut job,
+            &text[range],
+            color,
+            font_id.clone(),
+            search_lower,
+            colors.highlight_bg,
+            colors.highlight_fg,
+        );
+    }
+
+    job
+}
+
+/// Same search-highlighting as `json_layout_job`, but no syntax coloring —
+/// for a non-JSON response body (plain text, XML, HTML, ...).
+fn plain_layout_job(text: &str, dark_mode: bool, search_lower: &str) -> egui::text::LayoutJob {
+    let colors = json_colors(dark_mode);
+    let font_id = egui::FontId::monospace(13.0);
+    let mut job = egui::text::LayoutJob::default();
+    append_with_search_highlight(
+        &mut job,
+        text,
+        colors.default,
+        font_id,
+        search_lower,
+        colors.highlight_bg,
+        colors.highlight_fg,
+    );
+    job
+}
+
+/// Count of case-insensitive, non-overlapping occurrences of `search` in
+/// `text` — shown next to the search box so "0 matches" vs "N matches" is
+/// explicit rather than the user having to eyeball the highlighting.
+fn count_matches(text: &str, search: &str) -> usize {
+    if search.is_empty() {
+        return 0;
+    }
+    text.to_lowercase().matches(&search.to_lowercase()).count()
+}
+
 impl eframe::App for CurlyApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll_response();
         self.poll_project_dialog();
+        self.poll_response_save();
         self.show_save_dialog(ui.ctx());
 
         egui::Panel::left("project_sidebar")
@@ -1489,6 +1777,15 @@ impl eframe::App for CurlyApp {
             ui.separator();
             ui.heading("Response");
 
+            // Deferred like every other `self`-mutating action triggered from
+            // inside a `match &self.response { ... }` arm: `resp` there
+            // borrows `self.response` specifically, but `save_response_to_file`
+            // takes `&mut self` (opaque to the borrow checker — it can't see
+            // that the method never touches `self.response`), so the actual
+            // call has to wait until this match's borrow of `self.response`
+            // has ended.
+            let mut save_response_request: Option<(String, String)> = None;
+
             match &self.response {
                 None if self.in_flight => {
                     ui.label("Sending…");
@@ -1519,19 +1816,66 @@ impl eframe::App for CurlyApp {
                         }
                     });
 
-                    let mut pretty = serde_json::from_str::<serde_json::Value>(&resp.body)
-                        .ok()
-                        .and_then(|v| serde_json::to_string_pretty(&v).ok())
-                        .unwrap_or_else(|| resp.body.clone());
+                    let is_json = serde_json::from_str::<serde_json::Value>(&resp.body).is_ok();
+                    let mut pretty = if is_json {
+                        serde_json::from_str::<serde_json::Value>(&resp.body)
+                            .ok()
+                            .and_then(|v| serde_json::to_string_pretty(&v).ok())
+                            .unwrap_or_else(|| resp.body.clone())
+                    } else {
+                        resp.body.clone()
+                    };
+
+                    ui.horizontal(|ui| {
+                        ui.label("Search:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.response_search)
+                                .desired_width(180.0)
+                                .hint_text("filter body…"),
+                        );
+                        if !self.response_search.is_empty() {
+                            ui.weak(format!(
+                                "{} match(es)",
+                                count_matches(&pretty, &self.response_search)
+                            ));
+                        }
+                        if ui.button("Save Response…").clicked() {
+                            let default_name =
+                                if is_json { "response.json" } else { "response.txt" }.to_string();
+                            save_response_request = Some((resp.body.clone(), default_name));
+                        }
+                    });
+
+                    if let Some(notice) = &self.response_save_notice {
+                        ui.colored_label(egui::Color32::from_rgb(120, 190, 130), notice);
+                    }
+
+                    let dark_mode = ui.visuals().dark_mode;
+                    let search_lower = self.response_search.to_lowercase();
+                    let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap_width: f32| {
+                        let text = buf.as_str();
+                        let mut job = if is_json {
+                            json_layout_job(text, dark_mode, &search_lower)
+                        } else {
+                            plain_layout_job(text, dark_mode, &search_lower)
+                        };
+                        job.wrap.max_width = wrap_width;
+                        ui.fonts_mut(|f| f.layout_job(job))
+                    };
 
                     egui::ScrollArea::vertical().show(ui, |ui| {
                         ui.add(
                             egui::TextEdit::multiline(&mut pretty)
                                 .font(egui::TextStyle::Monospace)
-                                .desired_width(f32::INFINITY),
+                                .desired_width(f32::INFINITY)
+                                .layouter(&mut layouter),
                         );
                     });
                 }
+            }
+
+            if let Some((body, default_name)) = save_response_request {
+                self.save_response_to_file(&ctx, body, &default_name);
             }
 
             if should_send {
@@ -2966,5 +3310,185 @@ mod tests {
     #[test]
     fn parse_gnome_color_scheme_empty_is_none() {
         assert_eq!(parse_gnome_color_scheme(""), None);
+    }
+
+    // --- FR-22: JSON syntax highlighting + in-body search ---
+
+    #[test]
+    fn tokenize_json_identifies_a_string() {
+        let text = r#""hello""#;
+        let spans = tokenize_json(text);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].1, JsonTokenKind::String);
+        assert_eq!(spans[0].0, 0..text.len());
+    }
+
+    #[test]
+    fn tokenize_json_identifies_a_number() {
+        let spans = tokenize_json("42");
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].1, JsonTokenKind::Number);
+    }
+
+    #[test]
+    fn tokenize_json_identifies_a_negative_float() {
+        let spans = tokenize_json("-3.14");
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].1, JsonTokenKind::Number);
+        assert_eq!(spans[0].0, 0..5);
+    }
+
+    #[test]
+    fn tokenize_json_identifies_keywords() {
+        for word in ["true", "false", "null"] {
+            let spans = tokenize_json(word);
+            assert_eq!(spans.len(), 1, "word: {word}");
+            assert_eq!(spans[0].1, JsonTokenKind::Keyword, "word: {word}");
+            assert_eq!(spans[0].0, 0..word.len(), "word: {word}");
+        }
+    }
+
+    #[test]
+    fn tokenize_json_identifies_punctuation() {
+        let spans = tokenize_json("{}[]:,");
+        assert_eq!(spans.len(), 6);
+        for (_, kind) in &spans {
+            assert_eq!(*kind, JsonTokenKind::Punct);
+        }
+    }
+
+    #[test]
+    fn tokenize_json_handles_an_escaped_quote_inside_a_string() {
+        let text = r#""a\"b""#;
+        let spans = tokenize_json(text);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].1, JsonTokenKind::String);
+        assert_eq!(spans[0].0, 0..text.len());
+    }
+
+    #[test]
+    fn tokenize_json_covers_the_whole_input_with_no_gaps() {
+        let text = r#"{"name": "curly", "count": 3, "ok": true, "note": null}"#;
+        let spans = tokenize_json(text);
+        let mut expected_start = 0;
+        for (range, _) in &spans {
+            assert_eq!(range.start, expected_start);
+            expected_start = range.end;
+        }
+        assert_eq!(expected_start, text.len());
+    }
+
+    #[test]
+    fn tokenize_json_handles_multibyte_utf8_string_content_without_panicking() {
+        let text = "\"héllo wörld 🎉\"";
+        let spans = tokenize_json(text);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].1, JsonTokenKind::String);
+        assert_eq!(spans[0].0, 0..text.len());
+    }
+
+    #[test]
+    fn count_matches_is_zero_for_an_empty_search() {
+        assert_eq!(count_matches("hello world", ""), 0);
+    }
+
+    #[test]
+    fn count_matches_counts_case_insensitively() {
+        assert_eq!(count_matches("Hello HELLO hello", "hello"), 3);
+    }
+
+    #[test]
+    fn count_matches_is_zero_when_not_found() {
+        assert_eq!(count_matches("hello world", "xyz"), 0);
+    }
+
+    fn highlight_job(text: &str, search_lower: &str) -> egui::text::LayoutJob {
+        let mut job = egui::text::LayoutJob::default();
+        append_with_search_highlight(
+            &mut job,
+            text,
+            egui::Color32::WHITE,
+            egui::FontId::monospace(13.0),
+            search_lower,
+            egui::Color32::YELLOW,
+            egui::Color32::BLACK,
+        );
+        job
+    }
+
+    fn section_texts(job: &egui::text::LayoutJob) -> Vec<String> {
+        job.sections
+            .iter()
+            .map(|s| job.text[s.byte_range.start.0..s.byte_range.end.0].to_string())
+            .collect()
+    }
+
+    #[test]
+    fn append_with_search_highlight_empty_search_is_one_plain_section() {
+        let job = highlight_job("hello world", "");
+        assert_eq!(job.text, "hello world");
+        assert_eq!(section_texts(&job), vec!["hello world".to_string()]);
+        assert_eq!(job.sections[0].format.background, egui::Color32::TRANSPARENT);
+    }
+
+    #[test]
+    fn append_with_search_highlight_no_match_is_one_plain_section() {
+        let job = highlight_job("hello world", "xyz");
+        assert_eq!(job.text, "hello world");
+        assert_eq!(section_texts(&job), vec!["hello world".to_string()]);
+        assert_eq!(job.sections[0].format.background, egui::Color32::TRANSPARENT);
+    }
+
+    #[test]
+    fn append_with_search_highlight_splits_around_a_middle_match() {
+        let job = highlight_job("aXb", "x");
+        assert_eq!(job.text, "aXb");
+        assert_eq!(
+            section_texts(&job),
+            vec!["a".to_string(), "X".to_string(), "b".to_string()]
+        );
+        assert_eq!(job.sections[1].format.background, egui::Color32::YELLOW);
+        assert_eq!(job.sections[0].format.background, egui::Color32::TRANSPARENT);
+        assert_eq!(job.sections[2].format.background, egui::Color32::TRANSPARENT);
+    }
+
+    #[test]
+    fn append_with_search_highlight_match_at_start() {
+        let job = highlight_job("Xab", "x");
+        assert_eq!(section_texts(&job), vec!["X".to_string(), "ab".to_string()]);
+        assert_eq!(job.sections[0].format.background, egui::Color32::YELLOW);
+    }
+
+    #[test]
+    fn append_with_search_highlight_match_at_end() {
+        let job = highlight_job("abX", "x");
+        assert_eq!(section_texts(&job), vec!["ab".to_string(), "X".to_string()]);
+        assert_eq!(job.sections[1].format.background, egui::Color32::YELLOW);
+    }
+
+    #[test]
+    fn append_with_search_highlight_two_matches() {
+        let job = highlight_job("aXbXc", "x");
+        assert_eq!(job.text, "aXbXc");
+        assert_eq!(
+            section_texts(&job),
+            vec![
+                "a".to_string(),
+                "X".to_string(),
+                "b".to_string(),
+                "X".to_string(),
+                "c".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn append_with_search_highlight_is_case_insensitive() {
+        let job = highlight_job("ABC", "b");
+        assert_eq!(
+            section_texts(&job),
+            vec!["A".to_string(), "B".to_string(), "C".to_string()]
+        );
+        assert_eq!(job.sections[1].format.background, egui::Color32::YELLOW);
     }
 }

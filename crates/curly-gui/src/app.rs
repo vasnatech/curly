@@ -1,13 +1,12 @@
 //! The GUI's slices so far: FR-17's core loop (method/URL bar, Send,
 //! Headers/Body panels, a response pane), the start of FR-18 (a project
 //! picker plus browsing a collection's tree and clicking a request to load
-//! it into the editor), an environment switcher with real `{{variable}}`
-//! substitution when sending, and now creating/editing/deleting
-//! environments and their variables from the GUI itself (all FR-21). Still
-//! not built: `--var key=value`-style ad-hoc overrides, extraction rules
-//! writing into a session, saving requests, or multiple simultaneously-open
-//! projects (see project.rs's doc comment for why the data model already
-//! supports the last one).
+//! it into the editor), and all of FR-21 — an environment switcher,
+//! creating/editing/deleting environments, ad-hoc `--var`-style overrides,
+//! and now a loaded request's extraction rules running on a successful send
+//! and writing into a session, same as `curly run`. Still not built: saving
+//! requests, or multiple simultaneously-open projects (see project.rs's doc
+//! comment for why the data model already supports the last one).
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -15,6 +14,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use curly_core::exec::{self, ResponseSummary};
+use curly_core::extraction::{self, Extraction};
 use curly_core::model::{Body, Request};
 use curly_core::storage::{
     Collection, Environment, Folder, KvPair, SavedAuth, SavedBody, SavedRequest, Storage, Variable,
@@ -93,6 +93,20 @@ enum SendOutcome {
     Error(String),
 }
 
+/// Captured at `send()` time (before the request even goes out) rather than
+/// recomputed once the response lands, so extraction runs against exactly
+/// the same variable scope the request itself was substituted against —
+/// mirroring `curly-cli`'s own `run.rs`, which captures `variables` once and
+/// reuses it in its extraction closure rather than re-deriving it.
+struct PendingExtraction {
+    rules: Vec<Extraction>,
+    variables: BTreeMap<String, String>,
+    /// Which session to write into — the active environment's name, or
+    /// "global" if none is selected, matching `curly run`'s own
+    /// `session_scope` default.
+    session_scope: String,
+}
+
 /// A click in the sidebar's Environments section, applied after the
 /// rendering loop finishes — same reason `show_collection_tree` defers its
 /// click, and `load_saved_request`'s callers do too: acting immediately
@@ -138,6 +152,13 @@ pub struct CurlyApp {
     /// whenever the active project changes, since the previous selection's
     /// name may not even exist in the new project.
     active_environment: Option<String>,
+    /// Read-only display of `session_scope()`'s session variables — the
+    /// ones extraction writes into, distinct from `env_editor_variables`
+    /// (the environment *file*, editable). Refreshed whenever the
+    /// environment selection changes or extraction just wrote into it, so
+    /// what an extracted variable actually landed as is visible somewhere
+    /// in the GUI rather than only discoverable via `curly session show`.
+    session_variables: Vec<Variable>,
     /// The active environment's variables, editable in the sidebar — loaded
     /// from disk whenever `active_environment` changes, written back to
     /// disk only when the user clicks Save (so half-edited rows never leak
@@ -156,6 +177,20 @@ pub struct CurlyApp {
     /// active project or environment changes (same as headers/body — it's
     /// editor state, not project state).
     var_overrides: Vec<OverrideRow>,
+    /// The currently loaded saved request's extraction rules (FR-10), if
+    /// any — carried over by `load_saved_request`, empty for a request
+    /// built from scratch. Applied on a successful send via
+    /// `pending_extraction`, same as `curly run`.
+    extract_rules: Vec<Extraction>,
+    /// Set by `send()` right before the request goes out (if
+    /// `extract_rules` is non-empty), consumed by `poll_response` once the
+    /// response lands. `None` in between sends, and `None` for a send with
+    /// nothing to extract — extraction is skip-if-nothing-to-do, not a
+    /// mandatory step.
+    pending_extraction: Option<PendingExtraction>,
+    /// Feedback from applying extraction rules after a send (success or
+    /// error) — separate from `env_notice`/`load_notice`.
+    session_notice: Option<String>,
     /// Set after loading a saved request whose body/auth couldn't be fully
     /// represented in the editor, or that references a variable undefined
     /// in the currently selected environment — shown once as a notice near
@@ -201,10 +236,14 @@ impl CurlyApp {
             collections: Vec::new(),
             environments: Vec::new(),
             active_environment: None,
+            session_variables: Vec::new(),
             env_editor_variables: Vec::new(),
             new_environment_name: String::new(),
             env_notice: None,
             var_overrides: Vec::new(),
+            extract_rules: Vec::new(),
+            pending_extraction: None,
+            session_notice: None,
             load_notice: None,
         }
     }
@@ -231,6 +270,7 @@ impl CurlyApp {
         self.env_editor_variables.clear();
         self.env_notice = None;
         self.refresh_project_lists();
+        self.refresh_session_variables();
     }
 
     fn refresh_project_lists(&mut self) {
@@ -268,6 +308,7 @@ impl CurlyApp {
             None => self.env_editor_variables.clear(),
         }
         self.active_environment = name;
+        self.refresh_session_variables();
     }
 
     fn load_environment_editor(&mut self, name: &str) {
@@ -385,8 +426,7 @@ impl CurlyApp {
                     }
                 }
             }
-            let session_scope = self.active_environment.as_deref().unwrap_or("global");
-            if let Ok(session) = project.storage.load_session(session_scope) {
+            if let Ok(session) = project.storage.load_session(self.session_scope()) {
                 for var in session.variables {
                     variables.insert(var.key, var.value);
                 }
@@ -405,12 +445,16 @@ impl CurlyApp {
 
     /// Load a saved request's method/URL/headers into the editor, plus its
     /// body if it's a simple raw text body (the only kind the GUI's editor
-    /// can represent so far) and its auth if it's a Bearer token (folded
-    /// into an `Authorization` header — the editor has no separate auth
-    /// concept yet). Anything that can't be represented, or any
-    /// `{{variable}}` token that the currently selected environment doesn't
-    /// define, surfaces as `load_notice` rather than being silently dropped
-    /// or silently sent literally.
+    /// can represent so far), its auth if it's a Bearer token (folded into
+    /// an `Authorization` header — the editor has no separate auth concept
+    /// yet), and its extraction rules (carried over as-is into
+    /// `extract_rules` — there's no GUI editor for these yet, only `curly
+    /// collections add-request --extract-*` defines them, but a loaded
+    /// request's rules run on a successful send the same as `curly run`'s
+    /// do). Anything that can't be represented, or any `{{variable}}` token
+    /// that the currently selected environment doesn't define, surfaces as
+    /// `load_notice` rather than being silently dropped or silently sent
+    /// literally.
     fn load_saved_request(&mut self, saved: &SavedRequest) {
         self.method = saved.method.clone();
         self.url = saved.url.clone();
@@ -423,6 +467,8 @@ impl CurlyApp {
                 enabled: kv.enabled,
             })
             .collect();
+        self.extract_rules = saved.extract.clone();
+        self.session_notice = None;
 
         let mut notices: Vec<String> = Vec::new();
 
@@ -499,6 +545,47 @@ impl CurlyApp {
         self.active_project_idx.and_then(|i| self.projects.get(i))
     }
 
+    /// Which session `merged_variables`/extraction read from and write
+    /// into — the active environment's name, or "global" if none is
+    /// selected. Matches `curly run`'s own `session_scope` default exactly.
+    fn session_scope(&self) -> &str {
+        self.active_environment.as_deref().unwrap_or("global")
+    }
+
+    /// Re-read `session_variables` (the read-only sidebar display) from
+    /// disk for the current `session_scope()` — called whenever the
+    /// environment selection changes or a send just wrote new variables
+    /// into the session, so the display never goes stale without an
+    /// explicit reload step.
+    fn refresh_session_variables(&mut self) {
+        self.session_variables = match self.active_project() {
+            Some(project) => project
+                .storage
+                .load_session(self.session_scope())
+                .map(|s| s.variables)
+                .unwrap_or_default(),
+            None => Vec::new(),
+        };
+    }
+
+    /// Delete the current `session_scope()`'s session entirely — mirrors
+    /// `curly session clear`. A no-op (not an error) if there was nothing
+    /// to clear, same as the storage layer it calls.
+    fn clear_session(&mut self) {
+        let scope = self.session_scope().to_string();
+        let result = match self.active_project() {
+            Some(project) => project.storage.clear_session(&scope),
+            None => return,
+        };
+        match result {
+            Ok(()) => {
+                self.session_notice = Some(format!("cleared session \"{scope}\""));
+                self.refresh_session_variables();
+            }
+            Err(e) => self.session_notice = Some(format!("failed to clear session \"{scope}\": {e}")),
+        }
+    }
+
     /// Builds the request to send, substituting `{{variable}}` tokens
     /// against `merged_variables()` first (FR-21) — same as `curly run`,
     /// an undefined variable fails the whole send with a clear error rather
@@ -534,6 +621,19 @@ impl CurlyApp {
             }
         };
 
+        // Captured now, before the request goes out, not recomputed once
+        // the response lands — see PendingExtraction's doc comment.
+        self.pending_extraction = if self.extract_rules.is_empty() {
+            None
+        } else {
+            Some(PendingExtraction {
+                rules: self.extract_rules.clone(),
+                variables: self.merged_variables(),
+                session_scope: self.session_scope().to_string(),
+            })
+        };
+        self.session_notice = None;
+
         let (tx, rx) = mpsc::channel();
         self.rx = Some(rx);
         self.in_flight = true;
@@ -555,12 +655,70 @@ impl CurlyApp {
         let Some(rx) = &self.rx else { return };
         if let Ok(outcome) = rx.try_recv() {
             self.in_flight = false;
-            self.response = Some(match outcome {
-                SendOutcome::Success(r) => Ok(r),
-                SendOutcome::Error(e) => Err(e),
-            });
+            match outcome {
+                SendOutcome::Success(r) => {
+                    self.apply_pending_extraction(&r);
+                    self.response = Some(Ok(r));
+                }
+                SendOutcome::Error(e) => {
+                    self.pending_extraction = None;
+                    self.response = Some(Err(e));
+                }
+            }
             self.rx = None;
         }
+    }
+
+    /// Run this send's captured extraction rules (if any) against the
+    /// response that just landed, and write the results into the right
+    /// session — same "only on a 2xx, a failing rule on a real success is a
+    /// real problem, an unmet rule on any other status is an expected
+    /// absence" behavior as `curly run`'s own extraction closure. Sets
+    /// `session_notice` either way (success or failure) so extraction
+    /// happening is never silent, matching the rest of this app's "no
+    /// silent failure" pattern.
+    fn apply_pending_extraction(&mut self, response: &ResponseSummary) {
+        let Some(pending) = self.pending_extraction.take() else {
+            return;
+        };
+        if !(200..300).contains(&response.status) {
+            return;
+        }
+
+        let extracted = match extraction::apply(&pending.rules, response, &pending.variables) {
+            Ok(e) => e,
+            Err(e) => {
+                self.session_notice = Some(format!("extraction failed: {e}"));
+                return;
+            }
+        };
+
+        let result: anyhow::Result<()> = match self.active_project() {
+            Some(project) => (|| {
+                let mut session = project.storage.load_session(&pending.session_scope)?;
+                for var in &extracted {
+                    session.set(var.name.as_str(), var.value.as_str(), var.secret);
+                }
+                project.storage.save_session(&session)
+            })(),
+            None => Err(anyhow::anyhow!("no project is open")),
+        };
+
+        let message = match &result {
+            Ok(()) => {
+                let names: Vec<&str> = extracted.iter().map(|v| v.name.as_str()).collect();
+                format!(
+                    "extracted {} into session \"{}\"",
+                    names.join(", "),
+                    pending.session_scope
+                )
+            }
+            Err(e) => format!("extracted variable(s) but failed to save the session: {e}"),
+        };
+        if result.is_ok() {
+            self.refresh_session_variables();
+        }
+        self.session_notice = Some(message);
     }
 }
 
@@ -696,6 +854,35 @@ impl eframe::App for CurlyApp {
                             });
                         });
                 }
+
+                ui.separator();
+
+                let mut clear_session_clicked = false;
+                egui::CollapsingHeader::new(format!(
+                    "Session \"{}\" ({})",
+                    self.session_scope(),
+                    self.session_variables.len()
+                ))
+                .default_open(false)
+                .show(ui, |ui| {
+                    ui.weak(
+                        "Read-only — written by extraction rules on a successful send, \
+                         not the environment file. Edit the environment above to change a value by hand.",
+                    );
+                    if self.session_variables.is_empty() {
+                        ui.weak("  (empty)");
+                    }
+                    for var in &self.session_variables {
+                        let value = if var.secret { "***" } else { var.value.as_str() };
+                        ui.label(format!("  {} = {value}", var.key));
+                    }
+                    if !self.session_variables.is_empty() && ui.button("Clear session").clicked() {
+                        clear_session_clicked = true;
+                    }
+                });
+                if clear_session_clicked {
+                    self.clear_session();
+                }
             });
 
         egui::CentralPanel::default().show(ui, |ui| {
@@ -704,6 +891,19 @@ impl eframe::App for CurlyApp {
 
             if let Some(notice) = &self.load_notice {
                 ui.colored_label(egui::Color32::from_rgb(230, 190, 60), notice);
+            }
+
+            if !self.extract_rules.is_empty() {
+                let names: Vec<&str> = self.extract_rules.iter().map(|e| e.name()).collect();
+                let scope = self.active_environment.as_deref().unwrap_or("global");
+                ui.weak(format!(
+                    "On a successful send, extracts {} into session \"{scope}\".",
+                    names.join(", ")
+                ));
+            }
+
+            if let Some(notice) = &self.session_notice {
+                ui.colored_label(egui::Color32::from_rgb(120, 190, 130), notice);
             }
 
             ui.horizontal(|ui| {
@@ -1629,5 +1829,302 @@ mod tests {
         app.load_saved_request(&saved);
 
         assert!(app.load_notice.is_none());
+    }
+
+    // --- FR-21: extraction rules writing into a session on a successful send ---
+
+    fn response(status: u16, body: &str) -> ResponseSummary {
+        ResponseSummary {
+            status,
+            headers: vec![],
+            body: body.to_string(),
+            elapsed: Duration::from_millis(1),
+        }
+    }
+
+    #[test]
+    fn load_saved_request_carries_over_extraction_rules() {
+        let mut app = CurlyApp::default_state();
+        let mut saved = SavedRequest::new("login", Method::POST, "https://example.com");
+        saved.extract.push(Extraction::Body {
+            name: "TOKEN".to_string(),
+            path: "token".to_string(),
+            secret: true,
+        });
+
+        app.load_saved_request(&saved);
+
+        assert_eq!(app.extract_rules.len(), 1);
+        assert_eq!(app.extract_rules[0].name(), "TOKEN");
+    }
+
+    #[test]
+    fn load_saved_request_clears_stale_session_notice() {
+        let mut app = CurlyApp::default_state();
+        app.session_notice = Some("stale".to_string());
+
+        app.load_saved_request(&SavedRequest::new("get-me", Method::GET, "https://example.com"));
+
+        assert!(app.session_notice.is_none());
+    }
+
+    #[test]
+    fn send_captures_pending_extraction_before_the_request_goes_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = project_with(&dir);
+        app.url = "http://127.0.0.1:1/get".to_string();
+        app.extract_rules = vec![Extraction::Body {
+            name: "TOKEN".to_string(),
+            path: "token".to_string(),
+            secret: false,
+        }];
+        app.active_environment = Some("dev".to_string());
+
+        let ctx = egui::Context::default();
+        app.send(&ctx);
+
+        let pending = app.pending_extraction.as_ref().unwrap();
+        assert_eq!(pending.rules.len(), 1);
+        assert_eq!(pending.session_scope, "dev");
+    }
+
+    #[test]
+    fn send_captures_no_pending_extraction_when_the_request_has_no_rules() {
+        let mut app = CurlyApp::default_state();
+        app.url = "http://127.0.0.1:1/get".to_string();
+
+        let ctx = egui::Context::default();
+        app.send(&ctx);
+
+        assert!(app.pending_extraction.is_none());
+    }
+
+    #[test]
+    fn send_defaults_the_session_scope_to_global_with_no_environment_selected() {
+        let mut app = CurlyApp::default_state();
+        app.url = "http://127.0.0.1:1/get".to_string();
+        app.extract_rules = vec![Extraction::Body {
+            name: "TOKEN".to_string(),
+            path: "token".to_string(),
+            secret: false,
+        }];
+
+        let ctx = egui::Context::default();
+        app.send(&ctx);
+
+        assert_eq!(app.pending_extraction.unwrap().session_scope, "global");
+    }
+
+    #[test]
+    fn apply_pending_extraction_writes_into_the_session_on_a_successful_response() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = project_with(&dir);
+        app.pending_extraction = Some(PendingExtraction {
+            rules: vec![Extraction::Body {
+                name: "TOKEN".to_string(),
+                path: "token".to_string(),
+                secret: true,
+            }],
+            variables: BTreeMap::new(),
+            session_scope: "dev".to_string(),
+        });
+
+        app.apply_pending_extraction(&response(200, r#"{"token":"abc123"}"#));
+
+        let session = app.active_project().unwrap().storage.load_session("dev").unwrap();
+        assert_eq!(session.variables.len(), 1);
+        assert_eq!(session.variables[0].key, "TOKEN");
+        assert_eq!(session.variables[0].value, "abc123");
+        assert!(session.variables[0].secret);
+        assert!(app.session_notice.unwrap().contains("TOKEN"));
+        assert!(app.pending_extraction.is_none());
+    }
+
+    #[test]
+    fn apply_pending_extraction_is_skipped_for_a_non_2xx_response() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = project_with(&dir);
+        app.pending_extraction = Some(PendingExtraction {
+            rules: vec![Extraction::Body {
+                name: "TOKEN".to_string(),
+                path: "token".to_string(),
+                secret: false,
+            }],
+            variables: BTreeMap::new(),
+            session_scope: "dev".to_string(),
+        });
+
+        app.apply_pending_extraction(&response(400, r#"{"error":"nope"}"#));
+
+        let session = app.active_project().unwrap().storage.load_session("dev").unwrap();
+        assert!(session.variables.is_empty());
+        assert!(app.session_notice.is_none());
+        assert!(app.pending_extraction.is_none());
+    }
+
+    #[test]
+    fn apply_pending_extraction_is_a_no_op_with_nothing_pending() {
+        let mut app = CurlyApp::default_state();
+        app.apply_pending_extraction(&response(200, "{}"));
+        assert!(app.session_notice.is_none());
+    }
+
+    #[test]
+    fn apply_pending_extraction_reports_an_extraction_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = project_with(&dir);
+        app.pending_extraction = Some(PendingExtraction {
+            rules: vec![Extraction::Body {
+                name: "TOKEN".to_string(),
+                path: "missing".to_string(),
+                secret: false,
+            }],
+            variables: BTreeMap::new(),
+            session_scope: "dev".to_string(),
+        });
+
+        app.apply_pending_extraction(&response(200, r#"{"token":"abc"}"#));
+
+        assert!(app.session_notice.unwrap().contains("extraction failed"));
+    }
+
+    #[test]
+    fn apply_pending_extraction_reports_no_project_open() {
+        let mut app = CurlyApp::default_state();
+        app.pending_extraction = Some(PendingExtraction {
+            rules: vec![Extraction::Body {
+                name: "TOKEN".to_string(),
+                path: "token".to_string(),
+                secret: false,
+            }],
+            variables: BTreeMap::new(),
+            session_scope: "dev".to_string(),
+        });
+
+        app.apply_pending_extraction(&response(200, r#"{"token":"abc"}"#));
+
+        assert!(app.session_notice.unwrap().contains("no project is open"));
+    }
+
+    // --- Session variables display (the read-only "Session" sidebar panel) ---
+
+    #[test]
+    fn apply_pending_extraction_refreshes_the_session_display() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = project_with(&dir);
+        app.pending_extraction = Some(PendingExtraction {
+            rules: vec![Extraction::Body {
+                name: "TOKEN".to_string(),
+                path: "token".to_string(),
+                secret: true,
+            }],
+            variables: BTreeMap::new(),
+            session_scope: "global".to_string(),
+        });
+
+        app.apply_pending_extraction(&response(200, r#"{"token":"abc123"}"#));
+
+        assert_eq!(app.session_variables.len(), 1);
+        assert_eq!(app.session_variables[0].key, "TOKEN");
+        assert_eq!(app.session_variables[0].value, "abc123");
+        assert!(app.session_variables[0].secret);
+    }
+
+    #[test]
+    fn apply_pending_extraction_does_not_refresh_the_display_on_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = project_with(&dir);
+        app.pending_extraction = Some(PendingExtraction {
+            rules: vec![Extraction::Body {
+                name: "TOKEN".to_string(),
+                path: "missing".to_string(),
+                secret: false,
+            }],
+            variables: BTreeMap::new(),
+            session_scope: "global".to_string(),
+        });
+
+        app.apply_pending_extraction(&response(200, r#"{"token":"abc"}"#));
+
+        assert!(app.session_variables.is_empty());
+    }
+
+    #[test]
+    fn selecting_an_environment_loads_its_sessions_variables() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = project_with(&dir);
+        let mut session = Environment::new("dev");
+        session.set("TOKEN", "abc", false);
+        app.active_project().unwrap().storage.save_session(&session).unwrap();
+
+        app.select_environment(Some("dev".to_string()));
+
+        assert_eq!(app.session_variables.len(), 1);
+        assert_eq!(app.session_variables[0].key, "TOKEN");
+    }
+
+    #[test]
+    fn deselecting_an_environment_falls_back_to_the_global_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = project_with(&dir);
+        let mut global_session = Environment::new("global");
+        global_session.set("REQ_ID", "xyz", false);
+        app.active_project().unwrap().storage.save_session(&global_session).unwrap();
+        app.select_environment(Some("dev".to_string()));
+
+        app.select_environment(None);
+
+        assert_eq!(app.session_variables.len(), 1);
+        assert_eq!(app.session_variables[0].key, "REQ_ID");
+    }
+
+    #[test]
+    fn opening_a_new_project_refreshes_the_session_display() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let mut app = project_with(&dir_a);
+        let mut session = Environment::new("global");
+        session.set("LEFTOVER", "stale", false);
+        app.active_project().unwrap().storage.save_session(&session).unwrap();
+        app.refresh_session_variables();
+        assert_eq!(app.session_variables.len(), 1);
+
+        app.open_project_at(dir_b.path());
+
+        assert!(app.session_variables.is_empty());
+    }
+
+    #[test]
+    fn clear_session_removes_it_and_refreshes_the_display() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = project_with(&dir);
+        let mut session = Environment::new("global");
+        session.set("TOKEN", "abc", false);
+        app.active_project().unwrap().storage.save_session(&session).unwrap();
+        app.refresh_session_variables();
+        assert_eq!(app.session_variables.len(), 1);
+
+        app.clear_session();
+
+        assert!(app.session_variables.is_empty());
+        let reloaded = app.active_project().unwrap().storage.load_session("global").unwrap();
+        assert!(reloaded.variables.is_empty());
+        assert!(app.session_notice.unwrap().contains("cleared session"));
+    }
+
+    #[test]
+    fn clear_session_is_a_no_op_with_no_project_open() {
+        let mut app = CurlyApp::default_state();
+        app.clear_session();
+        assert!(app.session_notice.is_none());
+    }
+
+    #[test]
+    fn session_scope_defaults_to_global_and_follows_the_active_environment() {
+        let mut app = CurlyApp::default_state();
+        assert_eq!(app.session_scope(), "global");
+
+        app.active_environment = Some("dev".to_string());
+        assert_eq!(app.session_scope(), "dev");
     }
 }

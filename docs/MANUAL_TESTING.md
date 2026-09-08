@@ -325,6 +325,15 @@ Requires an actual display (X11 or Wayland) — not scriptable the way the rest 
 | 16.79 | Click it again | Switches back — toggling is fully reversible, no restart needed. |
 | 16.80 | Change the OS theme (e.g. `gsettings set org.gnome.desktop.interface color-scheme prefer-light` from a terminal) while curly is already running | curly's theme does **not** change on its own (detection is startup-only, documented as a known gap) — use the in-app toggle instead. |
 | 16.81 | Run `gsettings set org.gnome.desktop.interface color-scheme prefer-light`, then relaunch `curly gui` | Launches in light mode this time — confirms detection actually re-reads the setting on each startup, not a one-time cached value from the first build/run. |
+| 16.82 | Send `https://httpbin.org/get` (or any JSON-returning endpoint) | The response body's strings, numbers, `true`/`false`/`null`, and punctuation are colored differently from each other. |
+| 16.83 | Toggle light/dark (16.78) while a JSON response is showing | The syntax-highlighting colors change to the theme-appropriate palette — no leftover colors from the other theme. |
+| 16.84 | Send a request that returns non-JSON (e.g. `https://example.com` for HTML) | Body still displays correctly, just without syntax coloring — no error, no blank pane. |
+| 16.85 | With a JSON response showing, type a field name or value you know appears in it into the "Search:" box | Every case-insensitive occurrence gets a yellow highlight; a "N match(es)" label appears next to the box with the right count. |
+| 16.86 | Type a search term that doesn't appear anywhere in the body | "0 match(es)" shows, nothing in the body is highlighted, no error. |
+| 16.87 | Clear the search box | Highlighting disappears, the "N match(es)" label disappears too (it only shows when the box is non-empty). |
+| 16.88 | Send a different request without touching the search box | The search term and its highlighting carry over to the new response — confirms it persists across sends rather than resetting each time. |
+| 16.89 | With a response showing, click **"Save Response…"**, pick a location, save | Native picker opens (responsively — same as 16.64), suggests `response.json`/`response.txt` depending on whether the body was JSON; after saving, a green notice shows the path; open the saved file and confirm it matches the response body exactly. |
+| 16.90 | Click **"Save Response…"** and cancel the dialog | No notice appears, nothing is written. |
 
 ## 17. Cross-platform sanity (when releasing)
 

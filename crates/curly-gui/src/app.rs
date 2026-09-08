@@ -1,8 +1,9 @@
-//! The GUI's first two slices: FR-17's core loop (method/URL bar, Send,
-//! Headers/Body panels, a response pane) plus the beginning of FR-18 — a
-//! project picker and a read-only listing of the active project's
-//! collections/environments. Not yet built: browsing into a collection's
-//! requests, loading one into the editor, an environment switcher, or
+//! The GUI's first three slices: FR-17's core loop (method/URL bar, Send,
+//! Headers/Body panels, a response pane), the start of FR-18 (a project
+//! picker), and now browsing a collection's tree and clicking a request to
+//! load it into the editor. Still not built: an environment switcher (so
+//! `{{variable}}` tokens stay unresolved when a loaded request has any —
+//! flagged with a notice, not silently wrong), saving from the GUI, or
 //! multiple simultaneously-open projects (see project.rs's doc comment for
 //! why the data model already supports the last one).
 
@@ -12,7 +13,7 @@ use std::time::Duration;
 
 use curly_core::exec::{self, ResponseSummary};
 use curly_core::model::{Body, Request};
-use curly_core::storage::Storage;
+use curly_core::storage::{Collection, Folder, KvPair, SavedAuth, SavedBody, SavedRequest, Storage};
 use reqwest::Method;
 
 use crate::project::Project;
@@ -62,11 +63,18 @@ pub struct CurlyApp {
     projects: Vec<Project>,
     active_project_idx: Option<usize>,
     project_open_error: Option<String>,
-    /// Cached listing of the active project's collections/environments —
-    /// re-read from disk whenever the active project changes. Not yet
-    /// clickable (that's the next slice, browsing into a collection).
-    collections: Vec<String>,
+    /// Cached listing of the active project's collections (loaded in full —
+    /// small enough for now to just read all of them upfront rather than
+    /// build a lazy-loading scheme — and environment names, re-read from
+    /// disk whenever the active project changes.
+    collections: Vec<Collection>,
     environments: Vec<String>,
+    /// Set after loading a saved request whose body/auth couldn't be fully
+    /// represented in the editor, or that still has unresolved
+    /// `{{variable}}` tokens (no environment substitution in the GUI yet) —
+    /// shown once as a notice near the editor, replaced (or cleared) on the
+    /// next load.
+    load_notice: Option<String>,
 }
 
 impl CurlyApp {
@@ -106,6 +114,7 @@ impl CurlyApp {
             project_open_error: None,
             collections: Vec::new(),
             environments: Vec::new(),
+            load_notice: None,
         }
     }
 
@@ -132,10 +141,15 @@ impl CurlyApp {
 
     fn refresh_project_lists(&mut self) {
         let listing = self.active_project_idx.and_then(|i| self.projects.get(i)).map(|p| {
-            (
-                p.storage.list_collections().unwrap_or_default(),
-                p.storage.list_environments().unwrap_or_default(),
-            )
+            let collections = p
+                .storage
+                .list_collections()
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|name| p.storage.load_collection(name).ok())
+                .collect::<Vec<_>>();
+            let environments = p.storage.list_environments().unwrap_or_default();
+            (collections, environments)
         });
         match listing {
             Some((collections, environments)) => {
@@ -147,6 +161,87 @@ impl CurlyApp {
                 self.environments.clear();
             }
         }
+    }
+
+    /// Load a saved request's method/URL/headers into the editor, plus its
+    /// body if it's a simple raw text body (the only kind the GUI's editor
+    /// can represent so far) and its auth if it's a Bearer token (folded
+    /// into an `Authorization` header — the editor has no separate auth
+    /// concept yet). Anything that can't be represented, or any
+    /// `{{variable}}` token left unresolved (no environment substitution in
+    /// the GUI yet), surfaces as `load_notice` rather than being silently
+    /// dropped or silently wrong.
+    fn load_saved_request(&mut self, saved: &SavedRequest) {
+        self.method = saved.method.clone();
+        self.url = saved.url.clone();
+        self.headers = saved
+            .headers
+            .iter()
+            .map(|kv: &KvPair| HeaderRow {
+                name: kv.name.clone(),
+                value: kv.value.clone(),
+                enabled: kv.enabled,
+            })
+            .collect();
+
+        let mut notices: Vec<String> = Vec::new();
+
+        self.body = match &saved.body {
+            Some(SavedBody::Raw { content }) => content.clone(),
+            Some(_) => {
+                notices.push(
+                    "its body isn't plain text (form/multipart/binary) — not loaded, \
+                     the editor only supports raw text bodies so far"
+                        .to_string(),
+                );
+                String::new()
+            }
+            None => String::new(),
+        };
+
+        match &saved.auth {
+            Some(SavedAuth::Bearer { token }) => {
+                self.headers
+                    .retain(|h| !h.name.eq_ignore_ascii_case("authorization"));
+                self.headers.insert(
+                    0,
+                    HeaderRow {
+                        name: "Authorization".to_string(),
+                        value: format!("Bearer {token}"),
+                        enabled: true,
+                    },
+                );
+            }
+            Some(SavedAuth::Basic { .. }) => {
+                notices.push(
+                    "its Basic auth isn't loaded — add an Authorization header manually if needed"
+                        .to_string(),
+                );
+            }
+            None => {}
+        }
+
+        if self.headers.is_empty() {
+            self.headers.push(HeaderRow::empty());
+        }
+
+        let has_unresolved_vars = self.url.contains("{{")
+            || self.headers.iter().any(|h| h.value.contains("{{"))
+            || self.body.contains("{{");
+        if has_unresolved_vars {
+            notices.push(
+                "it contains {{variable}} tokens — those aren't substituted in the GUI yet, \
+                 sending will use them literally"
+                    .to_string(),
+            );
+        }
+
+        self.load_notice = if notices.is_empty() {
+            None
+        } else {
+            Some(format!("Loaded \"{}\", but {}.", saved.name, notices.join("; and ")))
+        };
+        self.response = None;
     }
 
     fn active_project(&self) -> Option<&Project> {
@@ -246,8 +341,20 @@ impl eframe::App for CurlyApp {
                 if self.collections.is_empty() {
                     ui.weak("  (none yet)");
                 }
-                for name in &self.collections {
-                    ui.label(format!("  {name}"));
+                let mut clicked_request: Option<SavedRequest> = None;
+                for collection in &self.collections {
+                    egui::CollapsingHeader::new(&collection.name)
+                        .id_salt(collection.id)
+                        .show(ui, |ui| {
+                            if let Some(r) =
+                                show_collection_tree(ui, &collection.folders, &collection.requests)
+                            {
+                                clicked_request = Some(r);
+                            }
+                        });
+                }
+                if let Some(saved) = clicked_request {
+                    self.load_saved_request(&saved);
                 }
 
                 ui.separator();
@@ -264,6 +371,10 @@ impl eframe::App for CurlyApp {
         egui::CentralPanel::default().show(ui, |ui| {
             let ctx = ui.ctx().clone();
             let mut should_send = false;
+
+            if let Some(notice) = &self.load_notice {
+                ui.colored_label(egui::Color32::from_rgb(230, 190, 60), notice);
+            }
 
             ui.horizontal(|ui| {
                 egui::ComboBox::from_id_salt("method")
@@ -402,6 +513,37 @@ impl eframe::App for CurlyApp {
     }
 }
 
+/// Render a collection's (or folder's) sub-folders and requests, recursing
+/// into each sub-folder as its own collapsing section. Returns the request
+/// clicked this frame, if any — a free function rather than a method since
+/// it only needs the tree data, not the rest of `CurlyApp`.
+fn show_collection_tree(
+    ui: &mut egui::Ui,
+    folders: &[Folder],
+    requests: &[SavedRequest],
+) -> Option<SavedRequest> {
+    let mut clicked = None;
+
+    for folder in folders {
+        egui::CollapsingHeader::new(format!("{}/", folder.name))
+            .id_salt(folder.id)
+            .show(ui, |ui| {
+                if let Some(r) = show_collection_tree(ui, &folder.folders, &folder.requests) {
+                    clicked = Some(r);
+                }
+            });
+    }
+
+    for request in requests {
+        let label = format!("{:<7} {}", request.method, request.name);
+        if ui.selectable_label(false, label).clicked() {
+            clicked = Some(request.clone());
+        }
+    }
+
+    clicked
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -522,7 +664,8 @@ mod tests {
         let mut app = CurlyApp::default_state();
         app.open_project_at(dir.path());
 
-        assert_eq!(app.collections, vec!["existing".to_string()]);
+        assert_eq!(app.collections.len(), 1);
+        assert_eq!(app.collections[0].name, "Existing");
     }
 
     #[test]
@@ -556,7 +699,109 @@ mod tests {
 
         app.refresh_project_lists();
 
-        assert_eq!(app.collections, vec!["my-api".to_string()]);
+        assert_eq!(app.collections.len(), 1);
+        assert_eq!(app.collections[0].name, "My API");
         assert_eq!(app.environments, vec!["dev".to_string()]);
+    }
+
+    #[test]
+    fn load_saved_request_carries_method_url_headers() {
+        let mut app = CurlyApp::default_state();
+        let mut saved = SavedRequest::new("get-me", Method::GET, "https://example.com/me");
+        saved.headers.push(KvPair::new("Accept", "application/json"));
+
+        app.load_saved_request(&saved);
+
+        assert_eq!(app.method, "GET");
+        assert_eq!(app.url, "https://example.com/me");
+        assert_eq!(app.headers.len(), 1);
+        assert_eq!(app.headers[0].name, "Accept");
+        assert_eq!(app.headers[0].value, "application/json");
+        assert!(app.load_notice.is_none());
+    }
+
+    #[test]
+    fn load_saved_request_loads_raw_body() {
+        let mut app = CurlyApp::default_state();
+        let mut saved = SavedRequest::new("create", Method::POST, "https://example.com");
+        saved.body = Some(SavedBody::Raw {
+            content: r#"{"a":1}"#.to_string(),
+        });
+
+        app.load_saved_request(&saved);
+
+        assert_eq!(app.body, r#"{"a":1}"#);
+        assert!(app.load_notice.is_none());
+    }
+
+    #[test]
+    fn load_saved_request_notices_unsupported_body_type() {
+        let mut app = CurlyApp::default_state();
+        let mut saved = SavedRequest::new("upload", Method::POST, "https://example.com");
+        saved.body = Some(SavedBody::Form {
+            fields: vec![("a".to_string(), "b".to_string())],
+        });
+
+        app.load_saved_request(&saved);
+
+        assert!(app.body.is_empty());
+        assert!(app.load_notice.unwrap().contains("body isn't plain text"));
+    }
+
+    #[test]
+    fn load_saved_request_folds_bearer_auth_into_header() {
+        let mut app = CurlyApp::default_state();
+        let mut saved = SavedRequest::new("get-me", Method::GET, "https://example.com");
+        saved.auth = Some(SavedAuth::Bearer {
+            token: "abc123".to_string(),
+        });
+
+        app.load_saved_request(&saved);
+
+        assert_eq!(app.headers.len(), 1);
+        assert_eq!(app.headers[0].name, "Authorization");
+        assert_eq!(app.headers[0].value, "Bearer abc123");
+        assert!(app.load_notice.is_none());
+    }
+
+    #[test]
+    fn load_saved_request_notices_basic_auth_not_loaded() {
+        let mut app = CurlyApp::default_state();
+        let mut saved = SavedRequest::new("get-me", Method::GET, "https://example.com");
+        saved.auth = Some(SavedAuth::Basic {
+            username: "alice".to_string(),
+            password: "s3cret".to_string(),
+        });
+
+        app.load_saved_request(&saved);
+
+        assert!(app.headers.iter().all(|h| h.name != "Authorization"));
+        assert!(app.load_notice.unwrap().contains("Basic auth"));
+    }
+
+    #[test]
+    fn load_saved_request_notices_unresolved_variables() {
+        let mut app = CurlyApp::default_state();
+        let saved = SavedRequest::new("get-user", Method::GET, "{{BASE_URL}}/users/{{ID}}");
+
+        app.load_saved_request(&saved);
+
+        assert!(app.load_notice.unwrap().contains("{{variable}}"));
+    }
+
+    #[test]
+    fn load_saved_request_clears_previous_response() {
+        let mut app = CurlyApp::default_state();
+        app.response = Some(Ok(ResponseSummary {
+            status: 200,
+            headers: vec![],
+            body: "stale".to_string(),
+            elapsed: Duration::from_millis(1),
+        }));
+        let saved = SavedRequest::new("get-me", Method::GET, "https://example.com");
+
+        app.load_saved_request(&saved);
+
+        assert!(app.response.is_none());
     }
 }

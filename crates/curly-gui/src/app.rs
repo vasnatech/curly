@@ -1,12 +1,13 @@
-//! The GUI's first three slices: FR-17's core loop (method/URL bar, Send,
+//! The GUI's slices so far: FR-17's core loop (method/URL bar, Send,
 //! Headers/Body panels, a response pane), the start of FR-18 (a project
-//! picker), and now browsing a collection's tree and clicking a request to
-//! load it into the editor. Still not built: an environment switcher (so
-//! `{{variable}}` tokens stay unresolved when a loaded request has any —
-//! flagged with a notice, not silently wrong), saving from the GUI, or
-//! multiple simultaneously-open projects (see project.rs's doc comment for
-//! why the data model already supports the last one).
+//! picker plus browsing a collection's tree and clicking a request to load
+//! it into the editor), and now an environment switcher with real
+//! `{{variable}}` substitution when sending (more of FR-21). Still not
+//! built: saving from the GUI, or multiple simultaneously-open projects (see
+//! project.rs's doc comment for why the data model already supports the
+//! last one).
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::mpsc;
 use std::time::Duration;
@@ -14,6 +15,7 @@ use std::time::Duration;
 use curly_core::exec::{self, ResponseSummary};
 use curly_core::model::{Body, Request};
 use curly_core::storage::{Collection, Folder, KvPair, SavedAuth, SavedBody, SavedRequest, Storage};
+use curly_core::substitution;
 use reqwest::Method;
 
 use crate::project::Project;
@@ -69,11 +71,17 @@ pub struct CurlyApp {
     /// disk whenever the active project changes.
     collections: Vec<Collection>,
     environments: Vec<String>,
+    /// The environment `{{variable}}` tokens resolve against when sending —
+    /// `None` means no environment is selected (only the always-merged-in
+    /// "global" environment and the "global"-scoped session apply, matching
+    /// `curly run`'s own default when `--env` is omitted). Reset to `None`
+    /// whenever the active project changes, since the previous selection's
+    /// name may not even exist in the new project.
+    active_environment: Option<String>,
     /// Set after loading a saved request whose body/auth couldn't be fully
-    /// represented in the editor, or that still has unresolved
-    /// `{{variable}}` tokens (no environment substitution in the GUI yet) —
-    /// shown once as a notice near the editor, replaced (or cleared) on the
-    /// next load.
+    /// represented in the editor, or that references a variable undefined
+    /// in the currently selected environment — shown once as a notice near
+    /// the editor, replaced (or cleared) on the next load.
     load_notice: Option<String>,
 }
 
@@ -114,6 +122,7 @@ impl CurlyApp {
             project_open_error: None,
             collections: Vec::new(),
             environments: Vec::new(),
+            active_environment: None,
             load_notice: None,
         }
     }
@@ -136,6 +145,7 @@ impl CurlyApp {
         self.projects = vec![Project::from_storage(storage)];
         self.active_project_idx = Some(0);
         self.project_open_error = None;
+        self.active_environment = None;
         self.refresh_project_lists();
     }
 
@@ -163,14 +173,51 @@ impl CurlyApp {
         }
     }
 
+    /// The variable scope `{{variable}}` tokens resolve against, mirroring
+    /// `curly run`'s own precedence (see `curly-cli/src/commands/run.rs`'s
+    /// `merged_variables`) minus its `--var key=value` overrides, which have
+    /// no GUI equivalent yet: the always-merged-in "global" environment,
+    /// then the selected environment (if any), then that environment's
+    /// session (or the "global"-scoped session if none is selected — the
+    /// same default `curly run` uses when `--env` is omitted). Returns an
+    /// empty map with no project open, which is correct: any `{{token}}`
+    /// then fails loudly as undefined rather than silently sending literally.
+    fn merged_variables(&self) -> BTreeMap<String, String> {
+        let mut variables = BTreeMap::new();
+        let Some(project) = self.active_project() else {
+            return variables;
+        };
+
+        if let Ok(Some(global)) = project.storage.load_environment_opt("global") {
+            for var in global.variables {
+                variables.insert(var.key, var.value);
+            }
+        }
+        if let Some(name) = &self.active_environment {
+            if let Ok(env) = project.storage.load_environment(name) {
+                for var in env.variables {
+                    variables.insert(var.key, var.value);
+                }
+            }
+        }
+        let session_scope = self.active_environment.as_deref().unwrap_or("global");
+        if let Ok(session) = project.storage.load_session(session_scope) {
+            for var in session.variables {
+                variables.insert(var.key, var.value);
+            }
+        }
+
+        variables
+    }
+
     /// Load a saved request's method/URL/headers into the editor, plus its
     /// body if it's a simple raw text body (the only kind the GUI's editor
     /// can represent so far) and its auth if it's a Bearer token (folded
     /// into an `Authorization` header — the editor has no separate auth
     /// concept yet). Anything that can't be represented, or any
-    /// `{{variable}}` token left unresolved (no environment substitution in
-    /// the GUI yet), surfaces as `load_notice` rather than being silently
-    /// dropped or silently wrong.
+    /// `{{variable}}` token that the currently selected environment doesn't
+    /// define, surfaces as `load_notice` rather than being silently dropped
+    /// or silently sent literally.
     fn load_saved_request(&mut self, saved: &SavedRequest) {
         self.method = saved.method.clone();
         self.url = saved.url.clone();
@@ -225,15 +272,26 @@ impl CurlyApp {
             self.headers.push(HeaderRow::empty());
         }
 
-        let has_unresolved_vars = self.url.contains("{{")
-            || self.headers.iter().any(|h| h.value.contains("{{"))
-            || self.body.contains("{{");
-        if has_unresolved_vars {
-            notices.push(
-                "it contains {{variable}} tokens — those aren't substituted in the GUI yet, \
-                 sending will use them literally"
-                    .to_string(),
-            );
+        // One combined substitution attempt (url + all header values + body,
+        // newline-joined) rather than three separate ones, so a request with
+        // several undefined variables gets a single notice naming all of
+        // them (substitute() already reports every undefined name, not just
+        // the first) instead of three overlapping ones.
+        let combined = format!(
+            "{}\n{}\n{}",
+            self.url,
+            self.headers.iter().map(|h| h.value.as_str()).collect::<Vec<_>>().join("\n"),
+            self.body
+        );
+        if let Err(e) = substitution::substitute(&combined, &self.merged_variables()) {
+            let env_desc = self
+                .active_environment
+                .as_deref()
+                .unwrap_or("no environment selected");
+            notices.push(format!(
+                "it references variables the current environment ({env_desc}) doesn't define ({e}) — \
+                 pick a different environment in the sidebar, or edit the fields by hand, before sending"
+            ));
         }
 
         self.load_notice = if notices.is_empty() {
@@ -248,16 +306,24 @@ impl CurlyApp {
         self.active_project_idx.and_then(|i| self.projects.get(i))
     }
 
+    /// Builds the request to send, substituting `{{variable}}` tokens
+    /// against `merged_variables()` first (FR-21) — same as `curly run`,
+    /// an undefined variable fails the whole send with a clear error rather
+    /// than going out with a literal `{{token}}` in it.
     fn build_request(&self) -> anyhow::Result<Request> {
+        let variables = self.merged_variables();
         let method = Method::from_bytes(self.method.to_uppercase().as_bytes())?;
-        let mut request = Request::new(method, self.url.clone());
+        let url = substitution::substitute(&self.url, &variables)?;
+        let mut request = Request::new(method, url);
         for h in &self.headers {
             if h.enabled && !h.name.trim().is_empty() {
-                request = request.with_header(h.name.clone(), h.value.clone());
+                let value = substitution::substitute(&h.value, &variables)?;
+                request = request.with_header(h.name.clone(), value);
             }
         }
         if !self.body.is_empty() {
-            request = request.with_body(Body::Raw(self.body.clone()));
+            let body = substitution::substitute(&self.body, &variables)?;
+            request = request.with_body(Body::Raw(body));
         }
         Ok(request)
     }
@@ -360,11 +426,17 @@ impl eframe::App for CurlyApp {
                 ui.separator();
 
                 ui.label(format!("Environments ({})", self.environments.len()));
-                if self.environments.is_empty() {
-                    ui.weak("  (none yet)");
+                if ui
+                    .selectable_label(self.active_environment.is_none(), "  (none selected)")
+                    .clicked()
+                {
+                    self.active_environment = None;
                 }
                 for name in &self.environments {
-                    ui.label(format!("  {name}"));
+                    let selected = self.active_environment.as_deref() == Some(name.as_str());
+                    if ui.selectable_label(selected, format!("  {name}")).clicked() {
+                        self.active_environment = Some(name.clone());
+                    }
                 }
             });
 
@@ -780,13 +852,16 @@ mod tests {
     }
 
     #[test]
-    fn load_saved_request_notices_unresolved_variables() {
+    fn load_saved_request_notices_variables_undefined_in_current_environment() {
         let mut app = CurlyApp::default_state();
         let saved = SavedRequest::new("get-user", Method::GET, "{{BASE_URL}}/users/{{ID}}");
 
         app.load_saved_request(&saved);
 
-        assert!(app.load_notice.unwrap().contains("{{variable}}"));
+        let notice = app.load_notice.unwrap();
+        assert!(notice.contains("BASE_URL"));
+        assert!(notice.contains("ID"));
+        assert!(notice.contains("no environment selected"));
     }
 
     #[test]
@@ -803,5 +878,198 @@ mod tests {
         app.load_saved_request(&saved);
 
         assert!(app.response.is_none());
+    }
+
+    // --- FR-21: environment switcher + {{variable}} substitution ---
+
+    use curly_core::storage::{Environment, Variable};
+
+    fn project_with(dir: &tempfile::TempDir) -> CurlyApp {
+        let mut app = CurlyApp::default_state();
+        app.open_project_at(dir.path());
+        app
+    }
+
+    #[test]
+    fn merged_variables_is_empty_with_no_project_open() {
+        let app = CurlyApp::default_state();
+        assert!(app.merged_variables().is_empty());
+    }
+
+    #[test]
+    fn merged_variables_includes_the_global_environment_even_when_unselected() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = project_with(&dir);
+
+        let mut global = Environment::new("global");
+        global.variables.push(Variable {
+            key: "HOST".to_string(),
+            value: "global.example.com".to_string(),
+            secret: false,
+        });
+        app.active_project().unwrap().storage.save_environment(&global).unwrap();
+
+        let variables = app.merged_variables();
+        assert_eq!(variables.get("HOST"), Some(&"global.example.com".to_string()));
+    }
+
+    #[test]
+    fn merged_variables_selected_environment_overrides_global() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = project_with(&dir);
+        let storage = &app.active_project().unwrap().storage;
+
+        let mut global = Environment::new("global");
+        global.variables.push(Variable {
+            key: "HOST".to_string(),
+            value: "global.example.com".to_string(),
+            secret: false,
+        });
+        storage.save_environment(&global).unwrap();
+
+        let mut dev = Environment::new("dev");
+        dev.variables.push(Variable {
+            key: "HOST".to_string(),
+            value: "dev.example.com".to_string(),
+            secret: false,
+        });
+        storage.save_environment(&dev).unwrap();
+
+        app.active_environment = Some("dev".to_string());
+
+        assert_eq!(
+            app.merged_variables().get("HOST"),
+            Some(&"dev.example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn merged_variables_reads_the_selected_environments_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = project_with(&dir);
+        let storage = &app.active_project().unwrap().storage;
+
+        let mut session = Environment::new("dev");
+        session.set("TOKEN", "abc123", true);
+        storage.save_session(&session).unwrap();
+
+        app.active_environment = Some("dev".to_string());
+
+        assert_eq!(
+            app.merged_variables().get("TOKEN"),
+            Some(&"abc123".to_string())
+        );
+    }
+
+    #[test]
+    fn merged_variables_falls_back_to_the_global_session_when_no_environment_selected() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = project_with(&dir);
+        let storage = &app.active_project().unwrap().storage;
+
+        let mut session = Environment::new("global");
+        session.set("TOKEN", "xyz", true);
+        storage.save_session(&session).unwrap();
+
+        assert_eq!(app.merged_variables().get("TOKEN"), Some(&"xyz".to_string()));
+    }
+
+    #[test]
+    fn build_request_substitutes_variables_from_the_selected_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = project_with(&dir);
+        let mut dev = Environment::new("dev");
+        dev.variables.push(Variable {
+            key: "HOST".to_string(),
+            value: "api.example.com".to_string(),
+            secret: false,
+        });
+        app.active_project().unwrap().storage.save_environment(&dev).unwrap();
+        app.active_environment = Some("dev".to_string());
+
+        app.url = "https://{{HOST}}/get".to_string();
+        app.headers = vec![HeaderRow {
+            name: "X-Env".to_string(),
+            value: "{{HOST}}".to_string(),
+            enabled: true,
+        }];
+        app.body = r#"{"host":"{{HOST}}"}"#.to_string();
+
+        let request = app.build_request().unwrap();
+
+        assert_eq!(request.url, "https://api.example.com/get");
+        assert_eq!(request.headers[0].1, "api.example.com");
+        assert!(matches!(request.body, Some(Body::Raw(ref s)) if s.contains("api.example.com")));
+    }
+
+    #[test]
+    fn build_request_errors_on_a_variable_undefined_in_the_current_environment() {
+        let mut app = CurlyApp::default_state();
+        app.url = "https://{{HOST}}/get".to_string();
+
+        let err = app.build_request().unwrap_err();
+        assert!(err.to_string().contains("HOST"));
+    }
+
+    #[test]
+    fn switching_the_active_environment_changes_what_a_send_resolves_to() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = project_with(&dir);
+        let storage = &app.active_project().unwrap().storage;
+
+        let mut dev = Environment::new("dev");
+        dev.variables.push(Variable {
+            key: "HOST".to_string(),
+            value: "dev.example.com".to_string(),
+            secret: false,
+        });
+        storage.save_environment(&dev).unwrap();
+
+        let mut prod = Environment::new("prod");
+        prod.variables.push(Variable {
+            key: "HOST".to_string(),
+            value: "prod.example.com".to_string(),
+            secret: false,
+        });
+        storage.save_environment(&prod).unwrap();
+
+        app.url = "https://{{HOST}}/get".to_string();
+
+        app.active_environment = Some("dev".to_string());
+        assert_eq!(app.build_request().unwrap().url, "https://dev.example.com/get");
+
+        app.active_environment = Some("prod".to_string());
+        assert_eq!(app.build_request().unwrap().url, "https://prod.example.com/get");
+    }
+
+    #[test]
+    fn opening_a_new_project_resets_the_active_environment() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let mut app = project_with(&dir_a);
+        app.active_environment = Some("dev".to_string());
+
+        app.open_project_at(dir_b.path());
+
+        assert!(app.active_environment.is_none());
+    }
+
+    #[test]
+    fn load_saved_request_notice_clears_once_the_selected_environment_defines_the_variable() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = project_with(&dir);
+        let mut dev = Environment::new("dev");
+        dev.variables.push(Variable {
+            key: "BASE_URL".to_string(),
+            value: "https://api.example.com".to_string(),
+            secret: false,
+        });
+        app.active_project().unwrap().storage.save_environment(&dev).unwrap();
+        app.active_environment = Some("dev".to_string());
+
+        let saved = SavedRequest::new("get-user", Method::GET, "{{BASE_URL}}/users/1");
+        app.load_saved_request(&saved);
+
+        assert!(app.load_notice.is_none());
     }
 }

@@ -265,6 +265,13 @@ Requires an actual display (X11 or Wayland) — not scriptable the way the rest 
 | 16.19 | Click **"Open Project…"**, pick an empty folder with no `.curly` | A new `.curly` is created there on the spot (check with `ls <folder>/.curly` afterward) — same as running `curly init` in that folder; sidebar opens it (Collections/Environments both empty). |
 | 16.20 | With a project already open, click **"Open Project…"** again and pick a *different* folder | The sidebar switches entirely to the new project — old one's Collections/Environments are gone from view (single-project-at-a-time, not a second tab). |
 | 16.21 | Cancel the folder-picker dialog (Escape or its own Cancel button) instead of picking anything | Nothing changes — the previously active project (if any) stays active, no error shown. |
+| 16.22 | With `health-record-backend-spring`'s project open, click **"Health Record API"** in the sidebar | Expands into a tree — `Auth/`, `Me/`, `Admin/`, etc. as sub-folders, each expandable further, with method+name shown for each leaf request. |
+| 16.23 | Click a top-level request (e.g. one directly under the collection, not nested in a folder) | Method/URL/headers load into the editor; if the saved request has `{{variable}}` tokens (most do — `{{BASE_URL}}` at minimum), a yellow notice appears above the editor naming the request and explaining that `{{variable}}` tokens aren't substituted yet. |
+| 16.24 | Click a nested request, e.g. `Auth/login` | Same as 16.23, but confirms clicking works at nested depth too, not just top-level. |
+| 16.25 | Click a request whose saved auth is `Bearer` (e.g. one you've added with `--extract-secret`/`--bearer` via the CLI, or hand-edit a collection JSON to add `"auth": {"type": "bearer", ...}`) | An `Authorization: Bearer <token>` header appears in the headers table — no separate auth UI, folded into headers. |
+| 16.26 | Click a request whose saved body is `form`/`multipart` (e.g. one added via `--data-urlencode`/`-F` through the CLI) | Body box stays empty; notice mentions the body "isn't plain text" and wasn't loaded. |
+| 16.27 | Load a request (any with `{{variable}}` tokens), replace the tokens in the URL/header fields by hand with real values, then Send | Works normally — the notice is informational only, it doesn't block sending; nothing stops you from fixing the values yourself. |
+| 16.28 | Load one request, then load a different one without sending in between | Editor fully replaces its contents with the second request's data; any stale response from a previous send is cleared (no leftover response pane content from before). |
 
 ## 17. Cross-platform sanity (when releasing)
 

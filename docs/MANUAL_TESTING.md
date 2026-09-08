@@ -272,6 +272,10 @@ Requires an actual display (X11 or Wayland) — not scriptable the way the rest 
 | 16.26 | Click a request whose saved body is `form`/`multipart` (e.g. one added via `--data-urlencode`/`-F` through the CLI) | Body box stays empty; notice mentions the body "isn't plain text" and wasn't loaded. |
 | 16.27 | Load a request (any with `{{variable}}` tokens), replace the tokens in the URL/header fields by hand with real values, then Send | Works normally — the notice is informational only, it doesn't block sending; nothing stops you from fixing the values yourself. |
 | 16.28 | Load one request, then load a different one without sending in between | Editor fully replaces its contents with the second request's data; any stale response from a previous send is cleared (no leftover response pane content from before). |
+| 16.29 | Launch `curly gui` and look at the window itself (title bar / task switcher preview, whichever your WM shows) | A `{ }` mark icon is visible — not blank, not a generic placeholder. Works out of the box on X11, Windows, and macOS with no extra steps. |
+| 16.30 | On GNOME/Wayland specifically: launch `curly gui` *before* running the install script | Dock/Alt-Tab/Activities show a generic fallback icon, not `{ }` — expected, since nothing has told GNOME which `.desktop` entry this window belongs to yet. |
+| 16.31 | Run `./scripts/linux-install-desktop-entry.sh`, then quit and relaunch `curly gui` | Script prints the paths it installed and exits 0; dock/Alt-Tab/Activities now show the `{ }` icon. |
+| 16.32 | Run `./scripts/linux-install-desktop-entry.sh` a second time in a row | Same output, no error — overwriting its own previously-installed files is safe (idempotent). |
 
 ## 17. Cross-platform sanity (when releasing)
 

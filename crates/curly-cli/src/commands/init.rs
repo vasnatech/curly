@@ -4,6 +4,12 @@
 //! can be committed alongside a project's own repo instead of living only
 //! in the OS-wide default location.
 //!
+//! The actual directory/`.gitignore` creation lives in
+//! `curly_core::storage::Storage::init_project_local`, shared with
+//! `curly-gui`'s "Open Project" flow (which offers to create one when the
+//! chosen folder has none) — this module is just the CLI's messaging around
+//! that shared call.
+//!
 //! Environments and sessions are gitignored by default alongside history,
 //! not just committed with collections: they typically hold real
 //! credentials/tokens (`--secret` only masks them in `env show`/`session
@@ -13,26 +19,22 @@
 //! default. Collections hold `{{variable}}` *names*, never values, so
 //! they're safe to share.
 
-use std::fs;
-
 use anyhow::{Context, Result};
-use curly_core::storage::PROJECT_LOCAL_DIR_NAME;
+use curly_core::storage::Storage;
 
 pub fn run() -> Result<()> {
     let cwd = std::env::current_dir().context("failed to determine current directory")?;
-    let root = cwd.join(PROJECT_LOCAL_DIR_NAME);
+    let (storage, created) = Storage::init_project_local(&cwd)?;
 
-    if root.is_dir() {
-        println!("curly project already initialized at {}", root.display());
+    if !created {
+        println!(
+            "curly project already initialized at {}",
+            storage.root().display()
+        );
         return Ok(());
     }
 
-    fs::create_dir_all(&root).with_context(|| format!("failed to create {}", root.display()))?;
-    let gitignore = root.join(".gitignore");
-    fs::write(&gitignore, "environments/\nsession/\nhistory/\n")
-        .with_context(|| format!("failed to write {}", gitignore.display()))?;
-
-    println!("initialized curly project at {}", root.display());
+    println!("initialized curly project at {}", storage.root().display());
     println!("collections created here will be committed with the project;");
     println!("environments/, session/, and history/ are gitignored by default (they can hold");
     println!("real credentials/tokens and response bodies) — each teammate sets their own via");

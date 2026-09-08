@@ -491,6 +491,42 @@ impl Storage {
         &self.root
     }
 
+    /// `true` if this storage's root is the OS-wide default location (as
+    /// opposed to a project-local `.curly` or an explicit override) —
+    /// used by callers that want to label that case specially (e.g. the
+    /// GUI's project picker showing "Default" rather than a path).
+    /// Best-effort: if the default location can't be determined, `false`.
+    pub fn is_default_location(&self) -> bool {
+        Self::default_location()
+            .map(|default| default.root == self.root)
+            .unwrap_or(false)
+    }
+
+    /// Create (or open, if one already exists there — idempotent, the same
+    /// as `git init` on an existing repo) a project-local `.curly` directory
+    /// at `dir`. Writes the standard `.gitignore` (`environments/`,
+    /// `session/`, `history/` excluded — they hold real credentials/tokens,
+    /// only `collections/` is meant to be committed) only when actually
+    /// creating it. Returns the resulting `Storage` and whether a new
+    /// directory was created (`false` if one already existed) — shared by
+    /// `curly-cli`'s `init` command and `curly-gui`'s "Open Project" (which
+    /// offers to create one when the chosen folder has none), so the two
+    /// don't drift out of sync on what "a curly project" means on disk.
+    pub fn init_project_local(dir: &Path) -> Result<(Self, bool)> {
+        let root = dir.join(PROJECT_LOCAL_DIR_NAME);
+        if root.is_dir() {
+            return Ok((Self::new(root), false));
+        }
+
+        std::fs::create_dir_all(&root)
+            .with_context(|| format!("failed to create {}", root.display()))?;
+        let gitignore = root.join(".gitignore");
+        std::fs::write(&gitignore, "environments/\nsession/\nhistory/\n")
+            .with_context(|| format!("failed to write {}", gitignore.display()))?;
+
+        Ok((Self::new(root), true))
+    }
+
     /// Resolve where storage should live, in precedence order: `explicit`
     /// (the `--data-dir` flag), then `env_data_dir` (`CURLY_DATA_DIR`), then
     /// an auto-detected `.curly/` walking up from `cwd` (see [`find_project_local_root`],

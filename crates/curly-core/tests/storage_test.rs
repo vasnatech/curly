@@ -549,3 +549,50 @@ fn clear_all_sessions_on_nothing_is_a_no_op() {
     let storage = Storage::new(dir.path());
     assert!(storage.clear_all_sessions().is_ok());
 }
+
+#[test]
+fn init_project_local_creates_dot_curly_and_gitignore() {
+    let dir = tempdir().unwrap();
+    let (storage, created) = Storage::init_project_local(dir.path()).unwrap();
+    assert!(created);
+    assert_eq!(storage.root(), dir.path().join(".curly"));
+
+    let gitignore = std::fs::read_to_string(dir.path().join(".curly/.gitignore")).unwrap();
+    assert!(gitignore.contains("environments/"));
+    assert!(gitignore.contains("session/"));
+    assert!(gitignore.contains("history/"));
+}
+
+#[test]
+fn init_project_local_is_idempotent() {
+    let dir = tempdir().unwrap();
+    let (_, created_first) = Storage::init_project_local(dir.path()).unwrap();
+    let (storage, created_second) = Storage::init_project_local(dir.path()).unwrap();
+    assert!(created_first);
+    assert!(!created_second);
+    assert_eq!(storage.root(), dir.path().join(".curly"));
+}
+
+#[test]
+fn init_project_local_preserves_existing_contents_on_reopen() {
+    let dir = tempdir().unwrap();
+    let (storage, _) = Storage::init_project_local(dir.path()).unwrap();
+    storage.save_collection(&Collection::new("My API")).unwrap();
+
+    let (reopened, created) = Storage::init_project_local(dir.path()).unwrap();
+    assert!(!created);
+    assert!(reopened.load_collection("My API").is_ok());
+}
+
+#[test]
+fn is_default_location_true_for_default_location() {
+    let default = Storage::default_location().unwrap();
+    assert!(default.is_default_location());
+}
+
+#[test]
+fn is_default_location_false_for_a_project_local_storage() {
+    let dir = tempdir().unwrap();
+    let storage = Storage::new(dir.path());
+    assert!(!storage.is_default_location());
+}

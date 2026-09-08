@@ -260,7 +260,15 @@ impl CurlyApp {
     /// kept out of `default_state` below — unit tests build on that instead,
     /// so they stay hermetic regardless of what directory `cargo test` runs
     /// from or what `.curly` might exist somewhere above it.
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    ///
+    /// Also seeds the theme from the OS's light/dark preference where it can
+    /// be detected (FR-24) — see `detect_system_theme`'s doc comment for why
+    /// egui's own built-in "follow the system theme" doesn't work on Linux.
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        if let Some(theme) = detect_system_theme() {
+            cc.egui_ctx.set_theme(theme);
+        }
+
         let mut app = Self::default_state();
         match Storage::resolve_default(None) {
             Ok(storage) => app.set_active_project(storage),
@@ -1089,6 +1097,41 @@ fn split_folder_and_name(path: &str) -> (String, String) {
     }
 }
 
+/// Detect the OS's light/dark preference on GNOME via `gsettings` — the
+/// same source GTK/GNOME apps themselves read. Needed because winit 0.30
+/// (egui/eframe's windowing backend) unconditionally returns `None` from
+/// `EventLoop::system_theme()` on both X11 and Wayland, so egui's own
+/// `ThemePreference::System` (the default) silently falls back to a
+/// hardcoded dark theme on Linux rather than actually following the OS —
+/// there's no live "OS theme changed" signal wired up either way; this is
+/// a one-shot check at startup, not a running watch (see the sidebar's
+/// light/dark toggle for changing it after launch). Returns `None` (leave
+/// egui's own default alone) if `gsettings` isn't installed, the call
+/// fails, or the value doesn't parse — most likely a non-GNOME desktop,
+/// where this specific heuristic doesn't apply.
+fn detect_system_theme() -> Option<egui::Theme> {
+    let output = std::process::Command::new("gsettings")
+        .args(["get", "org.gnome.desktop.interface", "color-scheme"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_gnome_color_scheme(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Parse `gsettings get org.gnome.desktop.interface color-scheme`'s output
+/// (`'default'`, `'prefer-dark'`, or `'prefer-light'`, single-quoted) into
+/// a `Theme`. `'default'` means light — GNOME's traditional base theme
+/// before dark mode existed as an explicit opt-in.
+fn parse_gnome_color_scheme(raw: &str) -> Option<egui::Theme> {
+    match raw.trim().trim_matches('\'') {
+        "prefer-dark" => Some(egui::Theme::Dark),
+        "prefer-light" | "default" => Some(egui::Theme::Light),
+        _ => None,
+    }
+}
+
 impl eframe::App for CurlyApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll_response();
@@ -1099,7 +1142,17 @@ impl eframe::App for CurlyApp {
             .resizable(true)
             .default_size(220.0)
             .show(ui, |ui| {
-                ui.heading("Project");
+                ui.horizontal(|ui| {
+                    ui.heading("Project");
+                    let current = ui.ctx().theme();
+                    let (icon, next, hover) = match current {
+                        egui::Theme::Dark => ("☀", egui::Theme::Light, "Switch to light mode"),
+                        egui::Theme::Light => ("🌙", egui::Theme::Dark, "Switch to dark mode"),
+                    };
+                    if ui.small_button(icon).on_hover_text(hover).clicked() {
+                        ui.ctx().set_theme(next);
+                    }
+                });
 
                 match self.active_project() {
                     Some(project) => {
@@ -2886,5 +2939,32 @@ mod tests {
         app.delete_saved_request("my-api", "ping");
 
         assert!(app.loaded_request.is_some());
+    }
+
+    // --- FR-24: theming ---
+
+    #[test]
+    fn parse_gnome_color_scheme_prefer_dark() {
+        assert_eq!(parse_gnome_color_scheme("'prefer-dark'\n"), Some(egui::Theme::Dark));
+    }
+
+    #[test]
+    fn parse_gnome_color_scheme_prefer_light() {
+        assert_eq!(parse_gnome_color_scheme("'prefer-light'\n"), Some(egui::Theme::Light));
+    }
+
+    #[test]
+    fn parse_gnome_color_scheme_default_means_light() {
+        assert_eq!(parse_gnome_color_scheme("'default'\n"), Some(egui::Theme::Light));
+    }
+
+    #[test]
+    fn parse_gnome_color_scheme_unrecognized_value_is_none() {
+        assert_eq!(parse_gnome_color_scheme("'something-new'\n"), None);
+    }
+
+    #[test]
+    fn parse_gnome_color_scheme_empty_is_none() {
+        assert_eq!(parse_gnome_color_scheme(""), None);
     }
 }

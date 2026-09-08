@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/curly-core", "crates/curly-cli"]
+members = ["crates/curly-core", "crates/curly-cli", "crates/curly-gui"]
 
 [workspace.package]
 version = "0.1.0"

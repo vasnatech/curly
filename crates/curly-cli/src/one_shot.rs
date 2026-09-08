@@ -166,7 +166,7 @@ fn build_request(args: &OneShotArgs) -> Result<Request> {
         .url
         .as_deref()
         .ok_or_else(|| {
-            anyhow!("a URL is required (or use a subcommand: init, env, collections, run, history, session)")
+            anyhow!("a URL is required (or use a subcommand: gui, init, env, collections, run, history, session)")
         })?;
 
     let body = build_body(args)?;

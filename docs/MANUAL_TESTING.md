@@ -346,6 +346,18 @@ Requires an actual display (X11 or Wayland) — not scriptable the way the rest 
 | 16.100 | Hold **Ctrl** and scroll the mouse wheel (or pinch on a touchpad) anywhere over the window | UI zooms in/out following the gesture, and the toolbar's percentage label updates to match — confirms the manual zoom state and egui's own built-in gesture stay in sync rather than fighting each other. |
 | 16.101 | Zoom in past a few clicks (or scroll a lot) then keep going | Stops growing/shrinking once it hits the clamped range (roughly 50%–300%) — doesn't runaway to an unusable size or invert. |
 | 16.102 | Zoom to something other than 100%, then quit and relaunch `curly gui` | Comes back up at 100% — zoom isn't persisted across launches (a known, documented gap). |
+| 16.103 | Launch `curly gui` and look above the method/URL bar | A tab row with one tab, labeled "New Request", and a `+` button. |
+| 16.104 | Type a URL (e.g. `https://httpbin.org/get`) into the current tab | The tab's own label updates to `GET https://httpbin.org/get` (or truncated if long) — no need to send first. |
+| 16.105 | Click **+** (or press **Ctrl/Cmd+T**) | A second tab appears, labeled "New Request", and becomes the active (highlighted) one; the first tab's label still shows its URL. |
+| 16.106 | In the new tab, load a different saved request from the sidebar (e.g. `Auth/login`) | That tab's label updates to the request's path (e.g. `Auth/login`); switch to the first tab and confirm its URL/method are untouched. |
+| 16.107 | Add a variable override in one tab's "Variable overrides" section, then switch to the other tab and open its own overrides section | The override from the first tab does **not** appear in the second — each tab's overrides are independent. |
+| 16.108 | Send from one tab, then switch to the other tab before the response arrives, then switch back | The response shows up in the first tab once you're looking at it again — sending wasn't cancelled by switching away. |
+| 16.109 | Load different requests with different extraction rules into two tabs | Each tab's "On a successful send, extracts..." note shows *that tab's own* rules, not the other tab's. |
+| 16.110 | Click a tab's own **✕** (not the active one) | That tab closes immediately; the currently active tab and its content are unaffected. |
+| 16.111 | Click the *active* tab's **✕** | Switches to a neighboring tab and loads its real content (not blank) — confirm by checking the URL/method match what you expect that neighbor to have. |
+| 16.112 | With only one tab open, click its **✕** | The tab doesn't disappear — it resets to blank ("New Request") instead, same as clicking "New". |
+| 16.113 | Open two tabs, click **Save As…** in one (dialog appears), then click the *other* tab | The Save dialog closes on its own — switching tabs cancels it rather than risk saving the wrong tab's content under a stale pre-fill. |
+| 16.114 | Open several tabs with long URLs | Each tab's label truncates with `…` rather than stretching the tab bar or wrapping awkwardly; the tab row scrolls horizontally if there isn't room for all of them. |
 
 ## 17. Cross-platform sanity (when releasing)
 

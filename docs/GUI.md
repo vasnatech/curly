@@ -1,6 +1,6 @@
 # Curly GUI — User Guide
 
-> Status: **early, several slices so far** (M4, still in progress — see [DESIGN.md](DESIGN.md) §6/§9). The GUI can open a project, browse its collections as a tree, click a saved request to load it, switch between environments to resolve `{{variable}}` tokens, build a request from scratch, send it, and show the response. It does **not** yet open more than one project at once, save/edit requests, offer multiple tabs, or theme — those are still the rest of FR-18..24. If you need history or saved-request extraction/session-writing today, use [the CLI](CLI.md) — GUI and CLI share the same underlying storage, so anything you build or extract with one is already usable by the other.
+> Status: **early, several slices so far** (M4, still in progress — see [DESIGN.md](DESIGN.md) §6/§9). The GUI can open a project, browse its collections as a tree, click a saved request to load it, create/edit/delete environments and switch between them to resolve `{{variable}}` tokens, build a request from scratch, send it, and show the response. It does **not** yet open more than one project at once, save/edit *requests*, offer multiple tabs, or theme — those are still the rest of FR-19..24. If you need history, `--var` overrides, or saved-request extraction/session-writing today, use [the CLI](CLI.md) — GUI and CLI share the same underlying storage, so anything you build or extract with one is already usable by the other.
 
 ## Launching it
 
@@ -37,7 +37,7 @@ The left sidebar shows:
 - The active project's label (the folder name a `.curly` lives in, or "Default") and its full path.
 - **"Open Project…"** — a native folder picker. Pick any directory: if it already has a `.curly` in it, that project opens; if not, one is created there on the spot (same as running `curly init` in that folder), then opens. Unlike the CLI's own auto-detection, this does **not** search parent directories — a folder dialog already lets you navigate to exactly the directory you want, so opening `Documents/my-api` won't accidentally reopen some unrelated project three levels up.
 - **Collections** — the active project's collections, each expandable into the same folder/request tree `curly collections show` prints. **Click any request to load it into the editor.**
-- **Environments** — click a name to make it the active environment (see "Environments and `{{variable}}` substitution" below); click **"(none selected)"** to go back to none.
+- **Environments** — click a name to make it the active environment and open its variable editor, or **"(none selected)"** to go back to none (see "Environments and `{{variable}}` substitution" below).
 
 **Only one project is open at a time right now** — picking a new one replaces the current one, it doesn't add a tab. This is deliberate groundwork, not a missing feature that slipped through: the underlying state is already a list (so a future "open several projects, switch between them" doesn't need a data-model change, just a UI for it), but only single-project interaction is wired up so far.
 
@@ -55,6 +55,14 @@ Clicking a name in the sidebar's Environments list makes it the **active environ
 
 An undefined variable fails the send outright with a clear error naming every undefined token (not just the first) — never silently goes out as a literal `{{token}}`, and never silently picks a value from the wrong environment.
 
+### Creating and editing environments
+
+- **"new environment" field + `+ New`** — type a name and click it (or it's disabled while the field is empty) to create an empty environment; it's selected immediately, ready for you to add variables to.
+- Selecting any environment (new or existing) opens an **"Edit `<name>`"** panel below the list: each variable is a row of KEY / value / a `secret` checkbox (mirrors `curly env set ... --secret` — masks nothing in this editor itself, since you need to see the value to edit it, but is saved the same way and still masked by `curly env show`) / a `✕` to remove the row, plus **`+ Add variable`**.
+- Nothing is written to disk until you click **Save** — a half-typed row never leaks into what a Send resolves against, since `Save` (not the in-memory editor) is what `merged_variables` reads back from. A row with a blank key is silently skipped on save, same rule `build_request` already applies to a blank-name header.
+- **Delete environment** removes it immediately — no confirmation dialog, matching `curly env delete`'s own behavior. Deleting the currently-active one also clears the active-environment selection.
+- All of this writes to the exact same `.curly/environments/*.json` files the CLI reads and writes, so a variable added in the GUI is visible to `curly env show` right away, and vice versa — no caching, every read/save goes straight to disk.
+
 ### Sending a request
 
 - **Method + URL bar** — pick a method from the dropdown, type a URL.
@@ -70,7 +78,7 @@ Sending is asynchronous — the window stays responsive while a request is in fl
 Tracked in DESIGN.md's M4 entry:
 
 - Multiple projects open simultaneously (the data model already supports it — see "Projects" above — the interaction doesn't yet)
-- Editing/creating an environment from the GUI, or a `--var key=value`-style ad-hoc override (FR-21 continues) — for now, manage environments with the CLI (`curly env set ...`); they show up in the sidebar's list once you do
+- A `--var key=value`-style ad-hoc override for a single send, without saving it to an environment (rest of FR-21)
 - Extraction rules writing into a session from the GUI — the GUI reads sessions the CLI's `curly run --extract-*` already wrote, but doesn't run extraction itself yet
 - Multiple request tabs (FR-19) — loading a new request replaces what's in the editor, there's no "open in a new tab"
 - Save/rename/duplicate/move a request from the GUI (FR-20) — for now, build/edit saved requests with the CLI (`curly collections add-request ...`); they show up in the sidebar's tree once you do, and loading one back into the editor works today
@@ -81,4 +89,4 @@ Tracked in DESIGN.md's M4 entry:
 
 ## A note on this guide's own testing
 
-Automated screenshotting wasn't available in the environment this was built in (no `xdotool`/`grim`/`gnome-screenshot`; the GNOME Shell and xdg-desktop-portal screenshot D-Bus APIs both need interactive consent that never resolves headlessly) — so the code's author could confirm the process launches cleanly but not see the window directly. The person running it, on their own real desktop, has confirmed it five times now: the send/response loop (GET round-tripped, body pretty-printed correctly), opening a real project via the folder picker (label and lists updated correctly), expanding a real project's collection tree and clicking a nested request to confirm it loaded into the editor with the expected unresolved-`{{variable}}` notice, the `{ }` window icon including the GNOME dock/Alt-Tab icon after running `scripts/linux-install-desktop-entry.sh`, and — most recently — the environment switcher end-to-end: loading a real `Auth/login` request against `health-record-backend-spring`'s actual `.curly` project, switching the active environment, and getting a real JWT back from the real local backend after `{{BASE_URL}}`/`{{EMAIL}}`/`{{PASSWORD}}` all resolved correctly (an intermediate 400 turned out to be a typo in the test fixture's stored `EMAIL` value, not a substitution bug — confirmed by fixing the environment variable and getting a real token back on retry). All five are human-confirmed working, not just inferred from clean process exit; the exact visual layout (spacing, precise widget placement) is still code-derived rather than pixel-verified.
+Automated screenshotting wasn't available in the environment this was built in (no `xdotool`/`grim`/`gnome-screenshot`; the GNOME Shell and xdg-desktop-portal screenshot D-Bus APIs both need interactive consent that never resolves headlessly) — so the code's author could confirm the process launches cleanly but not see the window directly. The person running it, on their own real desktop, has confirmed it six times now: the send/response loop (GET round-tripped, body pretty-printed correctly), opening a real project via the folder picker (label and lists updated correctly), expanding a real project's collection tree and clicking a nested request to confirm it loaded into the editor with the expected unresolved-`{{variable}}` notice, the `{ }` window icon including the GNOME dock/Alt-Tab icon after running `scripts/linux-install-desktop-entry.sh`, the environment switcher end-to-end (loading a real `Auth/login` request against `health-record-backend-spring`'s actual `.curly` project, switching the active environment, and getting a real JWT back from the real local backend after `{{BASE_URL}}`/`{{EMAIL}}`/`{{PASSWORD}}` all resolved correctly), and — most recently — creating/editing/deleting an environment from the sidebar itself. All six are human-confirmed working, not just inferred from clean process exit; the exact visual layout (spacing, precise widget placement) is still code-derived rather than pixel-verified.

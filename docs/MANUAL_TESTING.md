@@ -334,6 +334,18 @@ Requires an actual display (X11 or Wayland) — not scriptable the way the rest 
 | 16.88 | Send a different request without touching the search box | The search term and its highlighting carry over to the new response — confirms it persists across sends rather than resetting each time. |
 | 16.89 | With a response showing, click **"Save Response…"**, pick a location, save | Native picker opens (responsively — same as 16.64), suggests `response.json`/`response.txt` depending on whether the body was JSON; after saving, a green notice shows the path; open the saved file and confirm it matches the response body exactly. |
 | 16.90 | Click **"Save Response…"** and cancel the dialog | No notice appears, nothing is written. |
+| 16.91 | Launch `curly gui` and look at the very top of the window | A single toolbar row spans the full width: "Open Project…", a separator, ☀/🌙, a separator, "Zoom:" with `−`, a percentage, `+`, "Reset". The sidebar's "Project" heading no longer has its own Open Project button or theme toggle next to it. |
+| 16.92 | Click the toolbar's **"Open Project…"** | Same folder picker as before (16.64) — still responsive, still reads "Choosing…" while open — just triggered from the toolbar now instead of the sidebar. |
+| 16.93 | Click the toolbar's **☀/🌙** | Same instant theme switch as before (16.78) — just relocated. |
+| 16.94 | Note the zoom percentage on launch | Reads "100%" — the default, matching this app's 1024×768 design baseline. |
+| 16.95 | Click **+** a few times, watching both the percentage and the UI itself | Percentage increases (~10% per click, e.g. 100% → 110% → 121%), and every widget — text, buttons, spacing, the sidebar, the response body — visibly grows together, not just the toolbar. |
+| 16.96 | Click **−** a few times from a zoomed-in state | Shrinks back down the same way, symmetrically. |
+| 16.97 | Click **Reset** after zooming in or out | Returns to exactly "100%" in one click, regardless of the current zoom level. |
+| 16.98 | Press **Ctrl+= ** (or **Ctrl++** ) and **Ctrl+-** repeatedly | Same effect as the toolbar buttons — the percentage and UI size track the keyboard shortcuts exactly like the clicks do. |
+| 16.99 | Zoom in or out, then press **Ctrl+0** | Resets to 100%, same as clicking Reset. |
+| 16.100 | Hold **Ctrl** and scroll the mouse wheel (or pinch on a touchpad) anywhere over the window | UI zooms in/out following the gesture, and the toolbar's percentage label updates to match — confirms the manual zoom state and egui's own built-in gesture stay in sync rather than fighting each other. |
+| 16.101 | Zoom in past a few clicks (or scroll a lot) then keep going | Stops growing/shrinking once it hits the clamped range (roughly 50%–300%) — doesn't runaway to an unusable size or invert. |
+| 16.102 | Zoom to something other than 100%, then quit and relaunch `curly gui` | Comes back up at 100% — zoom isn't persisted across launches (a known, documented gap). |
 
 ## 17. Cross-platform sanity (when releasing)
 

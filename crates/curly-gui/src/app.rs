@@ -1,11 +1,13 @@
 //! The GUI's slices so far: FR-17's core loop (method/URL bar, Send,
 //! Headers/Body panels, a response pane), the start of FR-18 (a project
 //! picker plus browsing a collection's tree and clicking a request to load
-//! it into the editor), and now an environment switcher with real
-//! `{{variable}}` substitution when sending (more of FR-21). Still not
-//! built: saving from the GUI, or multiple simultaneously-open projects (see
-//! project.rs's doc comment for why the data model already supports the
-//! last one).
+//! it into the editor), an environment switcher with real `{{variable}}`
+//! substitution when sending, and now creating/editing/deleting
+//! environments and their variables from the GUI itself (all FR-21). Still
+//! not built: `--var key=value`-style ad-hoc overrides, extraction rules
+//! writing into a session, saving requests, or multiple simultaneously-open
+//! projects (see project.rs's doc comment for why the data model already
+//! supports the last one).
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -14,7 +16,9 @@ use std::time::Duration;
 
 use curly_core::exec::{self, ResponseSummary};
 use curly_core::model::{Body, Request};
-use curly_core::storage::{Collection, Folder, KvPair, SavedAuth, SavedBody, SavedRequest, Storage};
+use curly_core::storage::{
+    Collection, Environment, Folder, KvPair, SavedAuth, SavedBody, SavedRequest, Storage, Variable,
+};
 use curly_core::substitution;
 use reqwest::Method;
 
@@ -38,9 +42,45 @@ impl HeaderRow {
     }
 }
 
+struct VariableRow {
+    key: String,
+    value: String,
+    secret: bool,
+}
+
+impl VariableRow {
+    fn empty() -> Self {
+        Self {
+            key: String::new(),
+            value: String::new(),
+            secret: false,
+        }
+    }
+}
+
+impl From<Variable> for VariableRow {
+    fn from(v: Variable) -> Self {
+        Self {
+            key: v.key,
+            value: v.value,
+            secret: v.secret,
+        }
+    }
+}
+
 enum SendOutcome {
     Success(ResponseSummary),
     Error(String),
+}
+
+/// A click in the sidebar's Environments section, applied after the
+/// rendering loop finishes — same reason `show_collection_tree` defers its
+/// click, and `load_saved_request`'s callers do too: acting immediately
+/// would borrow `self` mutably while the loop still holds an immutable
+/// borrow of `self.environments` to iterate over.
+enum EnvAction {
+    Select(Option<String>),
+    Create(String),
 }
 
 pub struct CurlyApp {
@@ -78,6 +118,18 @@ pub struct CurlyApp {
     /// whenever the active project changes, since the previous selection's
     /// name may not even exist in the new project.
     active_environment: Option<String>,
+    /// The active environment's variables, editable in the sidebar — loaded
+    /// from disk whenever `active_environment` changes, written back to
+    /// disk only when the user clicks Save (so half-edited rows never leak
+    /// into what a Send actually resolves against; `merged_variables`
+    /// always reads the saved file, not this buffer).
+    env_editor_variables: Vec<VariableRow>,
+    /// The "+ New Environment" text field's current contents.
+    new_environment_name: String,
+    /// Feedback from creating/saving/deleting an environment (success or
+    /// error) — separate from `load_notice`, which is about the request
+    /// editor, not environment management.
+    env_notice: Option<String>,
     /// Set after loading a saved request whose body/auth couldn't be fully
     /// represented in the editor, or that references a variable undefined
     /// in the currently selected environment — shown once as a notice near
@@ -123,6 +175,9 @@ impl CurlyApp {
             collections: Vec::new(),
             environments: Vec::new(),
             active_environment: None,
+            env_editor_variables: Vec::new(),
+            new_environment_name: String::new(),
+            env_notice: None,
             load_notice: None,
         }
     }
@@ -146,6 +201,8 @@ impl CurlyApp {
         self.active_project_idx = Some(0);
         self.project_open_error = None;
         self.active_environment = None;
+        self.env_editor_variables.clear();
+        self.env_notice = None;
         self.refresh_project_lists();
     }
 
@@ -170,6 +227,108 @@ impl CurlyApp {
                 self.collections.clear();
                 self.environments.clear();
             }
+        }
+    }
+
+    /// Change which environment is active — for both `{{variable}}`
+    /// resolution (`merged_variables`) and the sidebar's variable editor —
+    /// loading its variables from disk into `env_editor_variables`, or
+    /// clearing them if `name` is `None`.
+    fn select_environment(&mut self, name: Option<String>) {
+        self.env_notice = None;
+        match &name {
+            Some(n) => self.load_environment_editor(n),
+            None => self.env_editor_variables.clear(),
+        }
+        self.active_environment = name;
+    }
+
+    fn load_environment_editor(&mut self, name: &str) {
+        self.env_editor_variables = match self.active_project() {
+            Some(project) => project
+                .storage
+                .load_environment_opt(name)
+                .ok()
+                .flatten()
+                .map(|env| env.variables.into_iter().map(VariableRow::from).collect())
+                .unwrap_or_default(),
+            None => Vec::new(),
+        };
+    }
+
+    /// Create `name` as a new, empty environment, then select it (loading
+    /// its — empty — variables into the editor, same as any other
+    /// selection). Mirrors `curly env set`'s create-if-missing behavior
+    /// (here with zero variables, since there's no KEY=VALUE to seed it
+    /// with yet).
+    fn create_environment(&mut self, name: String) {
+        let result = match self.active_project() {
+            Some(project) => project.storage.save_environment(&Environment::new(&name)),
+            None => return,
+        };
+        match result {
+            Ok(()) => {
+                self.new_environment_name.clear();
+                self.refresh_project_lists();
+                // select_environment (below) clears env_notice as part of
+                // switching selection, so this has to be set after it, not
+                // before.
+                self.select_environment(Some(name.clone()));
+                self.env_notice = Some(format!("created environment \"{name}\""));
+            }
+            Err(e) => self.env_notice = Some(format!("failed to create \"{name}\": {e}")),
+        }
+    }
+
+    /// Write `env_editor_variables` to disk as the active environment —
+    /// rows with a blank key are skipped (same "blank name is ignored" rule
+    /// `build_request` already applies to headers), so an in-progress
+    /// half-typed row never gets persisted.
+    fn save_active_environment(&mut self) {
+        let Some(name) = self.active_environment.clone() else {
+            return;
+        };
+        let mut env = Environment::new(&name);
+        for v in &self.env_editor_variables {
+            if v.key.trim().is_empty() {
+                continue;
+            }
+            env.variables.push(Variable {
+                key: v.key.trim().to_string(),
+                value: v.value.clone(),
+                secret: v.secret,
+            });
+        }
+        let count = env.variables.len();
+        let result = match self.active_project() {
+            Some(project) => project.storage.save_environment(&env),
+            None => return,
+        };
+        self.env_notice = Some(match result {
+            Ok(()) => format!("saved {count} variable(s) to \"{name}\""),
+            Err(e) => format!("failed to save \"{name}\": {e}"),
+        });
+    }
+
+    /// Delete the active environment entirely and deselect it — mirrors
+    /// `curly env delete`, including that it takes effect immediately with
+    /// no separate confirmation step.
+    fn delete_active_environment(&mut self) {
+        let Some(name) = self.active_environment.clone() else {
+            return;
+        };
+        let result = match self.active_project() {
+            Some(project) => project.storage.delete_environment(&name),
+            None => return,
+        };
+        match result {
+            Ok(()) => {
+                self.refresh_project_lists();
+                self.active_environment = None;
+                self.env_editor_variables.clear();
+                self.env_notice = Some(format!("deleted environment \"{name}\""));
+            }
+            Err(e) => self.env_notice = Some(format!("failed to delete \"{name}\": {e}")),
         }
     }
 
@@ -426,17 +585,82 @@ impl eframe::App for CurlyApp {
                 ui.separator();
 
                 ui.label(format!("Environments ({})", self.environments.len()));
+
+                let mut env_action: Option<EnvAction> = None;
                 if ui
                     .selectable_label(self.active_environment.is_none(), "  (none selected)")
                     .clicked()
                 {
-                    self.active_environment = None;
+                    env_action = Some(EnvAction::Select(None));
                 }
                 for name in &self.environments {
                     let selected = self.active_environment.as_deref() == Some(name.as_str());
                     if ui.selectable_label(selected, format!("  {name}")).clicked() {
-                        self.active_environment = Some(name.clone());
+                        env_action = Some(EnvAction::Select(Some(name.clone())));
                     }
+                }
+
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.new_environment_name)
+                            .hint_text("new environment")
+                            .desired_width(120.0),
+                    );
+                    let name = self.new_environment_name.trim().to_string();
+                    if ui.add_enabled(!name.is_empty(), egui::Button::new("+ New")).clicked() {
+                        env_action = Some(EnvAction::Create(name));
+                    }
+                });
+
+                if let Some(action) = env_action {
+                    match action {
+                        EnvAction::Select(name) => self.select_environment(name),
+                        EnvAction::Create(name) => self.create_environment(name),
+                    }
+                }
+
+                if let Some(notice) = &self.env_notice {
+                    ui.colored_label(egui::Color32::from_rgb(120, 190, 130), notice);
+                }
+
+                if let Some(name) = self.active_environment.clone() {
+                    egui::CollapsingHeader::new(format!("Edit \"{name}\""))
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            let mut remove_idx = None;
+                            for (i, v) in self.env_editor_variables.iter_mut().enumerate() {
+                                ui.horizontal(|ui| {
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut v.key)
+                                            .hint_text("KEY")
+                                            .desired_width(70.0),
+                                    );
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut v.value)
+                                            .hint_text("value")
+                                            .desired_width(80.0),
+                                    );
+                                    ui.checkbox(&mut v.secret, "secret");
+                                    if ui.small_button("✕").clicked() {
+                                        remove_idx = Some(i);
+                                    }
+                                });
+                            }
+                            if let Some(i) = remove_idx {
+                                self.env_editor_variables.remove(i);
+                            }
+                            if ui.button("+ Add variable").clicked() {
+                                self.env_editor_variables.push(VariableRow::empty());
+                            }
+                            ui.horizontal(|ui| {
+                                if ui.button("Save").clicked() {
+                                    self.save_active_environment();
+                                }
+                                if ui.button("Delete environment").clicked() {
+                                    self.delete_active_environment();
+                                }
+                            });
+                        });
                 }
             });
 
@@ -882,8 +1106,6 @@ mod tests {
 
     // --- FR-21: environment switcher + {{variable}} substitution ---
 
-    use curly_core::storage::{Environment, Variable};
-
     fn project_with(dir: &tempfile::TempDir) -> CurlyApp {
         let mut app = CurlyApp::default_state();
         app.open_project_at(dir.path());
@@ -1071,5 +1293,154 @@ mod tests {
         app.load_saved_request(&saved);
 
         assert!(app.load_notice.is_none());
+    }
+
+    // --- FR-21: creating/editing/deleting environments from the GUI ---
+
+    #[test]
+    fn create_environment_makes_it_selectable_and_selects_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = project_with(&dir);
+
+        app.create_environment("staging".to_string());
+
+        assert_eq!(app.environments, vec!["staging".to_string()]);
+        assert_eq!(app.active_environment.as_deref(), Some("staging"));
+        assert!(app.env_editor_variables.is_empty());
+        assert!(app.env_notice.unwrap().contains("staging"));
+    }
+
+    #[test]
+    fn create_environment_clears_the_name_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = project_with(&dir);
+        app.new_environment_name = "staging".to_string();
+
+        app.create_environment("staging".to_string());
+
+        assert!(app.new_environment_name.is_empty());
+    }
+
+    #[test]
+    fn selecting_an_environment_loads_its_variables_into_the_editor() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = project_with(&dir);
+        let mut dev = Environment::new("dev");
+        dev.variables.push(Variable {
+            key: "HOST".to_string(),
+            value: "dev.example.com".to_string(),
+            secret: false,
+        });
+        app.active_project().unwrap().storage.save_environment(&dev).unwrap();
+
+        app.select_environment(Some("dev".to_string()));
+
+        assert_eq!(app.env_editor_variables.len(), 1);
+        assert_eq!(app.env_editor_variables[0].key, "HOST");
+        assert_eq!(app.env_editor_variables[0].value, "dev.example.com");
+    }
+
+    #[test]
+    fn deselecting_an_environment_clears_the_editor() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = project_with(&dir);
+        app.create_environment("dev".to_string());
+        app.env_editor_variables.push(VariableRow::empty());
+
+        app.select_environment(None);
+
+        assert!(app.active_environment.is_none());
+        assert!(app.env_editor_variables.is_empty());
+    }
+
+    #[test]
+    fn save_active_environment_persists_the_editors_variables() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = project_with(&dir);
+        app.create_environment("dev".to_string());
+        app.env_editor_variables.push(VariableRow {
+            key: "TOKEN".to_string(),
+            value: "abc123".to_string(),
+            secret: true,
+        });
+
+        app.save_active_environment();
+
+        let saved = app.active_project().unwrap().storage.load_environment("dev").unwrap();
+        assert_eq!(saved.variables.len(), 1);
+        assert_eq!(saved.variables[0].key, "TOKEN");
+        assert_eq!(saved.variables[0].value, "abc123");
+        assert!(saved.variables[0].secret);
+        assert!(app.env_notice.unwrap().contains('1'));
+    }
+
+    #[test]
+    fn save_active_environment_skips_rows_with_a_blank_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = project_with(&dir);
+        app.create_environment("dev".to_string());
+        app.env_editor_variables.push(VariableRow {
+            key: "   ".to_string(),
+            value: "ignored".to_string(),
+            secret: false,
+        });
+
+        app.save_active_environment();
+
+        let saved = app.active_project().unwrap().storage.load_environment("dev").unwrap();
+        assert!(saved.variables.is_empty());
+    }
+
+    #[test]
+    fn saved_variables_are_immediately_usable_by_merged_variables() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = project_with(&dir);
+        app.create_environment("dev".to_string());
+        app.env_editor_variables.push(VariableRow {
+            key: "HOST".to_string(),
+            value: "dev.example.com".to_string(),
+            secret: false,
+        });
+
+        app.save_active_environment();
+
+        assert_eq!(
+            app.merged_variables().get("HOST"),
+            Some(&"dev.example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn delete_active_environment_removes_it_and_deselects() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = project_with(&dir);
+        app.create_environment("dev".to_string());
+
+        app.delete_active_environment();
+
+        assert!(app.active_environment.is_none());
+        assert!(app.env_editor_variables.is_empty());
+        assert!(app.environments.is_empty());
+        assert!(app
+            .active_project()
+            .unwrap()
+            .storage
+            .load_environment("dev")
+            .is_err());
+        assert!(app.env_notice.unwrap().contains("dev"));
+    }
+
+    #[test]
+    fn save_active_environment_is_a_no_op_with_no_environment_selected() {
+        let mut app = CurlyApp::default_state();
+        app.save_active_environment();
+        assert!(app.env_notice.is_none());
+    }
+
+    #[test]
+    fn delete_active_environment_is_a_no_op_with_no_environment_selected() {
+        let mut app = CurlyApp::default_state();
+        app.delete_active_environment();
+        assert!(app.env_notice.is_none());
     }
 }

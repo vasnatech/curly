@@ -68,6 +68,26 @@ impl From<Variable> for VariableRow {
     }
 }
 
+/// A single ad-hoc `key=value` override, the GUI's equivalent of `curly
+/// run`'s `--var key=value` — applies only to sends made from this editor,
+/// never written to disk (no `secret` field: there's nothing to mask when
+/// nothing's persisted).
+struct OverrideRow {
+    key: String,
+    value: String,
+    enabled: bool,
+}
+
+impl OverrideRow {
+    fn empty() -> Self {
+        Self {
+            key: String::new(),
+            value: String::new(),
+            enabled: true,
+        }
+    }
+}
+
 enum SendOutcome {
     Success(ResponseSummary),
     Error(String),
@@ -130,6 +150,12 @@ pub struct CurlyApp {
     /// error) — separate from `load_notice`, which is about the request
     /// editor, not environment management.
     env_notice: Option<String>,
+    /// Ad-hoc `{{variable}}` overrides for this editor's sends only — the
+    /// GUI's equivalent of `curly run --var key=value`. Highest precedence
+    /// in `merged_variables`, never written to disk, not reset when the
+    /// active project or environment changes (same as headers/body — it's
+    /// editor state, not project state).
+    var_overrides: Vec<OverrideRow>,
     /// Set after loading a saved request whose body/auth couldn't be fully
     /// represented in the editor, or that references a variable undefined
     /// in the currently selected environment — shown once as a notice near
@@ -178,6 +204,7 @@ impl CurlyApp {
             env_editor_variables: Vec::new(),
             new_environment_name: String::new(),
             env_notice: None,
+            var_overrides: Vec::new(),
             load_notice: None,
         }
     }
@@ -333,36 +360,43 @@ impl CurlyApp {
     }
 
     /// The variable scope `{{variable}}` tokens resolve against, mirroring
-    /// `curly run`'s own precedence (see `curly-cli/src/commands/run.rs`'s
-    /// `merged_variables`) minus its `--var key=value` overrides, which have
-    /// no GUI equivalent yet: the always-merged-in "global" environment,
-    /// then the selected environment (if any), then that environment's
-    /// session (or the "global"-scoped session if none is selected — the
-    /// same default `curly run` uses when `--env` is omitted). Returns an
-    /// empty map with no project open, which is correct: any `{{token}}`
-    /// then fails loudly as undefined rather than silently sending literally.
+    /// `curly run`'s own precedence exactly (see
+    /// `curly-cli/src/commands/run.rs`'s `merged_variables`), low to high:
+    /// the always-merged-in "global" environment, the selected environment
+    /// (if any), that environment's session (or the "global"-scoped session
+    /// if none is selected — the same default `curly run` uses when
+    /// `--env` is omitted), then `var_overrides` — the GUI's equivalent of
+    /// `--var key=value`, highest precedence, applied whether or not a
+    /// project is open. A disabled or blank-key override row is ignored,
+    /// same rules `build_request` already applies to headers.
     fn merged_variables(&self) -> BTreeMap<String, String> {
         let mut variables = BTreeMap::new();
-        let Some(project) = self.active_project() else {
-            return variables;
-        };
 
-        if let Ok(Some(global)) = project.storage.load_environment_opt("global") {
-            for var in global.variables {
-                variables.insert(var.key, var.value);
+        if let Some(project) = self.active_project() {
+            if let Ok(Some(global)) = project.storage.load_environment_opt("global") {
+                for var in global.variables {
+                    variables.insert(var.key, var.value);
+                }
             }
-        }
-        if let Some(name) = &self.active_environment {
-            if let Ok(env) = project.storage.load_environment(name) {
-                for var in env.variables {
+            if let Some(name) = &self.active_environment {
+                if let Ok(env) = project.storage.load_environment(name) {
+                    for var in env.variables {
+                        variables.insert(var.key, var.value);
+                    }
+                }
+            }
+            let session_scope = self.active_environment.as_deref().unwrap_or("global");
+            if let Ok(session) = project.storage.load_session(session_scope) {
+                for var in session.variables {
                     variables.insert(var.key, var.value);
                 }
             }
         }
-        let session_scope = self.active_environment.as_deref().unwrap_or("global");
-        if let Ok(session) = project.storage.load_session(session_scope) {
-            for var in session.variables {
-                variables.insert(var.key, var.value);
+
+        for o in &self.var_overrides {
+            let key = o.key.trim();
+            if o.enabled && !key.is_empty() {
+                variables.insert(key.to_string(), o.value.clone());
             }
         }
 
@@ -706,6 +740,47 @@ impl eframe::App for CurlyApp {
                     should_send = true;
                 }
             });
+
+            ui.separator();
+
+            let override_count = self
+                .var_overrides
+                .iter()
+                .filter(|o| o.enabled && !o.key.trim().is_empty())
+                .count();
+            egui::CollapsingHeader::new(format!("Variable overrides ({override_count})"))
+                .default_open(false)
+                .show(ui, |ui| {
+                    ui.weak(
+                        "Highest precedence — the GUI's equivalent of `curly run --var key=value`. \
+                         Overrides the selected environment and its session for this send only; never saved to disk.",
+                    );
+                    let mut remove_idx = None;
+                    for (i, o) in self.var_overrides.iter_mut().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut o.enabled, "");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut o.key)
+                                    .hint_text("KEY")
+                                    .desired_width(140.0),
+                            );
+                            ui.add(
+                                egui::TextEdit::singleline(&mut o.value)
+                                    .hint_text("value")
+                                    .desired_width(240.0),
+                            );
+                            if ui.small_button("✕").clicked() {
+                                remove_idx = Some(i);
+                            }
+                        });
+                    }
+                    if let Some(i) = remove_idx {
+                        self.var_overrides.remove(i);
+                    }
+                    if ui.button("+ Add override").clicked() {
+                        self.var_overrides.push(OverrideRow::empty());
+                    }
+                });
 
             ui.separator();
 
@@ -1442,5 +1517,117 @@ mod tests {
         let mut app = CurlyApp::default_state();
         app.delete_active_environment();
         assert!(app.env_notice.is_none());
+    }
+
+    // --- FR-21: --var-style ad-hoc overrides ---
+
+    #[test]
+    fn var_override_applies_with_no_project_or_environment_at_all() {
+        let mut app = CurlyApp::default_state();
+        app.var_overrides.push(OverrideRow {
+            key: "HOST".to_string(),
+            value: "example.com".to_string(),
+            enabled: true,
+        });
+
+        assert_eq!(
+            app.merged_variables().get("HOST"),
+            Some(&"example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn var_override_takes_precedence_over_the_selected_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = project_with(&dir);
+        let mut dev = Environment::new("dev");
+        dev.variables.push(Variable {
+            key: "HOST".to_string(),
+            value: "dev.example.com".to_string(),
+            secret: false,
+        });
+        app.active_project().unwrap().storage.save_environment(&dev).unwrap();
+        app.active_environment = Some("dev".to_string());
+        app.var_overrides.push(OverrideRow {
+            key: "HOST".to_string(),
+            value: "overridden.example.com".to_string(),
+            enabled: true,
+        });
+
+        assert_eq!(
+            app.merged_variables().get("HOST"),
+            Some(&"overridden.example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn var_override_with_a_blank_key_is_ignored() {
+        let mut app = CurlyApp::default_state();
+        app.var_overrides.push(OverrideRow {
+            key: "   ".to_string(),
+            value: "ignored".to_string(),
+            enabled: true,
+        });
+
+        assert!(app.merged_variables().is_empty());
+    }
+
+    #[test]
+    fn disabled_var_override_is_ignored() {
+        let mut app = CurlyApp::default_state();
+        app.var_overrides.push(OverrideRow {
+            key: "HOST".to_string(),
+            value: "example.com".to_string(),
+            enabled: false,
+        });
+
+        assert!(app.merged_variables().is_empty());
+    }
+
+    #[test]
+    fn re_enabling_a_var_override_makes_it_apply_again() {
+        let mut app = CurlyApp::default_state();
+        app.var_overrides.push(OverrideRow {
+            key: "HOST".to_string(),
+            value: "example.com".to_string(),
+            enabled: false,
+        });
+        assert!(app.merged_variables().is_empty());
+
+        app.var_overrides[0].enabled = true;
+
+        assert_eq!(
+            app.merged_variables().get("HOST"),
+            Some(&"example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn build_request_uses_a_var_override() {
+        let mut app = CurlyApp::default_state();
+        app.url = "https://{{HOST}}/get".to_string();
+        app.var_overrides.push(OverrideRow {
+            key: "HOST".to_string(),
+            value: "example.com".to_string(),
+            enabled: true,
+        });
+
+        let request = app.build_request().unwrap();
+        assert_eq!(request.url, "https://example.com/get");
+    }
+
+    #[test]
+    fn load_saved_request_notice_clears_when_a_var_override_defines_the_missing_variable() {
+        let mut app = CurlyApp::default_state();
+        app.var_overrides.push(OverrideRow {
+            key: "BASE_URL".to_string(),
+            value: "https://api.example.com".to_string(),
+            enabled: true,
+        });
+
+        let saved = SavedRequest::new("get-user", Method::GET, "{{BASE_URL}}/users/1");
+        app.load_saved_request(&saved);
+
+        assert!(app.load_notice.is_none());
     }
 }

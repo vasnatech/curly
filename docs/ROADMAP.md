@@ -25,7 +25,7 @@ Every scenario node is one of two shapes — a leaf (a single request) or a comp
 
 ```json
 {
-  "request": "collection/path"
+  "request": "path"
 }
 ```
 ```json
@@ -76,56 +76,87 @@ A third node kind, alongside `request` and `requests`: routes to a different chi
 
 **`default` is optional. When it's omitted and no `case` matches, the scenario halts with a clear error naming what didn't match** (e.g. `"choice: response status 500 matched no case (defined: 200, 400) and no default was given"`) — not a silent no-op. This was deliberately chosen over "continue past the choice as if it wasn't there," and it's worth recording *why*, since an earlier pass through this reasoning leaned the other way before working through a concrete example changed it: extraction skipping on a non-2xx response is a genuinely different situation — the request already ran either way, extraction is a bonus step layered on top, so skipping it is a true no-op. A `choice` node *is* the thing deciding what happens next; if nothing matches, the scenario genuinely doesn't know what to do, and silently doing nothing there would be exactly the kind of surprise curly refuses elsewhere (`substitution::resolve` errors on an undefined `{{var}}` rather than sending it literally; Save As errors on a path collision rather than silently overwriting). `default` remains available for a genuine, deliberate fallback — including a deliberate no-op, if that's actually wanted, but only by writing it on purpose.
 
-### Worked example: health-record onboarding
+### Decided (2026-09): storage location, and cross-collection references via `imports`
 
-A concrete run through the format above, against real endpoints in this project's own `health-record-api` collection (not placeholders) — `auth/register`'s actual behavior, read from `AuthController`/`AuthService`/`GlobalExceptionHandler` rather than assumed: `200` on success, `400` (`"Email already in use"`, not `409`) if the email's already registered.
+**Scenarios get their own file**, `.curly/scenarios/<slug>.json`, one per scenario — mirroring collections exactly (`.curly/collections/<slug>.json`, `Storage::collections_dir`/`collection_path`), not nested inside a `Collection`. Same pattern of new `Storage` methods: `scenarios_dir`/`scenario_path`/`list_scenarios`/`load_scenario`/`load_scenario_opt`/`save_scenario`/`delete_scenario`, no new machinery invented. This was a reversal of the earlier "inside `Collection`" lean, once the real need — a scenario spanning *more than one* collection — came up; a request path is only unambiguous within a single collection's own file, so a scenario that isn't itself scoped to one collection can't live inside one.
+
+A scenario file declares which collections it needs, and under what local name, via `imports` — a map from **alias** to real collection name:
 
 ```json
 {
-  "scenario": {
-    "name": "onboarding",
-    "requests": {
-      "type": "sequence",
-      "items": [
-        { "request": "auth/register" },
-        {
-          "choice": {
-            "cases": [
-              {
-                "when": { "status": { "eq": 200 } },
-                "then": {
-                  "requests": {
-                    "type": "sequence",
-                    "items": [
-                      { "request": "me/update-preferences" },
-                      { "request": "body-measurements/update-preferences" },
-                      { "request": "me/update-preferences" },
-                      { "request": "notifications/update-preference" }
-                    ]
-                  }
+  "name": "onboarding",
+  "imports": {
+    "default": "health-record-api"
+  },
+  "requests": { "type": "sequence", "items": [ /* ... */ ] }
+}
+```
+
+A request reference is resolved one of two ways:
+- **`"alias->path"`** — split once on the first `->`; the left side must be a key in `imports`, the right side is handed to that collection's `Collection::find_request` exactly as-is (still `/`-nested for folders, unchanged). Deliberately `->` and not another `/` — request paths already use `/` for folder nesting (`"Auth/OAuth/login"`), and reusing it again for "cross into a different collection" would make the same character mean two different things depending on where you are in the string; the CLI's own `curly run <collection>/<path>` also uses `/`, but there it's the *real* collection name doing the splitting, not an alias, so visually reusing `/` for the alias case would look identical to that while actually meaning something different.
+- **A bare path with no `->`** — resolved against whichever import is named `"default"`. If no import is named `"default"`, this is an undefined-reference error, not a silent guess at which collection was meant.
+
+`"default"` is not a keyword with special parsing — it's simply the alias name this convention singles out; nothing stops also writing `"default->auth/register"` explicitly, and both forms resolve identically. A single-collection scenario (the common case) names its one import `"default"` and every reference stays a bare path, same ergonomics as before `imports` existed; a scenario spanning multiple collections only needs the explicit `alias->path` form for references into the *non-default* ones.
+
+### Worked example: health-record onboarding
+
+A concrete run through the format above, against real endpoints in this project's own `health-record-api` collection (not placeholders) — `auth/register`'s actual behavior, read from `AuthController`/`AuthService`/`GlobalExceptionHandler` rather than assumed: `200` on success, `400` (`"Email already in use"`, not `409`) if the email's already registered. This is the full contents of what `.curly/scenarios/onboarding.json` would hold — no outer wrapper key, matching how a collection's own file *is* the `Collection` object directly rather than `{"collection": {...}}`:
+
+```json
+{
+  "name": "onboarding",
+  "imports": {
+    "default": "health-record-api"
+  },
+  "requests": {
+    "type": "sequence",
+    "items": [
+      { "request": "auth/register" },
+      {
+        "choice": {
+          "cases": [
+            {
+              "when": { "status": { "eq": 200 } },
+              "then": {
+                "requests": {
+                  "type": "sequence",
+                  "items": [
+                    { "request": "me/update-preferences" },
+                    { "request": "body-measurements/update-preferences" },
+                    { "request": "me/update-preferences" },
+                    { "request": "notifications/update-preference" }
+                  ]
                 }
-              },
-              {
-                "when": { "status": { "eq": 400 } },
-                "then": { "request": "auth/login" }
               }
-            ]
-          }
+            },
+            {
+              "when": { "status": { "eq": 400 } },
+              "then": { "request": "auth/login" }
+            }
+          ]
         }
-      ]
-    }
+      }
+    ]
   }
 }
 ```
 
-`register` runs first. A `200` fans out into the onboarding wizard (settings → measurements → views → notifications, in order); a `400` (email already registered) logs the user in instead of failing the scenario outright. Per the decision above, any *other* status (a `500`, say) halts the scenario with a clear error, since neither `case` matches and there's no `default`.
+`register` runs first. A `200` fans out into the onboarding wizard (settings → measurements → views → notifications, in order); a `400` (email already registered) logs the user in instead of failing the scenario outright. Per the decision above, any *other* status (a `500`, say) halts the scenario with a clear error, since neither `case` matches and there's no `default` in the `choice` — a different, coincidentally-same-named thing from the `imports` alias called `"default"` above; the two `default`s don't interact.
 
 Two honesty notes baked into this example, not smoothed over: there's no dedicated `/views` endpoint in this codebase — per the `configurable_views_prefs_bug` work, view visibility is configured through the *same* `me/update-preferences` endpoint as general settings, so "views" here is a second call to that endpoint with a different (unshown) payload, not a distinct route. And the two `me/update-preferences` calls only make sense as written if their request bodies actually differ — this sketch doesn't fill those in.
+
+If a second collection joined in (say a separate `billing-api`), only `imports` and the specific steps that need it change — everything else, including every existing bare reference, is untouched:
+
+```json
+"imports": { "default": "health-record-api", "billing": "billing-api" },
+...
+{ "request": "billing->accounts/create" },
+{ "request": "me/get" }
+```
 
 ### Open questions (unresolved — next session should raise these, not assume answers)
 
 1. **DAG vs. nesting, finally confirmed?** — every worked example so far (including the one above) has used nesting without objection, and the recursive node format above has been adopted, but the user hasn't explicitly ruled out needing arbitrary "step D depends on both A and C, not just the previous step" dependency edges for some future scenario. Treat nesting as the working default, not a closed decision, until a real scenario surfaces that it can't express.
-2. **Where do scenarios live?** — inside `Collection` (`Collection.scenarios: Vec<Scenario>`, alongside `folders`/`requests`) is the natural fit given everything else lives there, but not yet decided.
-3. **General step failure semantics** — distinct from the `choice`-specific decision above, which only covers "no case matched." Does an ordinary `request` node's own 4xx/5xx (or an extraction failure) halt the whole scenario by default (matching `--fail`'s existing spirit and the "fail loud" reasoning used for `choice` above), or is that configurable per-scenario? What happens to a `parallel` block where one branch fails and others are still running — cancel the rest, or let them finish and report all failures together?
-4. **Output**: a per-step summary (status/ms/pass-fail, test-report-style) vs. each step's normal `run` output back-to-back vs. something configurable?
-5. **CLI shape**: `curly scenario run <collection>/<scenario-name>`, mirroring `curly run`? How are scenarios authored — `collections add-scenario` flags, or JSON-only (nested sequence/parallel/choice trees don't map cleanly onto flat CLI flags the way a single request's headers/body do, so JSON-only may be the more honest answer here even though extraction rules support flags)?
+2. **General step failure semantics** — distinct from the `choice`-specific decision above, which only covers "no case matched." Does an ordinary `request` node's own 4xx/5xx (or an extraction failure) halt the whole scenario by default (matching `--fail`'s existing spirit and the "fail loud" reasoning used for `choice` above), or is that configurable per-scenario? What happens to a `parallel` block where one branch fails and others are still running — cancel the rest, or let them finish and report all failures together?
+3. **Output**: a per-step summary (status/ms/pass-fail, test-report-style) vs. each step's normal `run` output back-to-back vs. something configurable?
+4. **CLI shape**: `curly scenario run <scenario-name>` (no collection prefix — a scenario is no longer inside one, it's its own top-level named thing, same as `curly env show <name>` or `curly session show --env <name>`)? How are scenarios authored — `curly scenario add-step`-style flags, or JSON-only (nested sequence/parallel/choice trees, and now `imports`, don't map cleanly onto flat CLI flags the way a single request's headers/body do, so JSON-only may be the more honest answer here even though extraction rules support flags)?

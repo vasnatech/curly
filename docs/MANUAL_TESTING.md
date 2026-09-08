@@ -238,15 +238,37 @@ EOF
 | 15.5 | `CURLY_DATA_DIR=/tmp/other2 curly env list` (run from inside `/tmp/proj/backend`, which has its own `.curly`) | Uses `/tmp/other2` — the env var beats auto-detection, even though a `.curly` is sitting right there. |
 | 15.6 | From a directory with no `.curly` anywhere in its ancestry and no `--data-dir`/`CURLY_DATA_DIR` set, `curly env list` | Falls back to the OS default (`~/.local/share/curly` on Linux) — unchanged pre-M2 behavior. |
 
-## 16. Cross-platform sanity (when releasing)
+## 16. GUI (M4, first slice — see GUI.md)
+
+Requires an actual display (X11 or Wayland) — not scriptable the way the rest of this doc is; run these by hand. `cargo build --release` first.
 
 | # | Steps | Expected |
 |---|---|---|
-| 16.1 | `cargo build --release` on Linux, macOS, and Windows | Each produces a working binary with no OS-specific build errors. |
-| 16.2 | Run scenario 1.1 and 4.1 on each OS | Same output shape on all three (path separators in `-o`/`--data-binary`/`--cacert` examples are the main thing to sanity-check on Windows). |
-| 16.3 | Run scenario 10.6 (inspect the collection JSON file) on each OS | Confirms the data directory resolves correctly per-OS (`~/.local/share/curly`, `~/Library/Application Support/curly`, `%APPDATA%\curly`). |
+| 16.1 | `curly` (no arguments) | GUI window opens (not a CLI error). |
+| 16.2 | `curly gui` | Same window opens. |
+| 16.3 | `curly -v` (a flag, no URL, no subcommand) | Does **not** open the GUI — prints the usual "a URL is required" CLI error. Confirms the zero-args check doesn't over-trigger on a flag-only invocation. |
+| 16.4 | `curly https://httpbin.org/get` | Still one-shots normally on stdout — GUI mode didn't hijack normal CLI usage. |
+| 16.5 | In the GUI: method dropdown → GET, URL → `https://httpbin.org/get`, click **Send** | Status turns up green (2xx), elapsed time and body size shown, body pretty-printed as JSON. |
+| 16.6 | Press **Enter** while focused in the URL field (instead of clicking Send) | Same as clicking Send. |
+| 16.7 | Press **Ctrl+Enter** (Cmd+Enter on macOS) anywhere in the window | Same as clicking Send. |
+| 16.8 | Click Send, then immediately try clicking it again before the response arrives | Button reads "Sending…" and is disabled — can't fire a second overlapping request; window stays responsive (not frozen) while waiting. |
+| 16.9 | Add a header row (`+ Add header`), set name `X-Test` / value `abc`, send to `https://httpbin.org/get` | Response's `headers.X-Test` echoes `abc`. |
+| 16.10 | Uncheck that header's enabled box, send again | `X-Test` no longer appears in the echoed headers — disabled means excluded, not deleted. |
+| 16.11 | Add a header row with a blank name, leave it checked, send | No error — a blank-name header is silently excluded (matches `build_request`'s unit-tested behavior). |
+| 16.12 | Method → POST, Body → `{"a":1}`, send to `https://httpbin.org/post` | Response's `data`/`json` field shows `{"a": 1}` — raw body sent correctly. |
+| 16.13 | Send to an invalid URL (e.g. `not-a-url`) | Error shown in red in the response pane — window doesn't crash or freeze. |
+| 16.14 | Collapse/expand the "Headers", "Body", and "Response Headers" sections | Each toggles independently, state persists while the window stays open. |
+| 16.15 | `cargo build -p curly-cli --no-default-features --release` then run `./target/release/curly` (zero args) and `curly gui` | Both print "this build of curly was compiled without the gui feature..." and exit 1 — no window, no panic. |
 
-## 17. Regression checklist for new flags/subcommands
+## 17. Cross-platform sanity (when releasing)
+
+| # | Steps | Expected |
+|---|---|---|
+| 17.1 | `cargo build --release` on Linux, macOS, and Windows | Each produces a working binary with no OS-specific build errors. |
+| 17.2 | Run scenario 1.1 and 4.1 on each OS | Same output shape on all three (path separators in `-o`/`--data-binary`/`--cacert` examples are the main thing to sanity-check on Windows). |
+| 17.3 | Run scenario 10.6 (inspect the collection JSON file) on each OS | Confirms the data directory resolves correctly per-OS (`~/.local/share/curly`, `~/Library/Application Support/curly`, `%APPDATA%\curly`). |
+
+## 18. Regression checklist for new flags/subcommands
 
 When adding a new flag or subcommand, add at minimum:
 - A unit test covering the pure parsing/building logic — `crates/curly-cli/src/one_shot.rs`, `args.rs`, or `commands/*.rs`'s `#[cfg(test)] mod tests` depending on where the logic lives, plus `crates/curly-core/tests/` for anything storage- or substitution-related.

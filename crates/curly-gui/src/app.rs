@@ -117,6 +117,37 @@ enum EnvAction {
     Create(String),
 }
 
+/// Identifies where a loaded request lives, so a plain "Save" knows what to
+/// overwrite without re-asking — the collection's name plus its
+/// slash-separated path within that collection (e.g. `"Auth/OAuth/login"`,
+/// matching `Collection::find_request`'s own path convention exactly; not
+/// including the collection name itself).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LoadedRequestRef {
+    collection: String,
+    path: String,
+}
+
+/// A click in the sidebar's Collections tree, applied after the rendering
+/// loop finishes (same deferred-action reason as `EnvAction`) — either load
+/// a request into the editor, or delete it from its collection.
+enum TreeAction {
+    Load(String, SavedRequest),
+    Delete(String),
+}
+
+/// State for the "Save Request" floating window (FR-20) — collection/folder
+/// path/name are free text rather than, say, a dropdown limited to existing
+/// collections, since typing a new collection or folder name is exactly how
+/// you create one (mirrors `curly collections add-request`'s own
+/// create-if-missing behavior).
+struct SaveDialog {
+    collection: String,
+    folder_path: String,
+    name: String,
+    error: Option<String>,
+}
+
 pub struct CurlyApp {
     method: String,
     url: String,
@@ -139,6 +170,15 @@ pub struct CurlyApp {
     projects: Vec<Project>,
     active_project_idx: Option<usize>,
     project_open_error: Option<String>,
+    /// The "Open Project…" folder picker's result channel, `Some` while a
+    /// pick is in flight — polled each frame like `rx`/`poll_response`. The
+    /// dialog itself runs on `runtime` via `rfd::AsyncFileDialog` rather
+    /// than the blocking `rfd::FileDialog`, which would freeze the whole
+    /// event loop (and every window's redraw with it) for as long as the OS
+    /// dialog stays open — long enough that GNOME's compositor reports the
+    /// window as "Not Responding", even though the app isn't actually
+    /// hung, just not pumping events while stuck in a synchronous call.
+    project_dialog_rx: Option<mpsc::Receiver<Option<std::path::PathBuf>>>,
     /// Cached listing of the active project's collections (loaded in full —
     /// small enough for now to just read all of them upfront rather than
     /// build a lazy-loading scheme — and environment names, re-read from
@@ -196,6 +236,19 @@ pub struct CurlyApp {
     /// in the currently selected environment — shown once as a notice near
     /// the editor, replaced (or cleared) on the next load.
     load_notice: Option<String>,
+    /// Which saved request (if any) the editor currently mirrors — set by
+    /// clicking a request in the Collections tree, and by a successful Save
+    /// (new or overwrite). `None` for a request built from scratch or after
+    /// deleting the loaded request out from under itself. Drives whether
+    /// plain "Save" overwrites in place or falls back to the "Save As…"
+    /// dialog (FR-20).
+    loaded_request: Option<LoadedRequestRef>,
+    /// Open while the "Save Request" window is showing; `None` otherwise.
+    save_dialog: Option<SaveDialog>,
+    /// Feedback from saving/deleting a request in a collection — separate
+    /// from `load_notice` (about the editor's own content) and
+    /// `env_notice`/`session_notice` (environments/sessions).
+    collection_notice: Option<String>,
 }
 
 impl CurlyApp {
@@ -233,6 +286,7 @@ impl CurlyApp {
             projects: Vec::new(),
             active_project_idx: None,
             project_open_error: None,
+            project_dialog_rx: None,
             collections: Vec::new(),
             environments: Vec::new(),
             active_environment: None,
@@ -245,6 +299,9 @@ impl CurlyApp {
             pending_extraction: None,
             session_notice: None,
             load_notice: None,
+            loaded_request: None,
+            save_dialog: None,
+            collection_notice: None,
         }
     }
 
@@ -259,6 +316,39 @@ impl CurlyApp {
         match Storage::init_project_local(dir) {
             Ok((storage, _created)) => self.set_active_project(storage),
             Err(e) => self.project_open_error = Some(e.to_string()),
+        }
+    }
+
+    /// Show the native folder picker on `runtime` without blocking the
+    /// event loop — see `project_dialog_rx`'s doc comment for why the
+    /// blocking `rfd::FileDialog` API isn't used here.
+    fn open_project_dialog(&mut self, ctx: &egui::Context) {
+        let (tx, rx) = mpsc::channel();
+        self.project_dialog_rx = Some(rx);
+        let ctx = ctx.clone();
+        self.runtime.spawn(async move {
+            let picked = rfd::AsyncFileDialog::new()
+                .pick_folder()
+                .await
+                .map(|handle| handle.path().to_path_buf());
+            let _ = tx.send(picked);
+            ctx.request_repaint();
+        });
+    }
+
+    /// Polled each frame, like `poll_response` — opens the picked directory
+    /// as a project once the async dialog resolves. A cancelled dialog
+    /// (`None`) is a no-op: the previously active project, if any, stays
+    /// active.
+    fn poll_project_dialog(&mut self) {
+        let Some(rx) = &self.project_dialog_rx else {
+            return;
+        };
+        if let Ok(picked) = rx.try_recv() {
+            self.project_dialog_rx = None;
+            if let Some(dir) = picked {
+                self.open_project_at(&dir);
+            }
         }
     }
 
@@ -720,11 +810,290 @@ impl CurlyApp {
         }
         self.session_notice = Some(message);
     }
+
+    /// Build a `SavedRequest` from the editor's current fields (FR-20) — a
+    /// disabled or blank-name header is dropped, same rule `build_request`
+    /// already applies when actually sending; extraction rules carry over
+    /// as-is from `extract_rules` (so editing a loaded request and saving
+    /// it back keeps whatever rules it already had). No auth is derived
+    /// from the headers — the editor has no separate auth concept, so an
+    /// `Authorization` header saves as a plain header, not `SavedAuth`.
+    fn build_saved_request(&self, name: &str) -> anyhow::Result<SavedRequest> {
+        let method = Method::from_bytes(self.method.to_uppercase().as_bytes())?;
+        let mut saved = SavedRequest::new(name, method, self.url.clone());
+        saved.headers = self
+            .headers
+            .iter()
+            .filter(|h| !h.name.trim().is_empty())
+            .map(|h| KvPair {
+                name: h.name.clone(),
+                value: h.value.clone(),
+                enabled: h.enabled,
+            })
+            .collect();
+        saved.body = if self.body.is_empty() {
+            None
+        } else {
+            Some(SavedBody::Raw {
+                content: self.body.clone(),
+            })
+        };
+        saved.extract = self.extract_rules.clone();
+        Ok(saved)
+    }
+
+    /// Reset the editor to a blank state, without touching the active
+    /// project/environment/overrides — the counterpart to loading a saved
+    /// request, so starting a new one doesn't risk a later "Save"
+    /// overwriting whatever was loaded before.
+    fn new_request(&mut self) {
+        self.method = "GET".to_string();
+        self.url.clear();
+        self.headers = vec![HeaderRow::empty()];
+        self.body.clear();
+        self.extract_rules.clear();
+        self.loaded_request = None;
+        self.load_notice = None;
+        self.response = None;
+    }
+
+    /// Pre-fill the Save dialog from `loaded_request` if there is one (so
+    /// "Save As…" on a loaded request defaults to *its* location — change
+    /// the name or folder to save a copy instead of overwriting), or from
+    /// the first available collection otherwise.
+    fn open_save_dialog(&mut self) {
+        let (collection, folder_path, name) = match &self.loaded_request {
+            Some(loaded) => {
+                let (folder, name) = split_folder_and_name(&loaded.path);
+                (loaded.collection.clone(), folder, name)
+            }
+            None => (
+                self.collections.first().map(|c| c.name.clone()).unwrap_or_default(),
+                String::new(),
+                String::new(),
+            ),
+        };
+        self.save_dialog = Some(SaveDialog {
+            collection,
+            folder_path,
+            name,
+            error: None,
+        });
+    }
+
+    fn cancel_save_dialog(&mut self) {
+        self.save_dialog = None;
+    }
+
+    /// Render the "Save Request" floating window if `save_dialog` is
+    /// `Some`. Kept to local `confirmed`/`cancelled` flags rather than
+    /// calling `confirm_save_dialog`/`cancel_save_dialog` from inside the
+    /// closure below — that closure only needs `dialog` (already a
+    /// `&mut SaveDialog`), and acting on `self` while `self.save_dialog`
+    /// is still mutably borrowed for `dialog` wouldn't borrow-check.
+    fn show_save_dialog(&mut self, ctx: &egui::Context) {
+        let mut confirmed = false;
+        let mut cancelled = false;
+
+        if let Some(dialog) = self.save_dialog.as_mut() {
+            let mut open = true;
+            egui::Window::new("Save Request")
+                .collapsible(false)
+                .resizable(false)
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Collection:");
+                        ui.text_edit_singleline(&mut dialog.collection);
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Folder (optional):");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut dialog.folder_path).hint_text("Auth/OAuth"),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Name:");
+                        ui.text_edit_singleline(&mut dialog.name);
+                    });
+                    if let Some(err) = &dialog.error {
+                        ui.colored_label(egui::Color32::from_rgb(220, 80, 80), err);
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("Save").clicked() {
+                            confirmed = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            cancelled = true;
+                        }
+                    });
+                });
+            if !open {
+                cancelled = true;
+            }
+        }
+
+        if confirmed {
+            self.confirm_save_dialog();
+        } else if cancelled {
+            self.cancel_save_dialog();
+        }
+    }
+
+    /// Save the dialog's collection/folder/name as a *new* request — always
+    /// creates, mirroring `Collection::add_request`'s own "errors if a
+    /// request already exists at that exact path" behavior rather than
+    /// silently overwriting (overwriting the currently loaded request is
+    /// what plain "Save" — `save_over_loaded` — is for).
+    fn confirm_save_dialog(&mut self) {
+        let Some(dialog) = self.save_dialog.as_ref() else {
+            return;
+        };
+        let collection_name = dialog.collection.trim().to_string();
+        let name = dialog.name.trim().to_string();
+        let folder = dialog.folder_path.trim().trim_matches('/').to_string();
+
+        if collection_name.is_empty() {
+            self.save_dialog.as_mut().unwrap().error = Some("collection name is required".to_string());
+            return;
+        }
+        if name.is_empty() {
+            self.save_dialog.as_mut().unwrap().error = Some("request name is required".to_string());
+            return;
+        }
+
+        let path = if folder.is_empty() {
+            name.clone()
+        } else {
+            format!("{folder}/{name}")
+        };
+
+        let saved = match self.build_saved_request(&name) {
+            Ok(s) => s,
+            Err(e) => {
+                self.save_dialog.as_mut().unwrap().error = Some(format!("invalid request: {e}"));
+                return;
+            }
+        };
+
+        let result: anyhow::Result<()> = match self.active_project() {
+            Some(project) => (|| {
+                let mut collection = project
+                    .storage
+                    .load_collection_opt(&collection_name)?
+                    .unwrap_or_else(|| Collection::new(&collection_name));
+                collection.add_request(&path, saved)?;
+                project.storage.save_collection(&collection)
+            })(),
+            None => Err(anyhow::anyhow!("no project is open")),
+        };
+
+        match result {
+            Ok(()) => {
+                self.loaded_request = Some(LoadedRequestRef {
+                    collection: collection_name.clone(),
+                    path: path.clone(),
+                });
+                self.refresh_project_lists();
+                self.collection_notice = Some(format!("saved \"{path}\" in \"{collection_name}\""));
+                self.save_dialog = None;
+            }
+            Err(e) => self.save_dialog.as_mut().unwrap().error = Some(e.to_string()),
+        }
+    }
+
+    /// Overwrite the currently loaded request in place — its own identity
+    /// (`SavedRequest::id`) is preserved rather than regenerated, and its
+    /// position in the tree doesn't move. Falls back to opening the Save
+    /// dialog when nothing is loaded, so a single "Save" button always does
+    /// something reasonable regardless of editor state.
+    fn save_over_loaded(&mut self) {
+        let Some(loaded) = self.loaded_request.clone() else {
+            self.open_save_dialog();
+            return;
+        };
+        let (_, name) = split_folder_and_name(&loaded.path);
+        let saved = match self.build_saved_request(&name) {
+            Ok(s) => s,
+            Err(e) => {
+                self.collection_notice = Some(format!("failed to save: {e}"));
+                return;
+            }
+        };
+
+        let result: anyhow::Result<()> = match self.active_project() {
+            Some(project) => (|| {
+                let mut collection = project.storage.load_collection(&loaded.collection)?;
+                match collection.find_request_mut(&loaded.path) {
+                    Some(existing) => {
+                        let id = existing.id;
+                        *existing = saved;
+                        existing.id = id;
+                    }
+                    None => collection.add_request(&loaded.path, saved)?,
+                }
+                project.storage.save_collection(&collection)
+            })(),
+            None => Err(anyhow::anyhow!("no project is open")),
+        };
+
+        if result.is_ok() {
+            self.refresh_project_lists();
+        }
+        self.collection_notice = Some(match result {
+            Ok(()) => format!("saved \"{}\" in \"{}\"", loaded.path, loaded.collection),
+            Err(e) => format!("failed to save: {e}"),
+        });
+    }
+
+    /// Remove a request from a collection (the sidebar tree's `✕` button) —
+    /// no confirmation step, matching this app's established "delete acts
+    /// immediately" pattern (environment delete, override row removal).
+    /// Clears `loaded_request` if the deleted request was the one loaded
+    /// into the editor, so a later "Save" doesn't try to overwrite
+    /// something that no longer exists.
+    fn delete_saved_request(&mut self, collection_name: &str, path: &str) {
+        let result: anyhow::Result<()> = match self.active_project() {
+            Some(project) => (|| {
+                let mut collection = project.storage.load_collection(collection_name)?;
+                collection.remove_request(path);
+                project.storage.save_collection(&collection)
+            })(),
+            None => Err(anyhow::anyhow!("no project is open")),
+        };
+
+        match result {
+            Ok(()) => {
+                if self
+                    .loaded_request
+                    .as_ref()
+                    .is_some_and(|r| r.collection == collection_name && r.path == path)
+                {
+                    self.loaded_request = None;
+                }
+                self.refresh_project_lists();
+                self.collection_notice = Some(format!("deleted \"{path}\" from \"{collection_name}\""));
+            }
+            Err(e) => self.collection_notice = Some(format!("failed to delete \"{path}\": {e}")),
+        }
+    }
+}
+
+/// Split `"Auth/OAuth/login"` into (`"Auth/OAuth"`, `"login"`) — a bare
+/// `"login"` (no `/`) splits into (`""`, `"login"`). The inverse of how the
+/// Save dialog's folder-path + name fields join back into one path.
+fn split_folder_and_name(path: &str) -> (String, String) {
+    match path.rsplit_once('/') {
+        Some((folder, name)) => (folder.to_string(), name.to_string()),
+        None => (String::new(), path.to_string()),
+    }
 }
 
 impl eframe::App for CurlyApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll_response();
+        self.poll_project_dialog();
+        self.show_save_dialog(ui.ctx());
 
         egui::Panel::left("project_sidebar")
             .resizable(true)
@@ -746,10 +1115,16 @@ impl eframe::App for CurlyApp {
                     ui.colored_label(egui::Color32::from_rgb(220, 80, 80), err);
                 }
 
-                if ui.button("Open Project…").clicked() {
-                    if let Some(dir) = rfd::FileDialog::new().pick_folder() {
-                        self.open_project_at(&dir);
-                    }
+                let dialog_pending = self.project_dialog_rx.is_some();
+                if ui
+                    .add_enabled(
+                        !dialog_pending,
+                        egui::Button::new(if dialog_pending { "Choosing…" } else { "Open Project…" }),
+                    )
+                    .clicked()
+                {
+                    let ctx = ui.ctx().clone();
+                    self.open_project_dialog(&ctx);
                 }
 
                 ui.separator();
@@ -758,20 +1133,30 @@ impl eframe::App for CurlyApp {
                 if self.collections.is_empty() {
                     ui.weak("  (none yet)");
                 }
-                let mut clicked_request: Option<SavedRequest> = None;
+                let mut tree_action: Option<(String, TreeAction)> = None;
                 for collection in &self.collections {
                     egui::CollapsingHeader::new(&collection.name)
                         .id_salt(collection.id)
                         .show(ui, |ui| {
-                            if let Some(r) =
-                                show_collection_tree(ui, &collection.folders, &collection.requests)
+                            if let Some(a) = show_collection_tree(ui, "", &collection.folders, &collection.requests)
                             {
-                                clicked_request = Some(r);
+                                tree_action = Some((collection.name.clone(), a));
                             }
                         });
                 }
-                if let Some(saved) = clicked_request {
-                    self.load_saved_request(&saved);
+                if let Some((collection_name, action)) = tree_action {
+                    match action {
+                        TreeAction::Load(path, saved) => {
+                            self.loaded_request = Some(LoadedRequestRef {
+                                collection: collection_name,
+                                path,
+                            });
+                            self.load_saved_request(&saved);
+                        }
+                        TreeAction::Delete(path) => {
+                            self.delete_saved_request(&collection_name, &path);
+                        }
+                    }
                 }
 
                 ui.separator();
@@ -941,6 +1326,29 @@ impl eframe::App for CurlyApp {
                 }
             });
 
+            ui.horizontal(|ui| {
+                match &self.loaded_request {
+                    Some(loaded) => ui.weak(format!("Editing \"{}/{}\"", loaded.collection, loaded.path)),
+                    None => ui.weak("New request (not saved)"),
+                };
+                if ui.button("New").clicked() {
+                    self.new_request();
+                }
+                if ui.button("Save").clicked() {
+                    self.save_over_loaded();
+                }
+                if ui.button("Save As…").clicked() {
+                    self.open_save_dialog();
+                }
+            });
+            if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::S)) {
+                self.save_over_loaded();
+            }
+
+            if let Some(notice) = &self.collection_notice {
+                ui.colored_label(egui::Color32::from_rgb(120, 190, 130), notice);
+            }
+
             ui.separator();
 
             let override_count = self
@@ -1090,29 +1498,45 @@ impl eframe::App for CurlyApp {
 /// it only needs the tree data, not the rest of `CurlyApp`.
 fn show_collection_tree(
     ui: &mut egui::Ui,
+    prefix: &str,
     folders: &[Folder],
     requests: &[SavedRequest],
-) -> Option<SavedRequest> {
-    let mut clicked = None;
+) -> Option<TreeAction> {
+    let mut action = None;
 
     for folder in folders {
+        let folder_prefix = if prefix.is_empty() {
+            folder.name.clone()
+        } else {
+            format!("{prefix}/{}", folder.name)
+        };
         egui::CollapsingHeader::new(format!("{}/", folder.name))
             .id_salt(folder.id)
             .show(ui, |ui| {
-                if let Some(r) = show_collection_tree(ui, &folder.folders, &folder.requests) {
-                    clicked = Some(r);
+                if let Some(a) = show_collection_tree(ui, &folder_prefix, &folder.folders, &folder.requests) {
+                    action = Some(a);
                 }
             });
     }
 
     for request in requests {
-        let label = format!("{:<7} {}", request.method, request.name);
-        if ui.selectable_label(false, label).clicked() {
-            clicked = Some(request.clone());
-        }
+        let path = if prefix.is_empty() {
+            request.name.clone()
+        } else {
+            format!("{prefix}/{}", request.name)
+        };
+        ui.horizontal(|ui| {
+            let label = format!("{:<7} {}", request.method, request.name);
+            if ui.selectable_label(false, label).clicked() {
+                action = Some(TreeAction::Load(path.clone(), request.clone()));
+            }
+            if ui.small_button("✕").clicked() {
+                action = Some(TreeAction::Delete(path.clone()));
+            }
+        });
     }
 
-    clicked
+    action
 }
 
 #[cfg(test)]
@@ -2126,5 +2550,341 @@ mod tests {
 
         app.active_environment = Some("dev".to_string());
         assert_eq!(app.session_scope(), "dev");
+    }
+
+    // --- FR-20: save/new/delete a request from the GUI ---
+
+    #[test]
+    fn split_folder_and_name_splits_a_nested_path() {
+        assert_eq!(
+            split_folder_and_name("Auth/OAuth/login"),
+            ("Auth/OAuth".to_string(), "login".to_string())
+        );
+    }
+
+    #[test]
+    fn split_folder_and_name_top_level_has_no_folder() {
+        assert_eq!(split_folder_and_name("login"), (String::new(), "login".to_string()));
+    }
+
+    #[test]
+    fn build_saved_request_carries_over_editor_fields() {
+        let mut app = CurlyApp::default_state();
+        app.method = "post".to_string();
+        app.url = "https://example.com/users".to_string();
+        app.headers = vec![
+            HeaderRow {
+                name: "X-Test".to_string(),
+                value: "1".to_string(),
+                enabled: true,
+            },
+            HeaderRow {
+                name: "X-Off".to_string(),
+                value: "2".to_string(),
+                enabled: false,
+            },
+            HeaderRow {
+                name: "   ".to_string(),
+                value: "ignored".to_string(),
+                enabled: true,
+            },
+        ];
+        app.body = r#"{"a":1}"#.to_string();
+        app.extract_rules = vec![Extraction::Body {
+            name: "ID".to_string(),
+            path: "id".to_string(),
+            secret: false,
+        }];
+
+        let saved = app.build_saved_request("create-user").unwrap();
+
+        assert_eq!(saved.name, "create-user");
+        assert_eq!(saved.method, "POST");
+        assert_eq!(saved.url, "https://example.com/users");
+        assert_eq!(saved.headers.len(), 2);
+        assert_eq!(saved.headers[0].name, "X-Test");
+        assert!(!saved.headers[1].enabled);
+        match saved.body {
+            Some(SavedBody::Raw { content }) => assert_eq!(content, r#"{"a":1}"#),
+            other => panic!("expected Raw body, got {other:?}"),
+        }
+        assert_eq!(saved.extract.len(), 1);
+    }
+
+    #[test]
+    fn build_saved_request_empty_body_is_none() {
+        let app = CurlyApp::default_state();
+        let saved = app.build_saved_request("x").unwrap();
+        assert!(saved.body.is_none());
+    }
+
+    #[test]
+    fn build_saved_request_errors_on_an_invalid_method() {
+        let mut app = CurlyApp::default_state();
+        app.method = "NOT A METHOD".to_string();
+        assert!(app.build_saved_request("x").is_err());
+    }
+
+    #[test]
+    fn new_request_resets_the_editor_and_clears_loaded_request() {
+        let mut app = CurlyApp::default_state();
+        app.method = "POST".to_string();
+        app.url = "https://example.com".to_string();
+        app.body = "stuff".to_string();
+        app.extract_rules = vec![Extraction::Header {
+            name: "X".to_string(),
+            header: "X".to_string(),
+            secret: false,
+        }];
+        app.loaded_request = Some(LoadedRequestRef {
+            collection: "api".to_string(),
+            path: "login".to_string(),
+        });
+
+        app.new_request();
+
+        assert_eq!(app.method, "GET");
+        assert!(app.url.is_empty());
+        assert!(app.body.is_empty());
+        assert!(app.extract_rules.is_empty());
+        assert!(app.loaded_request.is_none());
+    }
+
+    #[test]
+    fn open_save_dialog_prefills_from_the_loaded_request() {
+        let mut app = CurlyApp::default_state();
+        app.loaded_request = Some(LoadedRequestRef {
+            collection: "api".to_string(),
+            path: "Auth/login".to_string(),
+        });
+
+        app.open_save_dialog();
+
+        let dialog = app.save_dialog.unwrap();
+        assert_eq!(dialog.collection, "api");
+        assert_eq!(dialog.folder_path, "Auth");
+        assert_eq!(dialog.name, "login");
+    }
+
+    #[test]
+    fn open_save_dialog_defaults_to_the_first_collection_with_nothing_loaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = project_with(&dir);
+        app.active_project()
+            .unwrap()
+            .storage
+            .save_collection(&Collection::new("my-api"))
+            .unwrap();
+        app.refresh_project_lists();
+
+        app.open_save_dialog();
+
+        let dialog = app.save_dialog.unwrap();
+        assert_eq!(dialog.collection, "my-api");
+        assert!(dialog.folder_path.is_empty());
+        assert!(dialog.name.is_empty());
+    }
+
+    #[test]
+    fn cancel_save_dialog_clears_it() {
+        let mut app = CurlyApp::default_state();
+        app.open_save_dialog();
+        assert!(app.save_dialog.is_some());
+
+        app.cancel_save_dialog();
+
+        assert!(app.save_dialog.is_none());
+    }
+
+    #[test]
+    fn confirm_save_dialog_creates_a_new_request_in_a_new_collection() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = project_with(&dir);
+        app.url = "https://example.com/get".to_string();
+        app.save_dialog = Some(SaveDialog {
+            collection: "my-api".to_string(),
+            folder_path: "Auth".to_string(),
+            name: "login".to_string(),
+            error: None,
+        });
+
+        app.confirm_save_dialog();
+
+        assert!(app.save_dialog.is_none());
+        let collection = app.active_project().unwrap().storage.load_collection("my-api").unwrap();
+        let saved = collection.find_request("Auth/login").unwrap();
+        assert_eq!(saved.url, "https://example.com/get");
+        assert_eq!(
+            app.loaded_request.unwrap(),
+            LoadedRequestRef {
+                collection: "my-api".to_string(),
+                path: "Auth/login".to_string(),
+            }
+        );
+        assert_eq!(app.collections.len(), 1);
+    }
+
+    #[test]
+    fn confirm_save_dialog_at_the_top_level_has_no_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = project_with(&dir);
+        app.save_dialog = Some(SaveDialog {
+            collection: "my-api".to_string(),
+            folder_path: String::new(),
+            name: "ping".to_string(),
+            error: None,
+        });
+
+        app.confirm_save_dialog();
+
+        let collection = app.active_project().unwrap().storage.load_collection("my-api").unwrap();
+        assert!(collection.find_request("ping").is_some());
+    }
+
+    #[test]
+    fn confirm_save_dialog_rejects_a_blank_collection_name() {
+        let mut app = CurlyApp::default_state();
+        app.save_dialog = Some(SaveDialog {
+            collection: "   ".to_string(),
+            folder_path: String::new(),
+            name: "ping".to_string(),
+            error: None,
+        });
+
+        app.confirm_save_dialog();
+
+        assert!(app.save_dialog.is_some());
+        assert!(app.save_dialog.unwrap().error.unwrap().contains("collection"));
+    }
+
+    #[test]
+    fn confirm_save_dialog_rejects_a_blank_name() {
+        let mut app = CurlyApp::default_state();
+        app.save_dialog = Some(SaveDialog {
+            collection: "my-api".to_string(),
+            folder_path: String::new(),
+            name: "  ".to_string(),
+            error: None,
+        });
+
+        app.confirm_save_dialog();
+
+        assert!(app.save_dialog.is_some());
+        assert!(app.save_dialog.unwrap().error.unwrap().contains("name"));
+    }
+
+    #[test]
+    fn confirm_save_dialog_reports_a_collision_without_closing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = project_with(&dir);
+        let mut collection = Collection::new("my-api");
+        collection
+            .add_request("ping", SavedRequest::new("ping", Method::GET, "https://example.com"))
+            .unwrap();
+        app.active_project().unwrap().storage.save_collection(&collection).unwrap();
+        app.save_dialog = Some(SaveDialog {
+            collection: "my-api".to_string(),
+            folder_path: String::new(),
+            name: "ping".to_string(),
+            error: None,
+        });
+
+        app.confirm_save_dialog();
+
+        assert!(app.save_dialog.is_some());
+        assert!(app.save_dialog.unwrap().error.is_some());
+    }
+
+    #[test]
+    fn save_over_loaded_opens_the_dialog_when_nothing_is_loaded() {
+        let mut app = CurlyApp::default_state();
+        app.save_over_loaded();
+        assert!(app.save_dialog.is_some());
+    }
+
+    #[test]
+    fn save_over_loaded_overwrites_in_place_and_preserves_the_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = project_with(&dir);
+        let mut collection = Collection::new("my-api");
+        let original = SavedRequest::new("login", Method::GET, "https://old.example.com");
+        let original_id = original.id;
+        collection.add_request("Auth/login", original).unwrap();
+        app.active_project().unwrap().storage.save_collection(&collection).unwrap();
+
+        app.loaded_request = Some(LoadedRequestRef {
+            collection: "my-api".to_string(),
+            path: "Auth/login".to_string(),
+        });
+        app.method = "POST".to_string();
+        app.url = "https://new.example.com".to_string();
+
+        app.save_over_loaded();
+
+        let reloaded = app.active_project().unwrap().storage.load_collection("my-api").unwrap();
+        let saved = reloaded.find_request("Auth/login").unwrap();
+        assert_eq!(saved.url, "https://new.example.com");
+        assert_eq!(saved.method, "POST");
+        assert_eq!(saved.id, original_id);
+        assert!(app.collection_notice.unwrap().contains("Auth/login"));
+    }
+
+    #[test]
+    fn delete_saved_request_removes_it_and_refreshes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = project_with(&dir);
+        let mut collection = Collection::new("my-api");
+        collection
+            .add_request("ping", SavedRequest::new("ping", Method::GET, "https://example.com"))
+            .unwrap();
+        app.active_project().unwrap().storage.save_collection(&collection).unwrap();
+        app.refresh_project_lists();
+
+        app.delete_saved_request("my-api", "ping");
+
+        let reloaded = app.active_project().unwrap().storage.load_collection("my-api").unwrap();
+        assert!(reloaded.find_request("ping").is_none());
+        assert!(app.collection_notice.unwrap().contains("deleted"));
+    }
+
+    #[test]
+    fn delete_saved_request_clears_loaded_request_if_it_was_the_one_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = project_with(&dir);
+        let mut collection = Collection::new("my-api");
+        collection
+            .add_request("ping", SavedRequest::new("ping", Method::GET, "https://example.com"))
+            .unwrap();
+        app.active_project().unwrap().storage.save_collection(&collection).unwrap();
+        app.loaded_request = Some(LoadedRequestRef {
+            collection: "my-api".to_string(),
+            path: "ping".to_string(),
+        });
+
+        app.delete_saved_request("my-api", "ping");
+
+        assert!(app.loaded_request.is_none());
+    }
+
+    #[test]
+    fn delete_saved_request_leaves_a_different_loaded_request_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = project_with(&dir);
+        let mut collection = Collection::new("my-api");
+        collection
+            .add_request("ping", SavedRequest::new("ping", Method::GET, "https://example.com"))
+            .unwrap();
+        collection
+            .add_request("pong", SavedRequest::new("pong", Method::GET, "https://example.com"))
+            .unwrap();
+        app.active_project().unwrap().storage.save_collection(&collection).unwrap();
+        app.loaded_request = Some(LoadedRequestRef {
+            collection: "my-api".to_string(),
+            path: "pong".to_string(),
+        });
+
+        app.delete_saved_request("my-api", "ping");
+
+        assert!(app.loaded_request.is_some());
     }
 }

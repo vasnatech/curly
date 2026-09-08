@@ -6,6 +6,9 @@
 //! curly/
 //! ├── collections/<slug>.json   # one file per collection, requests embedded inline
 //! ├── environments/<slug>.json  # one file per environment
+//! ├── scenarios/<slug>.json     # one file per scenario (see crate::scenario) — not
+//! │                             # nested inside a collection, since a scenario's
+//! │                             # `imports` can span more than one
 //! └── history/<yyyy-mm-dd>.jsonl
 //! ```
 //!
@@ -29,6 +32,7 @@ use uuid::Uuid;
 
 use crate::exec::ResponseSummary;
 use crate::model::{Auth, Body, MultipartField, Request};
+use crate::scenario::Scenario;
 
 /// A name/value pair that can be individually disabled without deleting it —
 /// mirrors how Postman lets you toggle a header/param off. `enabled` defaults
@@ -563,6 +567,10 @@ impl Storage {
         self.root.join("collections")
     }
 
+    fn scenarios_dir(&self) -> PathBuf {
+        self.root.join("scenarios")
+    }
+
     fn environments_dir(&self) -> PathBuf {
         self.root.join("environments")
     }
@@ -577,6 +585,10 @@ impl Storage {
 
     fn collection_path(&self, slug: &str) -> PathBuf {
         self.collections_dir().join(format!("{slug}.json"))
+    }
+
+    fn scenario_path(&self, slug: &str) -> PathBuf {
+        self.scenarios_dir().join(format!("{slug}.json"))
     }
 
     fn environment_path(&self, slug: &str) -> PathBuf {
@@ -623,6 +635,46 @@ impl Storage {
         let path = self.collection_path(&slugify(name));
         std::fs::remove_file(&path)
             .with_context(|| format!("no collection named \"{name}\" (looked in {})", path.display()))
+    }
+
+    /// One file per scenario (`crate::scenario::Scenario`) — mirrors
+    /// `list_collections`/`load_collection`/`save_collection`/
+    /// `delete_collection` exactly, since a scenario is stored the same
+    /// way a collection is, just not nested inside one (a scenario's
+    /// `imports` can name more than one collection — see
+    /// `crate::scenario`'s own doc comment).
+    pub fn list_scenarios(&self) -> Result<Vec<String>> {
+        list_json_names(&self.scenarios_dir())
+    }
+
+    pub fn load_scenario(&self, name: &str) -> Result<Scenario> {
+        let path = self.scenario_path(&slugify(name));
+        let bytes = std::fs::read(&path)
+            .with_context(|| format!("no scenario named \"{name}\" (looked in {})", path.display()))?;
+        serde_json::from_slice(&bytes)
+            .with_context(|| format!("failed to parse scenario file: {}", path.display()))
+    }
+
+    pub fn load_scenario_opt(&self, name: &str) -> Result<Option<Scenario>> {
+        let path = self.scenario_path(&slugify(name));
+        if !path.exists() {
+            return Ok(None);
+        }
+        self.load_scenario(name).map(Some)
+    }
+
+    pub fn save_scenario(&self, scenario: &Scenario) -> Result<()> {
+        let dir = self.scenarios_dir();
+        std::fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
+        let path = self.scenario_path(&slugify(&scenario.name));
+        let json = serde_json::to_string_pretty(scenario)?;
+        std::fs::write(&path, json).with_context(|| format!("failed to write {}", path.display()))
+    }
+
+    pub fn delete_scenario(&self, name: &str) -> Result<()> {
+        let path = self.scenario_path(&slugify(name));
+        std::fs::remove_file(&path)
+            .with_context(|| format!("no scenario named \"{name}\" (looked in {})", path.display()))
     }
 
     pub fn list_environments(&self) -> Result<Vec<String>> {

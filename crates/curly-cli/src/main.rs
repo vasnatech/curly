@@ -53,6 +53,12 @@ enum Command {
         #[command(subcommand)]
         action: commands::session::SessionCommand,
     },
+    /// Run a multi-request scenario (M6) — creating/editing one is JSON-only,
+    /// see docs/ROADMAP.md; .curly/scenarios/<name>.json
+    Scenario {
+        #[command(subcommand)]
+        action: commands::scenario::ScenarioCommand,
+    },
 }
 
 /// Launch the GUI (DESIGN.md §3). Deliberately kept off the async runtime
@@ -108,6 +114,7 @@ async fn run_cli(cli: Cli) -> Result<()> {
         Some(Command::Collections { action }) => commands::collections::run(action, &storage),
         Some(Command::History(args)) => commands::history::run(args, &storage),
         Some(Command::Session { action }) => commands::session::run(action, &storage),
+        Some(Command::Scenario { action }) => commands::scenario::run(action, &storage).await,
         None => one_shot::run(&cli.one_shot, &storage).await,
     }
 }

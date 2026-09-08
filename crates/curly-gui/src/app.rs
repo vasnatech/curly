@@ -26,6 +26,15 @@ use crate::project::Project;
 
 const METHODS: [&str; 7] = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"];
 
+/// Multiplicative step for one zoom in/out click or Ctrl+/Ctrl- press.
+/// `egui::Context::zoom_factor()` defaults to `1.0` ("100%") — the
+/// baseline this app is laid out for is a 1024×768 window at that
+/// default, so "100%" here means exactly what it says, not some other
+/// implicit scale.
+const ZOOM_STEP: f32 = 1.1;
+const MIN_ZOOM: f32 = 0.5;
+const MAX_ZOOM: f32 = 3.0;
+
 struct HeaderRow {
     name: String,
     value: String,
@@ -1419,28 +1428,119 @@ fn count_matches(text: &str, search: &str) -> usize {
     text.to_lowercase().matches(&search.to_lowercase()).count()
 }
 
+// --- Toolbar: zoom ---
+
+/// Clamp a zoom factor to `[MIN_ZOOM, MAX_ZOOM]` so a stray double-press
+/// (or a saved value from a future settings feature) can't shrink/blow up
+/// the UI to the point of being unusable. Kept as a pure function, unlike
+/// `set_zoom_factor`/`apply_zoom_delta` below: `egui::Context::zoom_factor()`
+/// doesn't reflect a `set_zoom_factor()` call until the *next* pass begins
+/// (documented on `Context::set_zoom_factor` itself), so those two aren't
+/// meaningfully unit-testable by reading the value back outside a running
+/// app — this is, by staying decoupled from `Context` entirely.
+fn clamp_zoom(factor: f32) -> f32 {
+    factor.clamp(MIN_ZOOM, MAX_ZOOM)
+}
+
+fn set_zoom_factor(ctx: &egui::Context, factor: f32) {
+    ctx.set_zoom_factor(clamp_zoom(factor));
+}
+
+/// Multiply the current zoom factor by `delta` (e.g. `ZOOM_STEP` to zoom
+/// in, `1.0 / ZOOM_STEP` to zoom out) — used by both the toolbar's +/−
+/// buttons and the Ctrl+/Ctrl- keyboard shortcuts, so the two stay in sync.
+fn apply_zoom_delta(ctx: &egui::Context, delta: f32) {
+    set_zoom_factor(ctx, ctx.zoom_factor() * delta);
+}
+
+/// Apply egui's own Ctrl+scroll-wheel zoom gesture (and pinch-to-zoom on a
+/// touchpad/touchscreen) on top of the toolbar/keyboard-shortcut zoom —
+/// egui tracks the gesture as an input delta (`InputState::zoom_delta`)
+/// but doesn't apply it to `zoom_factor` on its own; an app has to do that
+/// itself each frame.
+fn apply_ctrl_scroll_zoom(ctx: &egui::Context) {
+    let delta = ctx.input(|i| i.zoom_delta());
+    if delta != 1.0 {
+        apply_zoom_delta(ctx, delta);
+    }
+}
+
 impl eframe::App for CurlyApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll_response();
         self.poll_project_dialog();
         self.poll_response_save();
         self.show_save_dialog(ui.ctx());
+        apply_ctrl_scroll_zoom(ui.ctx());
+
+        egui::Panel::top("toolbar").show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let dialog_pending = self.project_dialog_rx.is_some();
+                if ui
+                    .add_enabled(
+                        !dialog_pending,
+                        egui::Button::new(if dialog_pending { "Choosing…" } else { "Open Project…" }),
+                    )
+                    .clicked()
+                {
+                    let ctx = ui.ctx().clone();
+                    self.open_project_dialog(&ctx);
+                }
+
+                ui.separator();
+
+                let current_theme = ui.ctx().theme();
+                let (icon, next, hover) = match current_theme {
+                    egui::Theme::Dark => ("☀", egui::Theme::Light, "Switch to light mode"),
+                    egui::Theme::Light => ("🌙", egui::Theme::Dark, "Switch to dark mode"),
+                };
+                if ui.button(icon).on_hover_text(hover).clicked() {
+                    ui.ctx().set_theme(next);
+                }
+
+                ui.separator();
+
+                ui.label("Zoom:");
+                if ui.button("−").on_hover_text("Zoom out (Ctrl+-)").clicked() {
+                    apply_zoom_delta(ui.ctx(), 1.0 / ZOOM_STEP);
+                }
+                ui.label(format!("{:.0}%", ui.ctx().zoom_factor() * 100.0));
+                if ui.button("+").on_hover_text("Zoom in (Ctrl++)").clicked() {
+                    apply_zoom_delta(ui.ctx(), ZOOM_STEP);
+                }
+                if ui.button("Reset").on_hover_text("Reset zoom to 100% (Ctrl+0)").clicked() {
+                    set_zoom_factor(ui.ctx(), 1.0);
+                }
+            });
+        });
+
+        let mut zoom_delta: Option<f32> = None;
+        let mut zoom_reset = false;
+        ui.input(|i| {
+            if i.modifiers.command {
+                if i.key_pressed(egui::Key::Plus) || i.key_pressed(egui::Key::Equals) {
+                    zoom_delta = Some(ZOOM_STEP);
+                }
+                if i.key_pressed(egui::Key::Minus) {
+                    zoom_delta = Some(1.0 / ZOOM_STEP);
+                }
+                if i.key_pressed(egui::Key::Num0) {
+                    zoom_reset = true;
+                }
+            }
+        });
+        if let Some(delta) = zoom_delta {
+            apply_zoom_delta(ui.ctx(), delta);
+        }
+        if zoom_reset {
+            set_zoom_factor(ui.ctx(), 1.0);
+        }
 
         egui::Panel::left("project_sidebar")
             .resizable(true)
             .default_size(220.0)
             .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.heading("Project");
-                    let current = ui.ctx().theme();
-                    let (icon, next, hover) = match current {
-                        egui::Theme::Dark => ("☀", egui::Theme::Light, "Switch to light mode"),
-                        egui::Theme::Light => ("🌙", egui::Theme::Dark, "Switch to dark mode"),
-                    };
-                    if ui.small_button(icon).on_hover_text(hover).clicked() {
-                        ui.ctx().set_theme(next);
-                    }
-                });
+                ui.heading("Project");
 
                 match self.active_project() {
                     Some(project) => {
@@ -1454,18 +1554,6 @@ impl eframe::App for CurlyApp {
 
                 if let Some(err) = &self.project_open_error {
                     ui.colored_label(egui::Color32::from_rgb(220, 80, 80), err);
-                }
-
-                let dialog_pending = self.project_dialog_rx.is_some();
-                if ui
-                    .add_enabled(
-                        !dialog_pending,
-                        egui::Button::new(if dialog_pending { "Choosing…" } else { "Open Project…" }),
-                    )
-                    .clicked()
-                {
-                    let ctx = ui.ctx().clone();
-                    self.open_project_dialog(&ctx);
                 }
 
                 ui.separator();
@@ -3490,5 +3578,43 @@ mod tests {
             vec!["A".to_string(), "B".to_string(), "C".to_string()]
         );
         assert_eq!(job.sections[1].format.background, egui::Color32::YELLOW);
+    }
+
+    // --- Toolbar: zoom ---
+    //
+    // set_zoom_factor/apply_zoom_delta themselves aren't unit-tested here:
+    // egui::Context::set_zoom_factor's own doc comment says the change
+    // doesn't reflect in zoom_factor() until the *next* pass begins, which
+    // a bare Context::default() in a test never runs — so clamp_zoom (the
+    // actual decision logic) is tested standalone, decoupled from Context
+    // entirely, and the thin ctx-touching wrappers are left as untested
+    // integration glue, matching how detect_system_theme's gsettings call
+    // and open_project_dialog's rfd call are also left untested.
+
+    #[test]
+    fn clamp_zoom_leaves_an_in_range_value_alone() {
+        assert_eq!(clamp_zoom(1.5), 1.5);
+    }
+
+    #[test]
+    fn clamp_zoom_clamps_below_the_minimum() {
+        assert_eq!(clamp_zoom(0.1), MIN_ZOOM);
+    }
+
+    #[test]
+    fn clamp_zoom_clamps_above_the_maximum() {
+        assert_eq!(clamp_zoom(10.0), MAX_ZOOM);
+    }
+
+    #[test]
+    fn clamp_zoom_leaves_the_default_100_percent_alone() {
+        assert_eq!(clamp_zoom(1.0), 1.0);
+    }
+
+    #[test]
+    fn zoom_step_in_then_out_returns_to_the_starting_value() {
+        let zoomed_in = clamp_zoom(1.0 * ZOOM_STEP);
+        let back_out = clamp_zoom(zoomed_in / ZOOM_STEP);
+        assert!((back_out - 1.0).abs() < 1e-5);
     }
 }

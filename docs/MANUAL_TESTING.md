@@ -320,6 +320,11 @@ Requires an actual display (X11 or Wayland) — not scriptable the way the rest 
 | 16.74 | Click **New**, then build a request from scratch, Send it | Works normally — Save/New/Delete are independent of Send; a from-scratch request with nothing loaded sends exactly as before this feature existed. |
 | 16.75 | Load a request, click a *different* request's **✕** in the tree (not the loaded one) | Deletes that other request; the "Editing…" label and loaded editor content are unaffected. |
 | 16.76 | Load a request, then click **its own ✕** in the tree | Deletes it; "Editing…" reverts to "New request (not saved)" — Save would now open the dialog instead of trying to overwrite something gone. |
+| 16.77 | Launch `curly gui` fresh on GNOME, note the initial theme | Matches whatever `gsettings get org.gnome.desktop.interface color-scheme` reports on that machine (`prefer-dark` → dark, `prefer-light`/`default` → light). |
+| 16.78 | Click the ☀/🌙 button next to "Project" in the sidebar | Theme switches instantly (backgrounds, text, all widgets) and the icon flips to the *other* mode's symbol. |
+| 16.79 | Click it again | Switches back — toggling is fully reversible, no restart needed. |
+| 16.80 | Change the OS theme (e.g. `gsettings set org.gnome.desktop.interface color-scheme prefer-light` from a terminal) while curly is already running | curly's theme does **not** change on its own (detection is startup-only, documented as a known gap) — use the in-app toggle instead. |
+| 16.81 | Run `gsettings set org.gnome.desktop.interface color-scheme prefer-light`, then relaunch `curly gui` | Launches in light mode this time — confirms detection actually re-reads the setting on each startup, not a one-time cached value from the first build/run. |
 
 ## 17. Cross-platform sanity (when releasing)
 

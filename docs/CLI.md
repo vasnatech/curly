@@ -2,7 +2,7 @@
 
 `curly` is the command-line face of the Curly project: a curl-like tool for sending HTTP requests from a terminal. This guide covers everything the CLI currently supports. If you already know curl, the flags will feel familiar on purpose.
 
-> Status: §1–5 cover one-shot mode (send a single request, see the response). §6–7 cover saved requests, collections, environments, and history. Postman/curl import and OAuth2 are planned but not implemented yet — see [DESIGN.md](DESIGN.md) for the roadmap.
+> Status: §1–5 cover one-shot mode (send a single request, see the response). §6–8 cover saved requests, collections, environments, scenarios, and history. Postman/curl import and OAuth2 are planned but not implemented yet — see [DESIGN.md](DESIGN.md) for the roadmap.
 
 ## 1. Installing / Running
 
@@ -506,7 +506,50 @@ curly run "My API/get-user" --env dev --var USER_ID=42
 curly run "My API/get-user" --env dev -i -v --fail
 ```
 
-## 7. History — `curly history`
+## 7. Scenarios — `curly scenario`
+
+A **scenario** chains multiple saved requests together into one named, repeatable run — a login → settings → measurements onboarding flow, for example — with conditional branching on a response's status/header/body, and sequential or parallel steps. See [ROADMAP.md](ROADMAP.md)'s "Scenarios" section for the full design and worked examples; this is the CLI surface for it (M6, FR-25).
+
+Scenarios are **JSON-only** to author in this first slice — there's no `curly scenario add`/`edit`. Hand-write (or generate) a file at `.curly/scenarios/<name>.json`:
+
+```json
+{
+  "name": "onboarding-demo",
+  "imports": { "default": "health-record-api" },
+  "requests": {
+    "type": "sequence",
+    "items": [
+      { "request": "auth/register" },
+      {
+        "choice": {
+          "cases": [
+            { "when": { "status": { "eq": 200 } }, "then": { "request": "me" } },
+            { "when": { "status": { "eq": 400 } }, "then": { "request": "auth/login" } }
+          ]
+        }
+      }
+    ]
+  }
+}
+```
+
+`imports` maps an alias to a real collection name; `"default"` is the alias used when a `request` reference has no `alias->` prefix (e.g. `"request": "me"` above resolves against `imports.default`). A reference into a non-default collection uses `"<alias>->path"`, e.g. `"api->me/update-preferences"`.
+
+```sh
+curly scenario list
+curly scenario show onboarding-demo
+curly scenario run onboarding-demo --env dev
+curly scenario run onboarding-demo --env dev --var EMAIL=test@example.com
+curly scenario delete onboarding-demo
+```
+
+`run` accepts `--env` and `--var` exactly like `curly run` (§6), applied to every step in the scenario, and prints each step's method/URL/status (or the failure reason if a step didn't get a response) plus any variables it extracted, in execution order. On completion it either reports success or exits non-zero naming why the scenario halted — an unhandled 4xx/5xx (one with no following `choice` case to route it), a `choice` with no matching case and no `default`, or a network-level send error. See ROADMAP.md's "Decided: failure semantics" for the exact rules, including how a `parallel` block picks which branch's failure wins when more than one fails.
+
+Extraction (`--extract-*` on the underlying saved requests, same as `curly run`) flows between steps the same way it does across separate `curly run` invocations: into the session for the active `--env` (or the global session), immediately available for `{{variable}}` substitution in the next step.
+
+There's no scenario editor in the GUI yet — see [DESIGN.md](DESIGN.md) §9 (M6).
+
+## 8. History — `curly history`
 
 Every request sent by either one-shot mode or `run` is automatically recorded — no separate opt-in. `curly history [--limit N]` lists the most recent ones (default 20), newest first:
 
@@ -517,7 +560,7 @@ curly history --limit 5
 
 Each line shows timestamp, method, status, URL, and elapsed time. Recorded entries redact `Authorization`/`X-Api-Key`/`Cookie` header values and cap the stored response body at 8KB — see [DESIGN.md](DESIGN.md) §4 for the exact format if you want to read the underlying JSONL files directly (`<data dir>/curly/history/<yyyy-mm-dd>.jsonl`). There's no `curly history show <id>`/re-run-from-history yet — see §8.
 
-## 8. What's Not Here Yet
+## 9. What's Not Here Yet
 
 These are on the roadmap (see [DESIGN.md](DESIGN.md) §9) but don't exist in the CLI yet — using them will just fail as an unrecognized flag or bare argument for now:
 
@@ -528,3 +571,5 @@ These are on the roadmap (see [DESIGN.md](DESIGN.md) §9) but don't exist in the
 - Colorized output when connected to a TTY
 - Pretty-printing for non-JSON bodies (XML/HTML)
 - OS-keychain storage for `--secret` environment variables (currently plain JSON on disk)
+- A `curly scenario add`/`edit` command, or a GUI scenario editor (§7 — JSON-only for now)
+- Named-branch targeting for `parallel` failure selection (§7 references "first failure by declared order" — a future `on: "<branch-name>"` extension is noted in ROADMAP.md but not built)

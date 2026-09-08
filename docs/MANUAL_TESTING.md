@@ -359,15 +359,33 @@ Requires an actual display (X11 or Wayland) — not scriptable the way the rest 
 | 16.113 | Open two tabs, click **Save As…** in one (dialog appears), then click the *other* tab | The Save dialog closes on its own — switching tabs cancels it rather than risk saving the wrong tab's content under a stale pre-fill. |
 | 16.114 | Open several tabs with long URLs | Each tab's label truncates with `…` rather than stretching the tab bar or wrapping awkwardly; the tab row scrolls horizontally if there isn't room for all of them. |
 
-## 17. Cross-platform sanity (when releasing)
+## 17. Scenarios — `curly scenario` (M6, FR-25)
+
+Requires a real backend (these were live-verified against `health-record-backend-spring` on `localhost:8080`; substitute any API with a request that returns different status codes for a "duplicate" vs. "fresh" case if you don't have that backend running). Create the collection referenced by `imports.default` first (e.g. a collection named `health-record-api` with `auth/register`, `auth/login`, and `me` requests using `{{BASE_URL}}`, `{{EMAIL}}`, `{{PASSWORD}}`, with `auth/register`/`auth/login` set to `--extract-body "TOKEN=token"` and `me` set to send `Authorization: Bearer {{TOKEN}}`).
 
 | # | Steps | Expected |
 |---|---|---|
-| 17.1 | `cargo build --release` on Linux, macOS, and Windows | Each produces a working binary with no OS-specific build errors. |
-| 17.2 | Run scenario 1.1 and 4.1 on each OS | Same output shape on all three (path separators in `-o`/`--data-binary`/`--cacert` examples are the main thing to sanity-check on Windows). |
-| 17.3 | Run scenario 10.6 (inspect the collection JSON file) on each OS | Confirms the data directory resolves correctly per-OS (`~/.local/share/curly`, `~/Library/Application Support/curly`, `%APPDATA%\curly`). |
+| 17.1 | Write `.curly/scenarios/onboarding-demo.json` per the example in [CLI.md §7](CLI.md#7-scenarios--curly-scenario) (register → choice on status 200/400 → `me` or `login`), then `curly scenario list` | `onboarding-demo` appears. |
+| 17.2 | `curly scenario show onboarding-demo` | Prints the name, `default -> health-record-api`, and the top-level step count. |
+| 17.3 | `curly scenario run onboarding-demo --env dev --var EMAIL=fresh-$(date +%s)@example.com --var PASSWORD=Passw0rd!` (a brand-new email) | `auth/register` → 200, then the `choice` routes to `me` — both steps print with their status; scenario reports completed. |
+| 17.4 | Run the exact same command again (same `EMAIL`, now already registered) | `auth/register` → 400, the `choice` routes to `auth/login` instead → 200 — proves the *other* branch of the same `choice` node, not just the happy path. |
+| 17.5 | Temporarily edit the scenario's `choice` to have cases only for `{"status": {"eq": 200}}` and `{"status": {"eq": 400}}` with no `default`, then run it against an email that gets a 500 (or point `auth/register`'s URL at a route that 500s) | Scenario exits non-zero: "halted: ... no matching case and no default" — an unmatched `choice` fails loud rather than silently continuing. |
+| 17.6 | Edit the scenario to drop the `choice` entirely, leaving a bare `{"request": "auth/register"}` followed directly by `{"request": "me"}` with no conditional, then run it against an email that's already registered (so `register` returns 400) | Scenario exits non-zero: "halted: request \"auth/register\" returned 400 and was not explicitly handled by a following choice" — confirms an unhandled 4xx halts the whole run rather than continuing into `me` with a stale/absent token. |
+| 17.7 | Add a `{"type": "parallel", "items": [...]}` block with two independent requests (e.g. two different `GET`s) as a step, run it | Both requests execute (visible in the printed step list); scenario completes normally when both succeed. |
+| 17.8 | In that parallel block, point one branch at a URL that 500s and the other at one that's slow-but-succeeds (or vice versa), with nothing following to forgive the failure | Both branches still run to completion (the slow one isn't cancelled) — verify via the printed steps; the reported halt reason cites the *first-declared* branch's failure, not whichever branch happened to finish first (swap the branches' order and confirm the reported status changes accordingly). |
+| 17.9 | `curly scenario run does-not-exist` | Fails with a clear "no scenario named ..." error, not a panic. |
+| 17.10 | `curly scenario delete onboarding-demo` then `curly scenario list` | Reports deleted; no longer listed (or "no scenarios yet" if it was the only one). |
+| 17.11 | Reference a request via `"other->some/path"` where `other` isn't a key in `imports` | Fails immediately (before sending anything) naming the unknown alias. |
 
-## 18. Regression checklist for new flags/subcommands
+## 18. Cross-platform sanity (when releasing)
+
+| # | Steps | Expected |
+|---|---|---|
+| 18.1 | `cargo build --release` on Linux, macOS, and Windows | Each produces a working binary with no OS-specific build errors. |
+| 18.2 | Run scenario 1.1 and 4.1 on each OS | Same output shape on all three (path separators in `-o`/`--data-binary`/`--cacert` examples are the main thing to sanity-check on Windows). |
+| 18.3 | Run scenario 10.6 (inspect the collection JSON file) on each OS | Confirms the data directory resolves correctly per-OS (`~/.local/share/curly`, `~/Library/Application Support/curly`, `%APPDATA%\curly`). |
+
+## 19. Regression checklist for new flags/subcommands
 
 When adding a new flag or subcommand, add at minimum:
 - A unit test covering the pure parsing/building logic — `crates/curly-cli/src/one_shot.rs`, `args.rs`, or `commands/*.rs`'s `#[cfg(test)] mod tests` depending on where the logic lives, plus `crates/curly-core/tests/` for anything storage- or substitution-related.

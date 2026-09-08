@@ -58,7 +58,7 @@ A third node kind, alongside `request` and `requests`: routes to a different chi
       {
         "when": { "all": [
           { "status": { "eq": 200 } },
-          { "body": "mfaRequired", "eq": true }
+          { "body": { "path": "mfaRequired", "op": { "eq": true } } }
         ]},
         "then": { "request": "auth/mfa-verify" }
       },
@@ -72,7 +72,9 @@ A third node kind, alongside `request` and `requests`: routes to a different chi
 }
 ```
 
-`when` targets `status`, `header: "<name>"`, or `body: "<path>"` (dot/bracket syntax — reuses `extraction::get_json_path`, already written and tested, rather than a second JSON-path implementation), each with an operator (`eq`, `ne`, `gt`, `lt`, `contains`, `exists`, ...), composable via `all`/`any`/`not`. `then`/`default` are themselves scenario nodes (a `request`, or a nested `requests` sequence/parallel), so a matched case can fan out into its own multi-step sub-scenario, same as any other node.
+`when` targets `status` (`{"eq": ...}` directly, nothing to name), `header` (`{"name": "...", "op": {"eq": ...}}`), or `body` (`{"path": "...", "op": {"eq": ...}}`, dot/bracket syntax — reuses `extraction::get_json_path`, already written and tested, rather than a second JSON-path implementation), each `op`/`status` an operator object (`eq`, `ne`, `gt`, `lt`, `contains`, `exists`, ...), composable via `all`/`any`/`not`. `then`/`default` are themselves scenario nodes (a `request`, or a nested `requests` sequence/parallel), so a matched case can fan out into its own multi-step sub-scenario, same as any other node.
+>
+> **Implementation note (post-build):** an earlier draft of this sketch showed `header`/`body`'s operator as a sibling key (`{"body": "path", "eq": value}`) rather than nested the way `status` always was (`{"status": {"eq": value}}`) — an accidental asymmetry from an example that was never meant to be a field-name commitment. The shipped shape (above) nests all three consistently, since a variable-key sibling (the operator's own name varies) isn't something a derived `Deserialize` expresses cleanly. See DESIGN.md's M6 entry for the full reasoning.
 
 **`default` is optional. When it's omitted and no `case` matches, the scenario halts with a clear error naming what didn't match** (e.g. `"choice: response status 500 matched no case (defined: 200, 400) and no default was given"`) — not a silent no-op. This was deliberately chosen over "continue past the choice as if it wasn't there," and it's worth recording *why*, since an earlier pass through this reasoning leaned the other way before working through a concrete example changed it: extraction skipping on a non-2xx response is a genuinely different situation — the request already ran either way, extraction is a bonus step layered on top, so skipping it is a true no-op. A `choice` node *is* the thing deciding what happens next; if nothing matches, the scenario genuinely doesn't know what to do, and silently doing nothing there would be exactly the kind of surprise curly refuses elsewhere (`substitution::resolve` errors on an undefined `{{var}}` rather than sending it literally; Save As errors on a path collision rather than silently overwriting). `default` remains available for a genuine, deliberate fallback — including a deliberate no-op, if that's actually wanted, but only by writing it on purpose.
 

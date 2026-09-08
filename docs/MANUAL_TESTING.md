@@ -259,6 +259,12 @@ Requires an actual display (X11 or Wayland) — not scriptable the way the rest 
 | 16.13 | Send to an invalid URL (e.g. `not-a-url`) | Error shown in red in the response pane — window doesn't crash or freeze. |
 | 16.14 | Collapse/expand the "Headers", "Body", and "Response Headers" sections | Each toggles independently, state persists while the window stays open. |
 | 16.15 | `cargo build -p curly-cli --no-default-features --release` then run `./target/release/curly` (zero args) and `curly gui` | Both print "this build of curly was compiled without the gui feature..." and exit 1 — no window, no panic. |
+| 16.16 | Launch from a directory with no `.curly` anywhere above it (e.g. `cd /tmp && curly gui`) | Sidebar shows project label **"Default"**; Collections/Environments lists are empty unless the OS-wide default already has some. |
+| 16.17 | Launch from inside a project directory that already has a `.curly` (e.g. `cd health-record-backend-spring && curly gui`) | Sidebar auto-opens *that* project (label = the folder's name, e.g. "health-record-backend-spring") — same auto-detection the CLI uses, not "Default". |
+| 16.18 | Click **"Open Project…"**, pick a folder that already has a `.curly` in it (e.g. `health-record-backend-spring`) | Sidebar's label updates to that folder's name; Collections list shows `health-record-api` (or whatever's actually saved there); Environments list shows the real environment names. |
+| 16.19 | Click **"Open Project…"**, pick an empty folder with no `.curly` | A new `.curly` is created there on the spot (check with `ls <folder>/.curly` afterward) — same as running `curly init` in that folder; sidebar opens it (Collections/Environments both empty). |
+| 16.20 | With a project already open, click **"Open Project…"** again and pick a *different* folder | The sidebar switches entirely to the new project — old one's Collections/Environments are gone from view (single-project-at-a-time, not a second tab). |
+| 16.21 | Cancel the folder-picker dialog (Escape or its own Cancel button) instead of picking anything | Nothing changes — the previously active project (if any) stays active, no error shown. |
 
 ## 17. Cross-platform sanity (when releasing)
 

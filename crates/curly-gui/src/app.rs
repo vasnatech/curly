@@ -14,9 +14,10 @@ use std::time::Duration;
 
 use curly_core::exec::{self, ResponseSummary};
 use curly_core::extraction::{self, Extraction};
-use curly_core::model::{Body, Request};
+use curly_core::model::{Auth, Body, Request};
 use curly_core::storage::{
-    Collection, Environment, Folder, KvPair, SavedAuth, SavedBody, SavedRequest, Storage, Variable,
+    Collection, Environment, Folder, HistoryAuthKind, HistoryEntry, KvPair, SavedAuth, SavedBody,
+    SavedRequest, Storage, Variable, REDACTED,
 };
 use curly_core::substitution;
 use reqwest::Method;
@@ -33,6 +34,10 @@ const METHODS: [&str; 7] = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OP
 const ZOOM_STEP: f32 = 1.1;
 const MIN_ZOOM: f32 = 0.5;
 const MAX_ZOOM: f32 = 3.0;
+
+/// How many recent history entries the sidebar shows — matches `curly
+/// history`'s own CLI default (`--limit 20`).
+const HISTORY_DISPLAY_LIMIT: usize = 20;
 
 struct HeaderRow {
     name: String,
@@ -92,6 +97,34 @@ impl OverrideRow {
             key: String::new(),
             value: String::new(),
             enabled: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+enum AuthKind {
+    #[default]
+    None,
+    Basic,
+    Bearer,
+}
+
+/// Editor state for the Authorization section — all three text fields stay
+/// populated regardless of `kind` so switching Basic/Bearer/None in the UI
+/// never loses what was typed.
+#[derive(Debug, Clone, Default)]
+struct AuthEditor {
+    kind: AuthKind,
+    username: String,
+    password: String,
+    token: String,
+}
+
+impl From<HistoryAuthKind> for AuthKind {
+    fn from(kind: HistoryAuthKind) -> Self {
+        match kind {
+            HistoryAuthKind::Basic => AuthKind::Basic,
+            HistoryAuthKind::Bearer => AuthKind::Bearer,
         }
     }
 }
@@ -189,6 +222,7 @@ struct RequestTab {
     url: String,
     headers: Vec<HeaderRow>,
     body: String,
+    auth: AuthEditor,
     response: Option<Result<ResponseSummary, String>>,
     in_flight: bool,
     rx: Option<mpsc::Receiver<SendOutcome>>,
@@ -223,6 +257,7 @@ pub struct CurlyApp {
     url: String,
     headers: Vec<HeaderRow>,
     body: String,
+    auth: AuthEditor,
 
     response: Option<Result<ResponseSummary, String>>,
     in_flight: bool,
@@ -255,6 +290,12 @@ pub struct CurlyApp {
     /// disk whenever the active project changes.
     collections: Vec<Collection>,
     environments: Vec<String>,
+    /// The active project's recent send history (FR-6/FR-18), most recent
+    /// first, capped at `HISTORY_DISPLAY_LIMIT` — refreshed whenever the
+    /// project changes and right after every send, so a just-sent request
+    /// shows up without switching projects. Read-only in the GUI beyond
+    /// clicking an entry to load it back into the editor (`load_history_entry`).
+    history_entries: Vec<HistoryEntry>,
     /// The environment `{{variable}}` tokens resolve against when sending —
     /// `None` means no environment is selected (only the always-merged-in
     /// "global" environment and the "global"-scoped session apply, matching
@@ -378,6 +419,7 @@ impl CurlyApp {
             url: String::new(),
             headers: vec![HeaderRow::empty()],
             body: String::new(),
+            auth: AuthEditor::default(),
             response: None,
             in_flight: false,
             rx: None,
@@ -389,6 +431,7 @@ impl CurlyApp {
             project_dialog_rx: None,
             collections: Vec::new(),
             environments: Vec::new(),
+            history_entries: Vec::new(),
             active_environment: None,
             session_variables: Vec::new(),
             env_editor_variables: Vec::new(),
@@ -527,6 +570,18 @@ impl CurlyApp {
                 self.environments.clear();
             }
         }
+        self.refresh_history();
+    }
+
+    /// Reload the sidebar's history list from the active project's storage
+    /// (FR-6/FR-18) — called on project open/switch (via
+    /// `refresh_project_lists`) and again right after every send, so a
+    /// just-sent request shows up without needing to reopen the project.
+    fn refresh_history(&mut self) {
+        self.history_entries = self
+            .active_project()
+            .and_then(|p| p.storage.list_history(HISTORY_DISPLAY_LIMIT).ok())
+            .unwrap_or_default();
     }
 
     /// Change which environment is active — for both `{{variable}}`
@@ -717,42 +772,38 @@ impl CurlyApp {
             None => String::new(),
         };
 
-        match &saved.auth {
-            Some(SavedAuth::Bearer { token }) => {
-                self.headers
-                    .retain(|h| !h.name.eq_ignore_ascii_case("authorization"));
-                self.headers.insert(
-                    0,
-                    HeaderRow {
-                        name: "Authorization".to_string(),
-                        value: format!("Bearer {token}"),
-                        enabled: true,
-                    },
-                );
-            }
-            Some(SavedAuth::Basic { .. }) => {
-                notices.push(
-                    "its Basic auth isn't loaded — add an Authorization header manually if needed"
-                        .to_string(),
-                );
-            }
-            None => {}
-        }
+        self.auth = match &saved.auth {
+            Some(SavedAuth::Basic { username, password }) => AuthEditor {
+                kind: AuthKind::Basic,
+                username: username.clone(),
+                password: password.clone(),
+                ..Default::default()
+            },
+            Some(SavedAuth::Bearer { token }) => AuthEditor {
+                kind: AuthKind::Bearer,
+                token: token.clone(),
+                ..Default::default()
+            },
+            None => AuthEditor::default(),
+        };
 
         if self.headers.is_empty() {
             self.headers.push(HeaderRow::empty());
         }
 
-        // One combined substitution attempt (url + all header values + body,
-        // newline-joined) rather than three separate ones, so a request with
-        // several undefined variables gets a single notice naming all of
-        // them (substitute() already reports every undefined name, not just
-        // the first) instead of three overlapping ones.
+        // One combined substitution attempt (url + all header values + body +
+        // auth fields, newline-joined) rather than several separate ones, so
+        // a request with multiple undefined variables gets a single notice
+        // naming all of them (substitute() already reports every undefined
+        // name, not just the first) instead of overlapping ones.
         let combined = format!(
-            "{}\n{}\n{}",
+            "{}\n{}\n{}\n{}\n{}\n{}",
             self.url,
             self.headers.iter().map(|h| h.value.as_str()).collect::<Vec<_>>().join("\n"),
-            self.body
+            self.body,
+            self.auth.username,
+            self.auth.password,
+            self.auth.token,
         );
         if let Err(e) = substitution::substitute(&combined, &self.merged_variables()) {
             let env_desc = self
@@ -771,6 +822,78 @@ impl CurlyApp {
             Some(format!("Loaded \"{}\", but {}.", saved.name, notices.join("; and ")))
         };
         self.response = None;
+    }
+
+    /// Load a history entry back into the editor for a re-run (FR-6). Unlike
+    /// `load_saved_request`, a `HistoryEntry` is already fully resolved (no
+    /// `{{variable}}` templates — it was captured post-substitution at send
+    /// time), so there's no undefined-variable check here. It also isn't a
+    /// saved collection entry, so `loaded_request`/`extract_rules` are
+    /// cleared rather than carried over — a later Save must go through
+    /// Save As, not silently overwrite some unrelated saved request.
+    fn load_history_entry(&mut self, entry: &HistoryEntry) {
+        self.method = entry.method.clone();
+        self.url = entry.url.clone();
+
+        let mut notices: Vec<String> = Vec::new();
+
+        let mut redacted_count = 0;
+        self.headers = entry
+            .request_headers
+            .iter()
+            .filter(|(_, value)| {
+                let redacted = value == REDACTED;
+                if redacted {
+                    redacted_count += 1;
+                }
+                !redacted
+            })
+            .map(|(name, value)| HeaderRow {
+                name: name.clone(),
+                value: value.clone(),
+                enabled: true,
+            })
+            .collect();
+        if redacted_count > 0 {
+            notices.push(format!(
+                "{redacted_count} header(s) were redacted in history and weren't restored — re-add them if needed"
+            ));
+        }
+        if self.headers.is_empty() {
+            self.headers.push(HeaderRow::empty());
+        }
+
+        self.body = entry.request_body.clone().unwrap_or_default();
+
+        self.auth = match entry.request_auth_kind {
+            Some(kind) => {
+                notices.push(
+                    "this request used Basic/Bearer auth — credentials aren't stored in \
+                     history, re-enter them before sending"
+                        .to_string(),
+                );
+                AuthEditor {
+                    kind: kind.into(),
+                    ..Default::default()
+                }
+            }
+            None => AuthEditor::default(),
+        };
+
+        self.loaded_request = None;
+        self.extract_rules.clear();
+        self.session_notice = None;
+        self.response = None;
+        self.load_notice = if notices.is_empty() {
+            None
+        } else {
+            Some(format!(
+                "Loaded from history (\"{} {}\"), but {}.",
+                entry.method,
+                entry.url,
+                notices.join("; and ")
+            ))
+        };
     }
 
     fn active_project(&self) -> Option<&Project> {
@@ -837,6 +960,18 @@ impl CurlyApp {
             let body = substitution::substitute(&self.body, &variables)?;
             request = request.with_body(Body::Raw(body));
         }
+        match self.auth.kind {
+            AuthKind::None => {}
+            AuthKind::Basic => {
+                let username = substitution::substitute(&self.auth.username, &variables)?;
+                let password = substitution::substitute(&self.auth.password, &variables)?;
+                request = request.with_auth(Auth::Basic { username, password });
+            }
+            AuthKind::Bearer => {
+                let token = substitution::substitute(&self.auth.token, &variables)?;
+                request = request.with_auth(Auth::Bearer { token });
+            }
+        }
         Ok(request)
     }
 
@@ -871,11 +1006,24 @@ impl CurlyApp {
         self.in_flight = true;
         self.response = None;
 
+        // Captured before the request goes out, same reasoning as
+        // `pending_extraction` above — the active project shouldn't be able
+        // to change out from under an in-flight send.
+        let history_storage = self.active_project().map(|p| p.storage.clone());
+
         let client = self.client.clone();
         let ctx = ctx.clone();
         self.runtime.spawn(async move {
             let outcome = match exec::send(&client, &request).await {
-                Ok(resp) => SendOutcome::Success(resp),
+                Ok(resp) => {
+                    if let Some(storage) = &history_storage {
+                        // A history-write failure is swallowed, same as the
+                        // CLI's own `execute.rs` — never worth failing a
+                        // successful send over.
+                        let _ = storage.append_history(&HistoryEntry::new(&request, &resp));
+                    }
+                    SendOutcome::Success(resp)
+                }
                 Err(e) => SendOutcome::Error(e.to_string()),
             };
             let _ = tx.send(outcome);
@@ -891,6 +1039,7 @@ impl CurlyApp {
                 SendOutcome::Success(r) => {
                     self.apply_pending_extraction(&r);
                     self.response = Some(Ok(r));
+                    self.refresh_history();
                 }
                 SendOutcome::Error(e) => {
                     self.pending_extraction = None;
@@ -957,9 +1106,8 @@ impl CurlyApp {
     /// disabled or blank-name header is dropped, same rule `build_request`
     /// already applies when actually sending; extraction rules carry over
     /// as-is from `extract_rules` (so editing a loaded request and saving
-    /// it back keeps whatever rules it already had). No auth is derived
-    /// from the headers — the editor has no separate auth concept, so an
-    /// `Authorization` header saves as a plain header, not `SavedAuth`.
+    /// it back keeps whatever rules it already had). `auth` carries over
+    /// raw (unsubstituted), same treatment as headers/body.
     fn build_saved_request(&self, name: &str) -> anyhow::Result<SavedRequest> {
         let method = Method::from_bytes(self.method.to_uppercase().as_bytes())?;
         let mut saved = SavedRequest::new(name, method, self.url.clone());
@@ -979,6 +1127,16 @@ impl CurlyApp {
             Some(SavedBody::Raw {
                 content: self.body.clone(),
             })
+        };
+        saved.auth = match self.auth.kind {
+            AuthKind::None => None,
+            AuthKind::Basic => Some(SavedAuth::Basic {
+                username: self.auth.username.clone(),
+                password: self.auth.password.clone(),
+            }),
+            AuthKind::Bearer => Some(SavedAuth::Bearer {
+                token: self.auth.token.clone(),
+            }),
         };
         saved.extract = self.extract_rules.clone();
         Ok(saved)
@@ -1006,6 +1164,7 @@ impl CurlyApp {
             url: std::mem::take(&mut self.url),
             headers: std::mem::take(&mut self.headers),
             body: std::mem::take(&mut self.body),
+            auth: std::mem::take(&mut self.auth),
             response: self.response.take(),
             in_flight: std::mem::take(&mut self.in_flight),
             rx: self.rx.take(),
@@ -1028,6 +1187,7 @@ impl CurlyApp {
         self.url = tab.url;
         self.headers = tab.headers;
         self.body = tab.body;
+        self.auth = tab.auth;
         self.response = tab.response;
         self.in_flight = tab.in_flight;
         self.rx = tab.rx;
@@ -1802,6 +1962,34 @@ impl eframe::App for CurlyApp {
 
                 ui.separator();
 
+                let mut history_click: Option<usize> = None;
+                egui::CollapsingHeader::new(format!("History ({})", self.history_entries.len()))
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        if self.history_entries.is_empty() {
+                            ui.weak("  (no history yet)");
+                        }
+                        for (i, entry) in self.history_entries.iter().enumerate() {
+                            let mut label = format!(
+                                "{} {}  {}  ({} ms)",
+                                entry.method, entry.status, entry.url, entry.elapsed_ms
+                            );
+                            if label.len() > 60 {
+                                label.truncate(57);
+                                label.push_str("...");
+                            }
+                            if ui.selectable_label(false, label).clicked() {
+                                history_click = Some(i);
+                            }
+                        }
+                    });
+                if let Some(i) = history_click {
+                    let entry = self.history_entries[i].clone();
+                    self.load_history_entry(&entry);
+                }
+
+                ui.separator();
+
                 ui.label(format!("Environments ({})", self.environments.len()));
 
                 let mut env_action: Option<EnvAction> = None;
@@ -2056,6 +2244,47 @@ impl eframe::App for CurlyApp {
                     }
                     if ui.button("+ Add override").clicked() {
                         self.var_overrides.push(OverrideRow::empty());
+                    }
+                });
+
+            ui.separator();
+
+            egui::CollapsingHeader::new("Authorization")
+                .default_open(false)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(&mut self.auth.kind, AuthKind::None, "None");
+                        ui.selectable_value(&mut self.auth.kind, AuthKind::Basic, "Basic");
+                        ui.selectable_value(&mut self.auth.kind, AuthKind::Bearer, "Bearer");
+                    });
+                    match self.auth.kind {
+                        AuthKind::None => {}
+                        AuthKind::Basic => {
+                            ui.horizontal(|ui| {
+                                ui.label("Username:");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.auth.username)
+                                        .desired_width(200.0),
+                                );
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Password:");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.auth.password)
+                                        .password(true)
+                                        .desired_width(200.0),
+                                );
+                            });
+                        }
+                        AuthKind::Bearer => {
+                            ui.horizontal(|ui| {
+                                ui.label("Token:");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.auth.token)
+                                        .desired_width(300.0),
+                                );
+                            });
+                        }
                     }
                 });
 
@@ -2425,6 +2654,32 @@ mod tests {
     }
 
     #[test]
+    fn refresh_history_loads_from_storage() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = CurlyApp::default_state();
+        app.open_project_at(dir.path());
+
+        let request = Request::new(Method::GET, "https://example.com/a");
+        app.active_project()
+            .unwrap()
+            .storage
+            .append_history(&HistoryEntry::new(&request, &response(200, "ok")))
+            .unwrap();
+
+        app.refresh_history();
+
+        assert_eq!(app.history_entries.len(), 1);
+        assert_eq!(app.history_entries[0].url, "https://example.com/a");
+    }
+
+    #[test]
+    fn refresh_history_is_empty_with_no_project_open() {
+        let mut app = CurlyApp::default_state();
+        app.refresh_history();
+        assert!(app.history_entries.is_empty());
+    }
+
+    #[test]
     fn load_saved_request_carries_method_url_headers() {
         let mut app = CurlyApp::default_state();
         let mut saved = SavedRequest::new("get-me", Method::GET, "https://example.com/me");
@@ -2469,7 +2724,7 @@ mod tests {
     }
 
     #[test]
-    fn load_saved_request_folds_bearer_auth_into_header() {
+    fn load_saved_request_loads_bearer_auth() {
         let mut app = CurlyApp::default_state();
         let mut saved = SavedRequest::new("get-me", Method::GET, "https://example.com");
         saved.auth = Some(SavedAuth::Bearer {
@@ -2478,14 +2733,14 @@ mod tests {
 
         app.load_saved_request(&saved);
 
-        assert_eq!(app.headers.len(), 1);
-        assert_eq!(app.headers[0].name, "Authorization");
-        assert_eq!(app.headers[0].value, "Bearer abc123");
+        assert_eq!(app.auth.kind, AuthKind::Bearer);
+        assert_eq!(app.auth.token, "abc123");
+        assert!(app.headers.iter().all(|h| h.name != "Authorization"));
         assert!(app.load_notice.is_none());
     }
 
     #[test]
-    fn load_saved_request_notices_basic_auth_not_loaded() {
+    fn load_saved_request_loads_basic_auth() {
         let mut app = CurlyApp::default_state();
         let mut saved = SavedRequest::new("get-me", Method::GET, "https://example.com");
         saved.auth = Some(SavedAuth::Basic {
@@ -2495,8 +2750,11 @@ mod tests {
 
         app.load_saved_request(&saved);
 
+        assert_eq!(app.auth.kind, AuthKind::Basic);
+        assert_eq!(app.auth.username, "alice");
+        assert_eq!(app.auth.password, "s3cret");
         assert!(app.headers.iter().all(|h| h.name != "Authorization"));
-        assert!(app.load_notice.unwrap().contains("Basic auth"));
+        assert!(app.load_notice.is_none());
     }
 
     #[test]
@@ -2510,6 +2768,69 @@ mod tests {
         assert!(notice.contains("BASE_URL"));
         assert!(notice.contains("ID"));
         assert!(notice.contains("no environment selected"));
+    }
+
+    #[test]
+    fn load_history_entry_carries_method_url_body_and_headers() {
+        let mut app = CurlyApp::default_state();
+        let request = Request::new(Method::POST, "https://example.com/users")
+            .with_header("Accept", "application/json")
+            .with_body(Body::Raw(r#"{"a":1}"#.to_string()));
+        let entry = HistoryEntry::new(&request, &response(201, "ok"));
+
+        app.load_history_entry(&entry);
+
+        assert_eq!(app.method, "POST");
+        assert_eq!(app.url, "https://example.com/users");
+        assert_eq!(app.body, r#"{"a":1}"#);
+        assert_eq!(app.headers.len(), 1);
+        assert_eq!(app.headers[0].name, "Accept");
+        assert_eq!(app.headers[0].value, "application/json");
+        assert!(app.loaded_request.is_none());
+        assert!(app.load_notice.is_none());
+    }
+
+    #[test]
+    fn load_history_entry_drops_redacted_headers_with_a_notice() {
+        let mut app = CurlyApp::default_state();
+        let request = Request::new(Method::GET, "https://example.com")
+            .with_header("Authorization", "Bearer super-secret")
+            .with_header("Accept", "application/json");
+        let entry = HistoryEntry::new(&request, &response(200, "ok"));
+
+        app.load_history_entry(&entry);
+
+        assert!(app.headers.iter().all(|h| h.name != "Authorization"));
+        assert_eq!(app.headers.len(), 1);
+        assert_eq!(app.headers[0].name, "Accept");
+        assert!(app.load_notice.unwrap().contains("redacted"));
+    }
+
+    #[test]
+    fn load_history_entry_notices_when_credentials_would_be_needed() {
+        let mut app = CurlyApp::default_state();
+        let request = Request::new(Method::GET, "https://example.com").with_auth(Auth::Bearer {
+            token: "abc123".to_string(),
+        });
+        let entry = HistoryEntry::new(&request, &response(200, "ok"));
+
+        app.load_history_entry(&entry);
+
+        assert_eq!(app.auth.kind, AuthKind::Bearer);
+        assert!(app.auth.token.is_empty());
+        assert!(app.load_notice.unwrap().contains("credentials aren't stored"));
+    }
+
+    #[test]
+    fn load_history_entry_no_auth_has_no_notice() {
+        let mut app = CurlyApp::default_state();
+        let request = Request::new(Method::GET, "https://example.com");
+        let entry = HistoryEntry::new(&request, &response(200, "ok"));
+
+        app.load_history_entry(&entry);
+
+        assert_eq!(app.auth.kind, AuthKind::None);
+        assert!(app.load_notice.is_none());
     }
 
     #[test]
@@ -2646,6 +2967,51 @@ mod tests {
         assert_eq!(request.url, "https://api.example.com/get");
         assert_eq!(request.headers[0].1, "api.example.com");
         assert!(matches!(request.body, Some(Body::Raw(ref s)) if s.contains("api.example.com")));
+    }
+
+    #[test]
+    fn build_request_applies_basic_auth() {
+        let mut app = CurlyApp::default_state();
+        app.url = "https://example.com".to_string();
+        app.auth = AuthEditor {
+            kind: AuthKind::Basic,
+            username: "alice".to_string(),
+            password: "s3cret".to_string(),
+            ..Default::default()
+        };
+
+        let request = app.build_request().unwrap();
+
+        assert!(matches!(
+            request.auth,
+            Some(Auth::Basic { ref username, ref password })
+                if username == "alice" && password == "s3cret"
+        ));
+    }
+
+    #[test]
+    fn build_request_applies_bearer_auth() {
+        let mut app = CurlyApp::default_state();
+        app.url = "https://example.com".to_string();
+        app.auth = AuthEditor {
+            kind: AuthKind::Bearer,
+            token: "abc123".to_string(),
+            ..Default::default()
+        };
+
+        let request = app.build_request().unwrap();
+
+        assert!(matches!(request.auth, Some(Auth::Bearer { ref token }) if token == "abc123"));
+    }
+
+    #[test]
+    fn build_request_no_auth_by_default() {
+        let mut app = CurlyApp::default_state();
+        app.url = "https://example.com".to_string();
+
+        let request = app.build_request().unwrap();
+
+        assert!(request.auth.is_none());
     }
 
     #[test]
@@ -3341,6 +3707,34 @@ mod tests {
         let app = CurlyApp::default_state();
         let saved = app.build_saved_request("x").unwrap();
         assert!(saved.body.is_none());
+    }
+
+    #[test]
+    fn build_saved_request_carries_over_auth() {
+        let mut app = CurlyApp::default_state();
+        app.auth = AuthEditor {
+            kind: AuthKind::Basic,
+            username: "alice".to_string(),
+            password: "s3cret".to_string(),
+            ..Default::default()
+        };
+
+        let saved = app.build_saved_request("x").unwrap();
+
+        match saved.auth {
+            Some(SavedAuth::Basic { username, password }) => {
+                assert_eq!(username, "alice");
+                assert_eq!(password, "s3cret");
+            }
+            other => panic!("expected Basic auth, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_saved_request_no_auth_is_none() {
+        let app = CurlyApp::default_state();
+        let saved = app.build_saved_request("x").unwrap();
+        assert!(saved.auth.is_none());
     }
 
     #[test]

@@ -358,6 +358,19 @@ Requires an actual display (X11 or Wayland) — not scriptable the way the rest 
 | 16.112 | With only one tab open, click its **✕** | The tab doesn't disappear — it resets to blank ("New Request") instead, same as clicking "New". |
 | 16.113 | Open two tabs, click **Save As…** in one (dialog appears), then click the *other* tab | The Save dialog closes on its own — switching tabs cancels it rather than risk saving the wrong tab's content under a stale pre-fill. |
 | 16.114 | Open several tabs with long URLs | Each tab's label truncates with `…` rather than stretching the tab bar or wrapping awkwardly; the tab row scrolls horizontally if there isn't room for all of them. |
+| 16.115 | Open the **Authorization** section, select **Basic**, fill in Username/Password, send to `https://httpbin.org/basic-auth/<user>/<pass>` matching what you entered | 200 response — confirms the editor's Basic auth actually goes out on the wire, not just cosmetic. |
+| 16.116 | Same section, select **Bearer**, enter a token, send to `https://httpbin.org/bearer` | Response's `token` field echoes back exactly what you typed. |
+| 16.117 | With Basic or Bearer filled in, click **Save As…**, save, reload the app (or switch away and back to a different request then reload this one from Collections) | The Authorization section repopulates with the same kind and the same username/password or token — round-trips through disk. |
+| 16.118 | Enter a Bearer token of `{{TOKEN}}` with an active environment defining `TOKEN=abc123`, send | Sends with the real value substituted — confirms Authorization fields go through the same `{{variable}}` substitution as headers/body. |
+| 16.119 | Set Authorization to **Basic**, then switch to **Bearer**, then back to **Basic** | The username/password you typed are still there — switching kinds doesn't clear what you entered. |
+| 16.120 | Send a request with **no** Authorization set | No `Authorization` header appears on the wire (check against `https://httpbin.org/headers`) — `None` really means none, not an empty Basic/Bearer. |
+| 16.121 | With a project open, send a few different requests (mix of successful and a 404), then look at the sidebar's **History** section | Lists them newest-first, each showing method/status/url/elapsed — matches what `curly history` prints for the same project. |
+| 16.122 | Click a history entry | Loads its method/URL/headers/body straight into the current tab; the label under Save reads "New request (not saved)" (not tied to any collection entry). |
+| 16.123 | Send a request with a custom header, then click its History entry | The header reloads correctly (a non-redacted header round-trips exactly). |
+| 16.124 | Send a request with `Authorization: Bearer sekrit` set as a plain header (not via the Authorization section), then click its History entry | That header is **not** present in the reloaded editor — a yellow notice mentions redacted header(s) weren't restored. |
+| 16.125 | Send a request using the Authorization section's Bearer mode with a real token, then click its History entry | Authorization switches to Bearer but the Token field is **empty**; a yellow notice says credentials aren't stored in history and need re-entering. Confirms real credentials never round-trip through history, by design. |
+| 16.126 | Send a POST with a JSON body, then click its History entry | The body reloads verbatim in the Body box. |
+| 16.127 | Run `curly history` from a terminal in the same project right after a GUI send | The GUI's send shows up in the CLI's own history list too — confirms both share the same on-disk history, same as collections/environments. |
 
 ## 17. Scenarios — `curly scenario` (M6, FR-25)
 

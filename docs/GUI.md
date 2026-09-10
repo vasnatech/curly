@@ -1,6 +1,6 @@
 # Curly GUI — User Guide
 
-> Status: **early, several slices so far, FR-21 now complete** (M4, still in progress — see [DESIGN.md](DESIGN.md) §6/§9). The GUI has a toolbar (open a project, toggle light/dark, zoom the whole UI), supports multiple request tabs open at once, can open a project, browse its collections as a tree, click a saved request to load it into a tab (including its extraction rules), create/edit/delete environments and switch between them (plus ad-hoc `--var`-style overrides) to resolve `{{variable}}` tokens, build a request from scratch, save it into a collection (new or overwriting what's loaded) or delete it, send it, show the response with JSON syntax highlighting and in-body search, save the response to a file, and run a loaded request's extraction rules on success and write the results into a session (viewable read-only in the sidebar). It does **not** yet open more than one project at once, or preview an image response, and there's no rename/duplicate/move for an existing saved request yet — those are still FR-20 (partly)/22 (partly). If you need history today, use [the CLI](CLI.md) — GUI and CLI share the same underlying storage, so anything you build or extract with one is already usable by the other.
+> Status: **early, several slices so far, FR-21 now complete** (M4, still in progress — see [DESIGN.md](DESIGN.md) §6/§9). The GUI has a toolbar (open a project, toggle light/dark, zoom the whole UI), supports multiple request tabs open at once, can open a project, browse its collections as a tree, click a saved request to load it into a tab (including its extraction rules and Basic/Bearer authorization), create/edit/delete environments and switch between them (plus ad-hoc `--var`-style overrides) to resolve `{{variable}}` tokens, build a request from scratch (including its Authorization), save it into a collection (new or overwriting what's loaded) or delete it, send it, browse recent history in the sidebar and click an entry to load it back into the editor for a re-run, show the response with JSON syntax highlighting and in-body search, save the response to a file, and run a loaded request's extraction rules on success and write the results into a session (viewable read-only in the sidebar). It does **not** yet open more than one project at once, or preview an image response, and there's no rename/duplicate/move for an existing saved request yet — those are still FR-20 (partly)/22 (partly). GUI and CLI share the same underlying storage, so anything you build, send, or extract with one is already usable by the other (`curly history` still works too, and sees exactly the same entries).
 
 ## Launching it
 
@@ -56,6 +56,7 @@ A **project** is exactly what the CLI already calls a project-local `.curly` dir
 The left sidebar shows:
 - The active project's label (the folder name a `.curly` lives in, or "Default") and its full path. To switch projects, use the toolbar's **"Open Project…"** — a native folder picker, run asynchronously so the window stays responsive while it's open (reads "Choosing…" and disables itself for the moment it's up — see "A note on the folder picker" below for why this matters). Pick any directory: if it already has a `.curly` in it, that project opens; if not, one is created there on the spot (same as running `curly init` in that folder), then opens. Unlike the CLI's own auto-detection, this does **not** search parent directories — a folder dialog already lets you navigate to exactly the directory you want, so opening `Documents/my-api` won't accidentally reopen some unrelated project three levels up.
 - **Collections** — the active project's collections, each expandable into the same folder/request tree `curly collections show` prints. **Click any request to load it into the editor**, or its **✕** to delete it (see "Saving, deleting, and starting a new request" below).
+- **History** — the project's most recent sent requests (FR-6), newest first, same data `curly history` prints. Click one to load it back into the editor (see "History and re-running a request" below).
 - **Environments** — click a name to make it the active environment and open its variable editor, or **"(none selected)"** to go back to none (see "Environments and `{{variable}}` substitution" below).
 
 **Only one project is open at a time right now** — picking a new one replaces the current one. This is deliberate groundwork, not a missing feature that slipped through: the underlying state is already a list (so a future "open several projects, switch between them" doesn't need a data-model change, just a UI for it), but only single-project interaction is wired up so far. This is a different, independent axis from request tabs above — one project, multiple request tabs into it, today.
@@ -65,9 +66,28 @@ The left sidebar shows:
 Clicking a request in the sidebar's Collections tree loads it into the editor: method, URL, and headers always carry over. Beyond that:
 
 - A plain text (`raw`) body loads into the Body box as-is.
-- A `Bearer` token auth folds into an `Authorization: Bearer <token>` header (the editor has no separate auth concept yet, so this is the closest equivalent).
-- Anything the editor **can't** represent — a form/multipart/binary body, `Basic` auth, or a `{{variable}}` token the *currently selected environment* doesn't define — shows as a yellow notice above the editor instead of being silently dropped or silently sent wrong. If you load a request that uses `{{BASE_URL}}` and no environment (or the wrong one) is selected, you'll see the literal `{{BASE_URL}}` in the URL/header fields plus a notice naming exactly which variables are undefined; pick the right environment in the sidebar (or add the missing variable to it) and the notice clears on its own — no need to reload the request.
+- `Basic` and `Bearer` auth both load straight into the Authorization section (see "Authorization" below) — no more folding a Bearer token into a header or flagging Basic as unrepresentable, both are first-class now.
+- Anything the editor **can't** represent — a form/multipart/binary body, or a `{{variable}}` token the *currently selected environment* doesn't define — shows as a yellow notice above the editor instead of being silently dropped or silently sent wrong. If you load a request that uses `{{BASE_URL}}` and no environment (or the wrong one) is selected, you'll see the literal `{{BASE_URL}}` in the URL/header fields plus a notice naming exactly which variables are undefined; pick the right environment in the sidebar (or add the missing variable to it) and the notice clears on its own — no need to reload the request.
 - If the request has extraction rules (added via `curly collections add-request --extract-*`), they come along too — see "Extraction and sessions" below.
+
+### Authorization
+
+A collapsible **Authorization** section sits between Variable overrides and Headers, with a None/Basic/Bearer selector:
+
+- **Basic** — Username and Password fields.
+- **Bearer** — a single Token field.
+
+Either can reference `{{variable}}` tokens, resolved the same way as the URL/headers/body when you Send. Saving a request carries the Authorization section over as `SavedAuth` (the same thing `curly collections add-request -u`/`--bearer` write), and loading a saved request populates it straight back — round-trips exactly, in both directions, with the CLI.
+
+### History and re-running a request
+
+Clicking an entry in the sidebar's **History** list loads it back into the editor, ready to send again — a lightweight re-run, not a live replay of the original response. A history entry is already fully resolved (the CLI/GUI record it *after* `{{variable}}` substitution), so there's nothing to pick an environment for first. A few things intentionally don't come back byte-for-byte, each flagged with a yellow notice when it applies:
+
+- **Redacted headers** (`Authorization`, `X-Api-Key`, `Cookie` — the same NFR-4 redaction `curly history` already applies) are dropped rather than loaded as the literal `***redacted***` placeholder — re-add them by hand if the request needs them.
+- **Basic/Bearer credentials are never stored in history at all**, only *which kind* of auth was used — loading a history entry that used one sets the Authorization section's mode accordingly but leaves the username/password/token blank; re-enter them before sending. This is deliberate: storing real credentials in history to make re-run fully automatic would undo the same NFR-4 guarantee the redacted-headers behavior above protects.
+- The request body **is** recorded and reloads as-is, but only for a plain text body — a request sent with a form/multipart/binary body (not something the editor can build anyway) has no body recorded for it.
+
+Method, URL, and everything else recorded (headers, body) reload exactly as sent. The reloaded request isn't tied to any saved collection entry, so **Save** falls back to **Save As…**, same as any other from-scratch request.
 
 ### Environments and `{{variable}}` substitution
 
@@ -123,11 +143,12 @@ Native folder/file dialogs on Linux are commonly implemented as *blocking* calls
 
 - **Method + URL bar** — pick a method from the dropdown, type a URL.
 - **Send** — click the button, press Enter in the URL field, or press Ctrl+Enter (Cmd+Enter on macOS) from anywhere in the window.
+- **Authorization** — None/Basic/Bearer, see "Authorization" above.
 - **Headers** — an editable table: checkbox to enable/disable a header without deleting it, name/value fields, `+ Add header` to add another row. A header with an empty name is ignored even if checked.
 - **Body** — a plain multi-line text box, sent as the raw request body (matching the CLI's `-d`/`--data`; no separate form/multipart/binary body modes in the GUI's own editor yet, even though a loaded request's raw body shows here fine).
 - **Response pane** — status (color-coded: green 2xx, yellow 3xx, red 4xx/5xx), elapsed time, body size, a collapsible list of response headers, and the body — pretty-printed automatically if it's JSON, shown as-is otherwise. See "Reading a response" below for the search/highlighting/save-to-file that comes with it.
 
-Sending is asynchronous — the window stays responsive while a request is in flight ("Sending…" on the button), and you can't fire a second request until the first one finishes. This part is completely independent of which project (if any) is open — typing a URL and sending it works the same regardless.
+Sending is asynchronous — the window stays responsive while a request is in flight ("Sending…" on the button), and you can't fire a second request until the first one finishes. This part is completely independent of which project (if any) is open — typing a URL and sending it works the same regardless. Every request that actually gets a response (successful or not — a 404 counts, a network error doesn't) is recorded into the project's history, same as the CLI (see "History and re-running a request" above) — this needs a project open (falls back to "Default" if none was ever picked) since history is stored per-project, same as collections/environments.
 
 ### Reading a response (FR-22, partial)
 
@@ -145,7 +166,8 @@ Tracked in DESIGN.md's M4 entry:
 - Defining/editing extraction rules from the GUI — only running rules a saved request already has (defined via `curly collections add-request --extract-*`) is supported
 - A "response ready" indicator on a background tab whose send just completed while you were looking at a different tab (see "Request tabs" above)
 - Renaming, duplicating, or moving an existing saved request directly (rest of FR-20) — Save/Save As/Delete are done; see "Saving, deleting, and starting a new request" above
-- Loading a form/multipart/binary body or Basic auth into the editor (see "Loading a saved request" above) — flagged with a notice, not silently wrong
+- Loading a form/multipart/binary body into the editor (see "Loading a saved request" above) — flagged with a notice, not silently wrong; Basic/Bearer auth both load fine now (see "Authorization" above)
+- Re-running a history entry that used a form/multipart/binary body (its body was never recorded, only raw text bodies are — see "History and re-running a request" above), or one that used Basic/Bearer auth without re-entering credentials by hand (deliberate — history never stores real credentials, only which kind was used)
 - Image preview for a response, and "find next"/scroll-to-match for search (rest of FR-22) — syntax highlighting, highlight-all search, and save-to-file are done; see "Reading a response" above
 - Live-following an OS theme change while curly is already running, and non-GNOME OS-theme detection (rest of FR-24) — the manual toggle always works regardless
 - Remembering zoom level, theme choice, or which tabs were open between launches — all currently reset to their defaults every time curly starts

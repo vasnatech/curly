@@ -364,15 +364,36 @@ impl Environment {
     }
 }
 
+/// Which kind of auth a recorded request used — never the real credentials
+/// (NFR-4: nothing here should let a stored history entry leak a secret).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HistoryAuthKind {
+    Basic,
+    Bearer,
+}
+
 /// One completed request/response, recorded for `curly history`. Header
-/// values that look like credentials are redacted (NFR-4) and the body is
-/// capped at [`MAX_HISTORY_BODY_BYTES`] to keep history files small.
+/// values that look like credentials are redacted (NFR-4), auth is recorded
+/// only as its kind (see [`HistoryAuthKind`]) rather than real credentials,
+/// and both bodies are capped at [`MAX_HISTORY_BODY_BYTES`] to keep history
+/// files small.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HistoryEntry {
     pub sent_at: DateTime<Utc>,
     pub method: String,
     pub url: String,
     pub request_headers: Vec<(String, String)>,
+    /// Only ever populated for a `Body::Raw` request — the only body kind
+    /// the GUI editor itself supports, so it's the only one worth
+    /// remembering for a re-run. `None` covers both "no body" and "a body
+    /// type history doesn't record" — not distinguishable from this alone.
+    #[serde(default)]
+    pub request_body: Option<String>,
+    #[serde(default)]
+    pub request_body_truncated: bool,
+    #[serde(default)]
+    pub request_auth_kind: Option<HistoryAuthKind>,
     pub status: u16,
     pub elapsed_ms: u128,
     pub response_headers: Vec<(String, String)>,
@@ -381,7 +402,23 @@ pub struct HistoryEntry {
 }
 
 pub const MAX_HISTORY_BODY_BYTES: usize = 8192;
-const REDACTED: &str = "***redacted***";
+pub const REDACTED: &str = "***redacted***";
+
+/// Truncate `text` to at most [`MAX_HISTORY_BODY_BYTES`] bytes, cutting only
+/// at a char boundary, returning the (possibly-truncated) text and whether
+/// it was actually cut.
+fn truncate_body(text: &str) -> (String, bool) {
+    let truncated = text.len() > MAX_HISTORY_BODY_BYTES;
+    let body = if truncated {
+        text.char_indices()
+            .take_while(|(byte_idx, _)| *byte_idx < MAX_HISTORY_BODY_BYTES)
+            .map(|(_, c)| c)
+            .collect()
+    } else {
+        text.to_string()
+    };
+    (body, truncated)
+}
 
 impl HistoryEntry {
     pub fn new(request: &Request, response: &ResponseSummary) -> Self {
@@ -403,28 +440,35 @@ impl HistoryEntry {
             })
             .collect();
 
-        let truncated = response.body.len() > MAX_HISTORY_BODY_BYTES;
-        let response_body = if truncated {
-            response
-                .body
-                .char_indices()
-                .take_while(|(byte_idx, _)| *byte_idx < MAX_HISTORY_BODY_BYTES)
-                .map(|(_, c)| c)
-                .collect()
-        } else {
-            response.body.clone()
+        let (request_body, request_body_truncated) = match &request.body {
+            Some(Body::Raw(text)) => {
+                let (body, truncated) = truncate_body(text);
+                (Some(body), truncated)
+            }
+            _ => (None, false),
         };
+
+        let request_auth_kind = match &request.auth {
+            Some(Auth::Basic { .. }) => Some(HistoryAuthKind::Basic),
+            Some(Auth::Bearer { .. }) => Some(HistoryAuthKind::Bearer),
+            None => None,
+        };
+
+        let (response_body, response_body_truncated) = truncate_body(&response.body);
 
         Self {
             sent_at: Utc::now(),
             method: request.method.to_string(),
             url: request.url.clone(),
             request_headers,
+            request_body,
+            request_body_truncated,
+            request_auth_kind,
             status: response.status,
             elapsed_ms: response.elapsed.as_millis(),
             response_headers: response.headers.clone(),
             response_body,
-            response_body_truncated: truncated,
+            response_body_truncated,
         }
     }
 }
@@ -473,6 +517,7 @@ pub fn slugify(name: &str) -> String {
     }
 }
 
+#[derive(Clone)]
 pub struct Storage {
     root: PathBuf,
 }

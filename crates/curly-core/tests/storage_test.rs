@@ -191,6 +191,116 @@ fn history_entry_truncates_large_bodies() {
 }
 
 #[test]
+fn history_entry_records_raw_request_body() {
+    let request = Request::new(Method::POST, "https://example.com")
+        .with_body(curly_core::model::Body::Raw("{\"a\":1}".to_string()));
+    let response = ResponseSummary {
+        status: 200,
+        headers: vec![],
+        body: String::new(),
+        elapsed: Duration::from_millis(1),
+    };
+
+    let entry = HistoryEntry::new(&request, &response);
+    assert_eq!(entry.request_body.as_deref(), Some("{\"a\":1}"));
+    assert!(!entry.request_body_truncated);
+}
+
+#[test]
+fn history_entry_truncates_large_request_bodies() {
+    let big_body = "x".repeat(curly_core::storage::MAX_HISTORY_BODY_BYTES + 100);
+    let request = Request::new(Method::POST, "https://example.com")
+        .with_body(curly_core::model::Body::Raw(big_body));
+    let response = ResponseSummary {
+        status: 200,
+        headers: vec![],
+        body: String::new(),
+        elapsed: Duration::from_millis(1),
+    };
+
+    let entry = HistoryEntry::new(&request, &response);
+    assert!(entry.request_body_truncated);
+    assert!(entry.request_body.unwrap().len() <= curly_core::storage::MAX_HISTORY_BODY_BYTES);
+}
+
+#[test]
+fn history_entry_does_not_record_non_raw_request_bodies() {
+    let request = Request::new(Method::POST, "https://example.com")
+        .with_body(curly_core::model::Body::Binary(vec![1, 2, 3]));
+    let response = ResponseSummary {
+        status: 200,
+        headers: vec![],
+        body: String::new(),
+        elapsed: Duration::from_millis(1),
+    };
+
+    let entry = HistoryEntry::new(&request, &response);
+    assert_eq!(entry.request_body, None);
+    assert!(!entry.request_body_truncated);
+}
+
+#[test]
+fn history_entry_records_auth_kind_but_never_credentials() {
+    use curly_core::model::Auth;
+    use curly_core::storage::HistoryAuthKind;
+
+    let response = ResponseSummary {
+        status: 200,
+        headers: vec![],
+        body: String::new(),
+        elapsed: Duration::from_millis(1),
+    };
+
+    let basic = Request::new(Method::GET, "https://example.com")
+        .with_auth(Auth::Basic {
+            username: "alice".to_string(),
+            password: "sekrit".to_string(),
+        });
+    let entry = HistoryEntry::new(&basic, &response);
+    assert_eq!(entry.request_auth_kind, Some(HistoryAuthKind::Basic));
+    let json = serde_json::to_string(&entry).unwrap();
+    assert!(!json.contains("alice"));
+    assert!(!json.contains("sekrit"));
+    assert!(json.contains("\"basic\""));
+
+    let bearer = Request::new(Method::GET, "https://example.com").with_auth(Auth::Bearer {
+        token: "super-secret-token".to_string(),
+    });
+    let entry = HistoryEntry::new(&bearer, &response);
+    assert_eq!(entry.request_auth_kind, Some(HistoryAuthKind::Bearer));
+    let json = serde_json::to_string(&entry).unwrap();
+    assert!(!json.contains("super-secret-token"));
+    assert!(json.contains("\"bearer\""));
+
+    let none = Request::new(Method::GET, "https://example.com");
+    let entry = HistoryEntry::new(&none, &response);
+    assert_eq!(entry.request_auth_kind, None);
+}
+
+#[test]
+fn history_entry_deserializes_old_schema_without_new_fields() {
+    // A hand-written line matching the on-disk shape written before
+    // request_body/request_body_truncated/request_auth_kind existed —
+    // #[serde(default)] must let this keep parsing.
+    let old_json = r#"{
+        "sent_at": "2024-01-01T00:00:00Z",
+        "method": "GET",
+        "url": "https://example.com",
+        "request_headers": [],
+        "status": 200,
+        "elapsed_ms": 5,
+        "response_headers": [],
+        "response_body": "ok",
+        "response_body_truncated": false
+    }"#;
+
+    let entry: HistoryEntry = serde_json::from_str(old_json).unwrap();
+    assert_eq!(entry.request_body, None);
+    assert!(!entry.request_body_truncated);
+    assert_eq!(entry.request_auth_kind, None);
+}
+
+#[test]
 fn list_history_on_missing_directory_is_empty_not_an_error() {
     let dir = tempdir().unwrap();
     let storage = Storage::new(dir.path());

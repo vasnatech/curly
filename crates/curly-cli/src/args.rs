@@ -227,6 +227,7 @@ mod tests {
             status: 200,
             headers: vec![("Content-Type".to_string(), "application/json".to_string())],
             body: body.to_string(),
+            body_bytes: body.as_bytes().to_vec(),
             elapsed: std::time::Duration::from_millis(42),
         }
     }

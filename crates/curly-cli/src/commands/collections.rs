@@ -42,6 +42,19 @@ pub enum CollectionsCommand {
         collection: String,
         request_path: String,
     },
+    /// Rename and/or move a saved request within a collection (FR-20)
+    RenameRequest {
+        collection: String,
+        old_path: String,
+        new_path: String,
+    },
+    /// Copy a saved request to a new path within a collection (FR-20) — the
+    /// copy gets a fresh id, the original is left in place
+    DuplicateRequest {
+        collection: String,
+        path: String,
+        new_path: String,
+    },
     /// Create a folder (and any missing parent folders) inside a collection
     AddFolder {
         collection: String,
@@ -351,6 +364,28 @@ pub fn run(command: CollectionsCommand, storage: &Storage) -> Result<()> {
             }
             storage.save_collection(&coll)?;
             println!("removed \"{request_path}\" from collection \"{collection}\"");
+        }
+
+        CollectionsCommand::RenameRequest {
+            collection,
+            old_path,
+            new_path,
+        } => {
+            let mut coll = storage.load_collection(&collection)?;
+            coll.rename_or_move_request(&old_path, &new_path)?;
+            storage.save_collection(&coll)?;
+            println!("renamed \"{old_path}\" to \"{new_path}\" in collection \"{collection}\"");
+        }
+
+        CollectionsCommand::DuplicateRequest {
+            collection,
+            path,
+            new_path,
+        } => {
+            let mut coll = storage.load_collection(&collection)?;
+            coll.duplicate_request(&path, &new_path)?;
+            storage.save_collection(&coll)?;
+            println!("duplicated \"{path}\" to \"{new_path}\" in collection \"{collection}\"");
         }
 
         CollectionsCommand::AddFolder {

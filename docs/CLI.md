@@ -416,6 +416,8 @@ curly collections delete "My API"
 - `curly collections show <name>` — print a tree of its folders and saved requests (method + name; nested requests indented under their folder).
 - `curly collections add-request <collection> <request-path> <url> [flags...]` — save a request. Creates the collection first if it doesn't exist yet. `<request-path>` is either a bare name (`login`) for a top-level request, or a `/`-separated path (`Auth/OAuth/login`) to nest it — any folders in the path that don't exist yet are created automatically, and an existing folder with the same name is reused rather than duplicated. The flags are **exactly the same body/header/auth flags as one-shot mode** (`-X`, `-H`, `-Q`, `-d`, `--data-urlencode`, `--data-binary`, `-F`, `-u`, `--bearer`) — so the easiest workflow is: get a request working with plain `curly <url> ...`, then re-run the same flags under `collections add-request <collection> <path> <url> ...` to save it. `{{variable}}` tokens are stored literally — they're not resolved until `run`. Errors if the collection already has a request at that exact path (remove it first). See **Extracting variables from a response** below for the `--extract-*` flags.
 - `curly collections remove-request <collection> <request-path>` — same path syntax as `add-request`. Removing a request doesn't remove its (possibly now-empty) parent folder — use `remove-folder` for that.
+- `curly collections rename-request <collection> <old-path> <new-path>` — rename and/or move a saved request within a collection, preserving its identity (id, body, auth, extraction rules) exactly. Any missing folders along `<new-path>` are created, same as `add-request`. Errors (leaving the original untouched) if something already exists at `<new-path>`.
+- `curly collections duplicate-request <collection> <path> <new-path>` — copy a saved request to `<new-path>`, leaving the original in place. The copy gets a fresh id — it's a distinct entity, not an alias.
 - `curly collections add-folder <collection> <folder-path>` — create a folder (and any missing parent folders) without adding a request to it yet, e.g. to set up structure ahead of time. Idempotent: running it again for a folder that already exists is a no-op, not an error.
 - `curly collections remove-folder <collection> <folder-path> [--force]` — remove a folder. Errors if it still contains requests or sub-folders unless `--force` is given, which deletes everything inside it too.
 - `curly collections import postman <collection> <path>` / `curly collections import curl <collection> <request-path> [command]` — see **Importing from Postman or curl** below.
@@ -567,7 +569,7 @@ These are on the roadmap (see [DESIGN.md](DESIGN.md) §9) but don't exist in the
 - OAuth2 authorization-code/client-credentials auth helpers
 - Exporting collections/environments in Postman's format (curly's own JSON is the only export format)
 - Re-running or viewing the full detail of a single history entry (only the summary list exists)
-- Editing a saved request in place (currently: remove-request, then add-request again)
+- Editing a saved request's *content* (URL/headers/body/auth) in place from the CLI (currently: remove-request, then add-request again) — renaming/moving/duplicating a request without touching its content is now supported (`rename-request`/`duplicate-request`, §6)
 - Colorized output when connected to a TTY
 - Pretty-printing for non-JSON bodies (XML/HTML)
 - OS-keychain storage for `--secret` environment variables (currently plain JSON on disk)

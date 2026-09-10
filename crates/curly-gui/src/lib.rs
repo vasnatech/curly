@@ -5,6 +5,7 @@
 //! or via `curly gui` (DESIGN.md §3).
 
 mod app;
+mod persistence;
 mod project;
 
 pub use app::CurlyApp;

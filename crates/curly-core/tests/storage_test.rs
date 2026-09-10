@@ -128,12 +128,14 @@ fn history_entries_are_appended_and_listed_most_recent_first() {
         status: 200,
         headers: vec![],
         body: "a".to_string(),
+        body_bytes: Vec::new(),
         elapsed: Duration::from_millis(1),
     };
     let response_b = ResponseSummary {
         status: 201,
         headers: vec![],
         body: "b".to_string(),
+        body_bytes: Vec::new(),
         elapsed: Duration::from_millis(2),
     };
 
@@ -156,6 +158,7 @@ fn history_entry_redacts_authorization_header() {
         status: 200,
         headers: vec![],
         body: String::new(),
+        body_bytes: Vec::new(),
         elapsed: Duration::from_millis(1),
     };
 
@@ -182,6 +185,7 @@ fn history_entry_truncates_large_bodies() {
         status: 200,
         headers: vec![],
         body: big_body,
+        body_bytes: Vec::new(),
         elapsed: Duration::from_millis(1),
     };
 
@@ -198,6 +202,7 @@ fn history_entry_records_raw_request_body() {
         status: 200,
         headers: vec![],
         body: String::new(),
+        body_bytes: Vec::new(),
         elapsed: Duration::from_millis(1),
     };
 
@@ -215,6 +220,7 @@ fn history_entry_truncates_large_request_bodies() {
         status: 200,
         headers: vec![],
         body: String::new(),
+        body_bytes: Vec::new(),
         elapsed: Duration::from_millis(1),
     };
 
@@ -231,6 +237,7 @@ fn history_entry_does_not_record_non_raw_request_bodies() {
         status: 200,
         headers: vec![],
         body: String::new(),
+        body_bytes: Vec::new(),
         elapsed: Duration::from_millis(1),
     };
 
@@ -248,6 +255,7 @@ fn history_entry_records_auth_kind_but_never_credentials() {
         status: 200,
         headers: vec![],
         body: String::new(),
+        body_bytes: Vec::new(),
         elapsed: Duration::from_millis(1),
     };
 
@@ -471,6 +479,98 @@ fn remove_request_nested() {
 fn remove_request_missing_returns_false() {
     let mut coll = Collection::new("My API");
     assert!(!coll.remove_request("Auth/login"));
+}
+
+#[test]
+fn rename_or_move_request_renames_in_place() {
+    let mut coll = Collection::new("My API");
+    let mut req = sample_request("login");
+    req.body = Some(curly_core::storage::SavedBody::Raw {
+        content: "hi".to_string(),
+    });
+    let id = req.id;
+    coll.add_request("login", req).unwrap();
+
+    coll.rename_or_move_request("login", "sign-in").unwrap();
+
+    assert!(coll.find_request("login").is_none());
+    let renamed = coll.find_request("sign-in").unwrap();
+    assert_eq!(renamed.name, "sign-in");
+    assert_eq!(renamed.id, id);
+    assert!(matches!(&renamed.body, Some(curly_core::storage::SavedBody::Raw { content }) if content == "hi"));
+}
+
+#[test]
+fn rename_or_move_request_can_move_into_a_new_folder() {
+    let mut coll = Collection::new("My API");
+    coll.add_request("login", sample_request("login")).unwrap();
+
+    coll.rename_or_move_request("login", "Auth/login").unwrap();
+
+    assert!(coll.find_request("login").is_none());
+    assert!(coll.find_request("Auth/login").is_some());
+}
+
+#[test]
+fn rename_or_move_request_same_path_is_a_no_op() {
+    let mut coll = Collection::new("My API");
+    coll.add_request("login", sample_request("login")).unwrap();
+
+    coll.rename_or_move_request("login", "login").unwrap();
+
+    assert!(coll.find_request("login").is_some());
+}
+
+#[test]
+fn rename_or_move_request_errors_on_missing_source() {
+    let mut coll = Collection::new("My API");
+    assert!(coll.rename_or_move_request("nope", "still-nope").is_err());
+}
+
+#[test]
+fn rename_or_move_request_errors_on_collision_and_leaves_original_untouched() {
+    let mut coll = Collection::new("My API");
+    coll.add_request("login", sample_request("login")).unwrap();
+    coll.add_request("logout", sample_request("logout")).unwrap();
+
+    assert!(coll.rename_or_move_request("login", "logout").is_err());
+
+    // the original is still exactly where it was
+    assert!(coll.find_request("login").is_some());
+    assert!(coll.find_request("logout").is_some());
+}
+
+#[test]
+fn duplicate_request_copies_with_a_fresh_id() {
+    let mut coll = Collection::new("My API");
+    let original_id = {
+        let req = sample_request("login");
+        let id = req.id;
+        coll.add_request("login", req).unwrap();
+        id
+    };
+
+    coll.duplicate_request("login", "login-copy").unwrap();
+
+    assert!(coll.find_request("login").is_some());
+    let copy = coll.find_request("login-copy").unwrap();
+    assert_eq!(copy.name, "login-copy");
+    assert_ne!(copy.id, original_id);
+}
+
+#[test]
+fn duplicate_request_errors_on_missing_source() {
+    let mut coll = Collection::new("My API");
+    assert!(coll.duplicate_request("nope", "still-nope").is_err());
+}
+
+#[test]
+fn duplicate_request_errors_on_collision() {
+    let mut coll = Collection::new("My API");
+    coll.add_request("login", sample_request("login")).unwrap();
+    coll.add_request("logout", sample_request("logout")).unwrap();
+
+    assert!(coll.duplicate_request("login", "logout").is_err());
 }
 
 #[test]

@@ -10,6 +10,14 @@ pub struct ResponseSummary {
     pub status: u16,
     pub headers: Vec<(String, String)>,
     pub body: String,
+    /// The exact bytes the server sent, before `body`'s lossy UTF-8
+    /// decoding — needed by anything that must reproduce the response
+    /// exactly (the GUI's image preview and "Save Response…"). Every other
+    /// existing consumer of `body` is unaffected: its type and semantics
+    /// haven't changed, it's just now derived from `body_bytes` rather than
+    /// decoded directly, so a binary response gets a garbled-but-harmless
+    /// `body` the same way it always implicitly would have.
+    pub body_bytes: Vec<u8>,
     pub elapsed: Duration,
 }
 
@@ -53,13 +61,15 @@ pub async fn send(client: &reqwest::Client, request: &Request) -> Result<Respons
             )
         })
         .collect();
-    let body = response.text().await?;
+    let body_bytes = response.bytes().await?.to_vec();
+    let body = String::from_utf8_lossy(&body_bytes).into_owned();
     let elapsed = started.elapsed();
 
     Ok(ResponseSummary {
         status,
         headers,
         body,
+        body_bytes,
         elapsed,
     })
 }

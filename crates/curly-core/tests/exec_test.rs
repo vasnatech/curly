@@ -145,3 +145,39 @@ async fn returns_response_headers() {
         .iter()
         .any(|(name, value)| name.eq_ignore_ascii_case("X-Reply") && value == "yes"));
 }
+
+#[tokio::test]
+async fn body_bytes_matches_the_raw_response_exactly_for_text() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("hello world"))
+        .mount(&server)
+        .await;
+
+    let client = reqwest::Client::new();
+    let request = Request::new(Method::GET, server.uri());
+    let response = exec::send(&client, &request).await.unwrap();
+
+    assert_eq!(response.body_bytes, b"hello world");
+    assert_eq!(response.body, "hello world");
+}
+
+#[tokio::test]
+async fn body_bytes_preserves_non_utf8_bytes_that_body_would_lossily_mangle() {
+    let server = MockServer::start().await;
+    // Not valid UTF-8 — a stand-in for something like PNG bytes.
+    let raw_bytes: &[u8] = &[0xFF, 0xD8, 0xFF, 0x00, 0x01, 0x02];
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(raw_bytes))
+        .mount(&server)
+        .await;
+
+    let client = reqwest::Client::new();
+    let request = Request::new(Method::GET, server.uri());
+    let response = exec::send(&client, &request).await.unwrap();
+
+    assert_eq!(response.body_bytes, raw_bytes);
+    // `body` is still whatever lossy UTF-8 conversion produces — never
+    // relied on to reconstruct the original bytes.
+    assert_eq!(response.body, String::from_utf8_lossy(raw_bytes));
+}

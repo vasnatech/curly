@@ -143,6 +143,17 @@ alias curly=./target/release/curly   # or use cargo run -- ... directly
 | 10.19 | `curly collections remove-folder "My API" "NoSuchFolder"` | Fails with "has no folder named \"NoSuchFolder\"". |
 | 10.20 | Take the `health-record-backend-spring/.curly/collections/health-record-api.json` committed before folder support existed (no `"folders"` key at all) and run `curly collections show "Health Record API"` against it | Still loads and shows correctly (`folders` defaults to empty on parse) — confirms old collection files aren't broken by this feature. |
 
+### Rename, move, and duplicate (FR-20)
+
+| # | Steps | Expected |
+|---|---|---|
+| 10.21 | `curly collections add-request "My API" login https://httpbin.org/post`, then `curly collections rename-request "My API" login sign-in` then `show` | "renamed \"login\" to \"sign-in\" in collection \"My API\""; the tree now shows `sign-in`, not `login`. |
+| 10.22 | `curly collections rename-request "My API" sign-in "Auth/sign-in"` then `show` | Moves it into a new `Auth` folder (created automatically); `show` reflects the new location. |
+| 10.23 | `curly collections add-request "My API" logout https://httpbin.org/post`, then `curly collections rename-request "My API" "Auth/sign-in" logout` (colliding with the existing `logout`) | Fails with "a request already exists at \"logout\""; `Auth/sign-in` is still there afterward — a failed rename never loses the original. |
+| 10.24 | `curly collections rename-request "My API" nope still-nope` | Fails with "no request found at \"nope\"". |
+| 10.25 | `curly collections duplicate-request "My API" "Auth/sign-in" "Auth/sign-in-copy"` then `show` | Both `Auth/sign-in` and `Auth/sign-in-copy` appear; inspect the collection's JSON file directly to confirm they have different `id`s. |
+| 10.26 | `curly collections duplicate-request "My API" "Auth/sign-in" logout` (colliding) | Fails with "a request already exists at \"logout\""; nothing duplicated. |
+
 ## 11. Running a saved request — `curly run`
 
 | # | Steps | Expected |
@@ -371,6 +382,32 @@ Requires an actual display (X11 or Wayland) — not scriptable the way the rest 
 | 16.125 | Send a request using the Authorization section's Bearer mode with a real token, then click its History entry | Authorization switches to Bearer but the Token field is **empty**; a yellow notice says credentials aren't stored in history and need re-entering. Confirms real credentials never round-trip through history, by design. |
 | 16.126 | Send a POST with a JSON body, then click its History entry | The body reloads verbatim in the Body box. |
 | 16.127 | Run `curly history` from a terminal in the same project right after a GUI send | The GUI's send shows up in the CLI's own history list too — confirms both share the same on-disk history, same as collections/environments. |
+| 16.128 | Set zoom to something other than 100%, toggle to light mode, open a second tab with a distinct URL/method, then quit `curly gui` normally and relaunch it | Zoom, theme, and both tabs (with the same URL/method/headers/body in each) come back exactly as left — confirms persistence round-trips through a real restart, not just the unit-tested `PersistedState` struct. |
+| 16.129 | Kill the GUI process (e.g. `kill -9`) instead of closing it normally, having changed zoom/theme/tabs since the last normal exit | On relaunch, the *previous* normal exit's saved state comes back, not the killed session's — confirms nothing is written except on a clean exit. |
+| 16.130 | On GNOME: change the OS light/dark setting (e.g. via Settings or `gsettings set org.gnome.desktop.interface color-scheme 'prefer-dark'`) while `curly gui` is running, without touching the toolbar toggle | Within ~2 seconds, curly's own theme switches to match, with no restart. |
+| 16.131 | Click the toolbar's ☀/🌙 toggle, then change the OS setting again | Curly's theme does **not** follow the OS anymore — your manual choice sticks. |
+| 16.132 | After 16.131, quit and relaunch `curly gui` (still not having toggled back) | Comes back in the theme you manually chose, not whatever the OS is currently set to — confirms the "pinned" choice persists across restarts. |
+| 16.133 | On a KDE desktop, switch the system color scheme, then launch `curly gui` fresh (no persisted preferences file) | Curly's theme matches KDE's current light/dark setting at launch — confirms the `kdeglobals` heuristic works on a real KDE session (this one needs an actual KDE box, not GNOME — skip if none is available). |
+| 16.134 | Send a request from one tab, immediately switch to a different tab before the response arrives, then wait for it to land while looking at the other tab | A small **●** appears before the sending tab's label once its response lands. |
+| 16.135 | Click the tab with the **●** marker | The marker disappears and the response (now visible) matches what actually came back — confirms it wasn't silently dropped while backgrounded. |
+| 16.136 | Repeat 16.134/16.135 but with the backgrounded tab's request having an extraction rule | The session panel updates with the extracted value as soon as the response lands in the background, not only after switching to that tab. |
+| 16.137 | In the sidebar, click a saved request's **✎** | A "Rename / Move" window opens, pre-filled with its current folder/name. |
+| 16.138 | Change just the Name field and confirm | The request moves to the new name within the same folder; clicking the old name in the tree no longer finds it, the new name does — and if it was the currently-loaded request, the "Editing…" label under Save now shows the new path. |
+| 16.139 | Repeat 16.137/138 but change the Folder field to move it into a different (possibly new) folder | The request now appears under the new folder in the Collections tree; the new folder is created automatically if it didn't exist. |
+| 16.140 | Try to rename a request to a name that collides with an existing one in the same folder | An error appears in the dialog (not closed); the original request is still exactly where it was. |
+| 16.141 | Click a saved request's **⧉**, confirm with a different name | A second copy appears in the tree under the new name; the original is untouched and (if it was loaded) stays loaded — the copy is not automatically loaded. |
+| 16.142 | Open the **Extraction rules** section on a blank request, click **+ Add rule** | A new row appears defaulting to **Body** kind, with empty Name/JSON path fields and an unchecked secret box. |
+| 16.143 | Fill in Name `TOKEN`, JSON path `access_token`, send a request whose JSON response has that field | The "On a successful send, extracts TOKEN..." note appears, and after sending, the Session panel shows `TOKEN` with the extracted value. |
+| 16.144 | Switch the same row's kind to **Header**, then to **Template** | The Name and secret checkbox keep their values across each switch; the second field's label changes (JSON path → Header name → Template) and its own value resets each time. |
+| 16.145 | Add a rule, leave its Name blank, fill in the rest, then Save the request and reload it from Collections | The blank-named rule isn't there after reloading — confirms it's dropped on save, same as a blank-name header. |
+| 16.146 | Remove a rule's **✕** | That row disappears immediately; other rows are unaffected. |
+| 16.147 | With a JSON response showing, type a search term that appears 3+ times, on a body long enough to need scrolling | "match 1 of N" appears next to **◀**/**▶**; every match is highlighted yellow, and the first one is additionally highlighted **orange** (the "current" one) — the two colors need to be visibly different, not just yellow everywhere. |
+| 16.148 | Click **▶** repeatedly | The label's count advances (2 of N, 3 of N, ...); the orange highlight moves to each successive match (the previous one reverts to plain yellow) and the view scrolls so the new current match is visible, even when it's off-screen before clicking; clicking **▶** past the last match wraps back to "match 1". |
+| 16.149 | Click **◀** from "match 1 of N" | Wraps to the last match ("N of N"), which is now the orange one; scrolls to it if it's off-screen. |
+| 16.150 | Send a request to `https://httpbin.org/image/png` | The Response pane shows the actual decoded PNG image (not raw bytes/garbled text), scaled to fit the pane's width. |
+| 16.151 | With that image response showing, click **Save Response…**, save it, then open the saved file in an image viewer | The saved file opens correctly as a valid PNG — confirms bytes were written exactly, not the lossy-text copy. |
+| 16.152 | Send a request to `https://httpbin.org/image/jpeg` and `https://httpbin.org/image/webp` | Each renders correctly as an image too — confirms more than just PNG decodes (the `image` crate's jpeg/webp features are actually wired up, not just declared). |
+| 16.153 | Send a request whose `Content-Type` is `image/png` but whose body isn't actually a valid image (e.g. point it at an HTML error page while spoofing the header isn't possible from the GUI directly — instead, use a URL that's briefly wrong, or skip if not easily reproducible) | A red notice explains the body couldn't be decoded, rather than a blank pane or a panic. |
 
 ## 17. Scenarios — `curly scenario` (M6, FR-25)
 

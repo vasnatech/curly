@@ -21,7 +21,9 @@ use curly_core::storage::{
 };
 use curly_core::substitution;
 use reqwest::Method;
+use serde::{Deserialize, Serialize};
 
+use crate::persistence;
 use crate::project::Project;
 
 const METHODS: [&str; 7] = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"];
@@ -39,10 +41,11 @@ const MAX_ZOOM: f32 = 3.0;
 /// history`'s own CLI default (`--limit 20`).
 const HISTORY_DISPLAY_LIMIT: usize = 20;
 
-struct HeaderRow {
-    name: String,
-    value: String,
-    enabled: bool,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct HeaderRow {
+    pub(crate) name: String,
+    pub(crate) value: String,
+    pub(crate) enabled: bool,
 }
 
 impl HeaderRow {
@@ -101,8 +104,8 @@ impl OverrideRow {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
-enum AuthKind {
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub(crate) enum AuthKind {
     #[default]
     None,
     Basic,
@@ -112,12 +115,58 @@ enum AuthKind {
 /// Editor state for the Authorization section — all three text fields stay
 /// populated regardless of `kind` so switching Basic/Bearer/None in the UI
 /// never loses what was typed.
-#[derive(Debug, Clone, Default)]
-struct AuthEditor {
-    kind: AuthKind,
-    username: String,
-    password: String,
-    token: String,
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub(crate) struct AuthEditor {
+    pub(crate) kind: AuthKind,
+    pub(crate) username: String,
+    pub(crate) password: String,
+    pub(crate) token: String,
+}
+
+/// Which `Extraction` variant a rule-editor row currently is — used only to
+/// drive the Body/Header/Template selector; `Extraction` itself (from
+/// `curly-core`) stays the single source of truth for the rule's data.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExtractionKindTag {
+    Body,
+    Header,
+    Template,
+}
+
+fn extraction_kind(rule: &Extraction) -> ExtractionKindTag {
+    match rule {
+        Extraction::Body { .. } => ExtractionKindTag::Body,
+        Extraction::Header { .. } => ExtractionKindTag::Header,
+        Extraction::Template { .. } => ExtractionKindTag::Template,
+    }
+}
+
+/// Reconstruct `rule` as a different variant, carrying `name`/`secret` over
+/// and starting the kind-specific field blank — used when the editor's
+/// Body/Header/Template selector changes for an existing row.
+fn rebuild_extraction(rule: &Extraction, kind: ExtractionKindTag) -> Extraction {
+    let (name, secret) = match rule {
+        Extraction::Body { name, secret, .. } => (name.clone(), *secret),
+        Extraction::Header { name, secret, .. } => (name.clone(), *secret),
+        Extraction::Template { name, secret, .. } => (name.clone(), *secret),
+    };
+    match kind {
+        ExtractionKindTag::Body => Extraction::Body {
+            name,
+            path: String::new(),
+            secret,
+        },
+        ExtractionKindTag::Header => Extraction::Header {
+            name,
+            header: String::new(),
+            secret,
+        },
+        ExtractionKindTag::Template => Extraction::Template {
+            name,
+            template: String::new(),
+            secret,
+        },
+    }
 }
 
 impl From<HistoryAuthKind> for AuthKind {
@@ -163,10 +212,10 @@ enum EnvAction {
 /// slash-separated path within that collection (e.g. `"Auth/OAuth/login"`,
 /// matching `Collection::find_request`'s own path convention exactly; not
 /// including the collection name itself).
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct LoadedRequestRef {
-    collection: String,
-    path: String,
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct LoadedRequestRef {
+    pub(crate) collection: String,
+    pub(crate) path: String,
 }
 
 /// A click in the sidebar's Collections tree, applied after the rendering
@@ -175,6 +224,29 @@ struct LoadedRequestRef {
 enum TreeAction {
     Load(String, SavedRequest),
     Delete(String),
+    Rename(String),
+    Duplicate(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PathDialogMode {
+    Rename,
+    Duplicate,
+}
+
+/// State for the "Rename/Move" and "Duplicate" floating windows (FR-20) —
+/// deliberately a separate type from `SaveDialog` rather than merged into
+/// it: same shape (collection/folder/name), but a different purpose (moving
+/// an *existing* tree entry vs. saving the editor's current content), and
+/// merging them would need a mode flag threaded through every method that
+/// already exists for `SaveDialog` alone.
+struct PathDialog {
+    mode: PathDialogMode,
+    collection: String,
+    old_path: String,
+    folder_path: String,
+    name: String,
+    error: Option<String>,
 }
 
 /// State for the "Save Request" floating window (FR-20) — collection/folder
@@ -224,6 +296,11 @@ struct RequestTab {
     body: String,
     auth: AuthEditor,
     response: Option<Result<ResponseSummary, String>>,
+    /// A decoded texture for an image response (see Part F / `is_image_content_type`),
+    /// `None` for a non-image response or before it's been decoded yet.
+    /// Not persisted (a `TextureHandle` is a runtime GPU resource) and not
+    /// part of `PersistedTab`.
+    response_image: Option<egui::TextureHandle>,
     in_flight: bool,
     rx: Option<mpsc::Receiver<SendOutcome>>,
     var_overrides: Vec<OverrideRow>,
@@ -233,8 +310,22 @@ struct RequestTab {
     load_notice: Option<String>,
     loaded_request: Option<LoadedRequestRef>,
     response_search: String,
+    /// Which match `response_search` is currently jumped to (0-indexed,
+    /// wraps in both directions) — reset to 0 whenever the search text
+    /// changes or a new response lands, so it never points past the end of
+    /// a shorter match list.
+    response_search_current: usize,
     response_save_rx: Option<mpsc::Receiver<Option<String>>>,
     response_save_notice: Option<String>,
+    /// Set when a response arrives while this tab isn't the active one
+    /// (see `poll_background_tab_responses`) — drives a "response ready"
+    /// marker on the tab strip. Naturally resets to `false` on its own once
+    /// the tab becomes active: `switch_to_tab`'s `std::mem::take` leaves a
+    /// fresh `Default` (i.e. `false`) sitting in the now-inactive slot,
+    /// since this field is deliberately not part of `restore_active_tab`'s
+    /// field list (the active tab itself never needs to show its own
+    /// badge).
+    has_unseen_response: bool,
 }
 
 impl RequestTab {
@@ -260,6 +351,7 @@ pub struct CurlyApp {
     auth: AuthEditor,
 
     response: Option<Result<ResponseSummary, String>>,
+    response_image: Option<egui::TextureHandle>,
     in_flight: bool,
     rx: Option<mpsc::Receiver<SendOutcome>>,
 
@@ -356,6 +448,10 @@ pub struct CurlyApp {
     loaded_request: Option<LoadedRequestRef>,
     /// Open while the "Save Request" window is showing; `None` otherwise.
     save_dialog: Option<SaveDialog>,
+    /// Open while the "Rename/Move" or "Duplicate" window is showing (FR-20);
+    /// `None` otherwise. Opening this closes `save_dialog` and vice versa —
+    /// only one floating dialog is ever open at a time.
+    path_dialog: Option<PathDialog>,
     /// Feedback from saving/deleting a request in a collection — separate
     /// from `load_notice` (about the editor's own content) and
     /// `env_notice`/`session_notice` (environments/sessions).
@@ -365,6 +461,7 @@ pub struct CurlyApp {
     /// (FR-22). Persists across sends deliberately, so re-sending the same
     /// request keeps the same search highlighted.
     response_search: String,
+    response_search_current: usize,
     /// The "Save Response…" async file dialog's result channel — same
     /// fire-and-poll shape as `project_dialog_rx`, but the spawned task
     /// also writes the file itself before reporting back, so there's only
@@ -382,6 +479,21 @@ pub struct CurlyApp {
     /// instead of leaving zero tabs open.
     tabs: Vec<RequestTab>,
     active_tab_idx: usize,
+
+    /// Cached copies of `ui.ctx().zoom_factor()`/`.theme()`, refreshed once
+    /// per frame — `eframe::App::on_exit` (where these get persisted) isn't
+    /// handed an `egui::Context`, so there's nothing else to read them from
+    /// at that point.
+    last_zoom: f32,
+    last_theme: egui::Theme,
+    /// Whether the theme should keep following the OS preference live
+    /// (checked periodically — see `ui()`) or has been pinned by a manual
+    /// toggle click. Persisted across restarts (`persistence::PersistedState`)
+    /// so a manual choice sticks until toggled again, the same way a manual
+    /// light/dark override behaves in most apps that also support "follow
+    /// the OS".
+    theme_follows_system: bool,
+    last_theme_check: std::time::Instant,
 }
 
 impl CurlyApp {
@@ -394,15 +506,52 @@ impl CurlyApp {
     /// so they stay hermetic regardless of what directory `cargo test` runs
     /// from or what `.curly` might exist somewhere above it.
     ///
-    /// Also seeds the theme from the OS's light/dark preference where it can
-    /// be detected (FR-24) — see `detect_system_theme`'s doc comment for why
-    /// egui's own built-in "follow the system theme" doesn't work on Linux.
+    /// Also restores persisted zoom/theme/tabs (see `persistence`) where a
+    /// preferences file exists; otherwise seeds the theme from the OS's
+    /// light/dark preference where it can be detected (FR-24) — see
+    /// `detect_system_theme`'s doc comment for why egui's own built-in
+    /// "follow the system theme" doesn't work on Linux.
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        if let Some(theme) = detect_system_theme() {
-            cc.egui_ctx.set_theme(theme);
+        let mut app = Self::default_state();
+
+        match persistence::load() {
+            Some(prefs) => {
+                cc.egui_ctx.set_zoom_factor(clamp_zoom(prefs.zoom));
+                app.theme_follows_system = prefs.theme_follows_system;
+                if prefs.theme_follows_system {
+                    if let Some(theme) = detect_system_theme() {
+                        cc.egui_ctx.set_theme(theme);
+                    }
+                } else {
+                    cc.egui_ctx.set_theme(egui::Theme::from(prefs.theme));
+                }
+                if !prefs.tabs.is_empty() {
+                    app.tabs = prefs
+                        .tabs
+                        .into_iter()
+                        .map(|t| RequestTab {
+                            method: t.method,
+                            url: t.url,
+                            headers: t.headers,
+                            body: t.body,
+                            auth: t.auth,
+                            loaded_request: t.loaded_request,
+                            ..Default::default()
+                        })
+                        .collect();
+                    let idx = prefs.active_tab_idx.min(app.tabs.len() - 1);
+                    app.active_tab_idx = idx;
+                    let active = std::mem::take(&mut app.tabs[idx]);
+                    app.restore_active_tab(active);
+                }
+            }
+            None => {
+                if let Some(theme) = detect_system_theme() {
+                    cc.egui_ctx.set_theme(theme);
+                }
+            }
         }
 
-        let mut app = Self::default_state();
         match Storage::resolve_default(None) {
             Ok(storage) => app.set_active_project(storage),
             Err(e) => app.project_open_error = Some(e.to_string()),
@@ -421,6 +570,7 @@ impl CurlyApp {
             body: String::new(),
             auth: AuthEditor::default(),
             response: None,
+            response_image: None,
             in_flight: false,
             rx: None,
             runtime: tokio::runtime::Runtime::new().expect("failed to start async runtime"),
@@ -444,12 +594,18 @@ impl CurlyApp {
             load_notice: None,
             loaded_request: None,
             save_dialog: None,
+            path_dialog: None,
             collection_notice: None,
             response_search: String::new(),
+            response_search_current: 0,
             response_save_rx: None,
             response_save_notice: None,
             tabs: vec![RequestTab::blank()],
             active_tab_idx: 0,
+            last_zoom: 1.0,
+            last_theme: egui::Theme::Dark,
+            theme_follows_system: true,
+            last_theme_check: std::time::Instant::now(),
         }
     }
 
@@ -506,7 +662,11 @@ impl CurlyApp {
     /// `response.json` vs `response.txt`) — purely a starting suggestion,
     /// the user can change it. A cancelled dialog reports nothing; a write
     /// failure or success both set `response_save_notice`.
-    fn save_response_to_file(&mut self, ctx: &egui::Context, body: String, default_name: &str) {
+    ///
+    /// Takes the raw `body_bytes`, not `body` (the lossy-UTF8-decoded
+    /// `String`) — writing `body` would silently corrupt any response
+    /// that isn't valid UTF-8 text (an image response, most notably).
+    fn save_response_to_file(&mut self, ctx: &egui::Context, body: Vec<u8>, default_name: &str) {
         let (tx, rx) = mpsc::channel();
         self.response_save_rx = Some(rx);
         let ctx = ctx.clone();
@@ -514,7 +674,7 @@ impl CurlyApp {
         self.runtime.spawn(async move {
             let picked = rfd::AsyncFileDialog::new().set_file_name(&default_name).save_file().await;
             let message = match picked {
-                Some(handle) => match tokio::fs::write(handle.path(), body.as_bytes()).await {
+                Some(handle) => match tokio::fs::write(handle.path(), &body).await {
                     Ok(()) => Some(format!("saved response to {}", handle.path().display())),
                     Err(e) => Some(format!("failed to save response: {e}")),
                 },
@@ -1032,21 +1192,66 @@ impl CurlyApp {
     }
 
     fn poll_response(&mut self) {
-        let Some(rx) = &self.rx else { return };
-        if let Ok(outcome) = rx.try_recv() {
-            self.in_flight = false;
+        if let Some(rx) = &self.rx {
+            if let Ok(outcome) = rx.try_recv() {
+                self.in_flight = false;
+                match outcome {
+                    SendOutcome::Success(r) => {
+                        self.apply_pending_extraction(&r);
+                        self.response = Some(Ok(r));
+                        self.response_image = None;
+                        self.response_search_current = 0;
+                        self.refresh_history();
+                    }
+                    SendOutcome::Error(e) => {
+                        self.pending_extraction = None;
+                        self.response = Some(Err(e));
+                        self.response_image = None;
+                        self.response_search_current = 0;
+                    }
+                }
+                self.rx = None;
+            }
+        }
+        self.poll_background_tab_responses();
+    }
+
+    /// The same handling `poll_response` gives the *active* tab's `rx`,
+    /// applied to every other tab's — a background send keeps running
+    /// while you're looking at a different tab (see `RequestTab`'s doc
+    /// comment), and its result/extraction/history entry shouldn't wait
+    /// for you to switch back to see it. Marks `has_unseen_response` so the
+    /// tab strip can show a "response ready" indicator.
+    fn poll_background_tab_responses(&mut self) {
+        for i in 0..self.tabs.len() {
+            if i == self.active_tab_idx {
+                continue;
+            }
+            let Some(rx) = &self.tabs[i].rx else { continue };
+            let Ok(outcome) = rx.try_recv() else { continue };
+            self.tabs[i].in_flight = false;
+            self.tabs[i].rx = None;
+            self.tabs[i].has_unseen_response = true;
             match outcome {
                 SendOutcome::Success(r) => {
-                    self.apply_pending_extraction(&r);
-                    self.response = Some(Ok(r));
+                    let pending = self.tabs[i].pending_extraction.take();
+                    if let Some(pending) = pending {
+                        if let Some(notice) = self.apply_extraction_for(pending, &r) {
+                            self.tabs[i].session_notice = Some(notice);
+                        }
+                    }
+                    self.tabs[i].response = Some(Ok(r));
+                    self.tabs[i].response_image = None;
+                    self.tabs[i].response_search_current = 0;
                     self.refresh_history();
                 }
                 SendOutcome::Error(e) => {
-                    self.pending_extraction = None;
-                    self.response = Some(Err(e));
+                    self.tabs[i].pending_extraction = None;
+                    self.tabs[i].response = Some(Err(e));
+                    self.tabs[i].response_image = None;
+                    self.tabs[i].response_search_current = 0;
                 }
             }
-            self.rx = None;
         }
     }
 
@@ -1062,16 +1267,30 @@ impl CurlyApp {
         let Some(pending) = self.pending_extraction.take() else {
             return;
         };
+        if let Some(notice) = self.apply_extraction_for(pending, response) {
+            self.session_notice = Some(notice);
+        }
+    }
+
+    /// The extraction-on-success logic itself, decoupled from *which* tab's
+    /// `pending_extraction`/`session_notice` it's operating on — reused by
+    /// `apply_pending_extraction` (active tab) and
+    /// `poll_background_tab_responses` (any other tab). `None` means
+    /// "nothing to report" (a non-2xx response — an expected absence, not
+    /// a problem); `Some(message)` covers both an extraction failure and a
+    /// success.
+    fn apply_extraction_for(
+        &mut self,
+        pending: PendingExtraction,
+        response: &ResponseSummary,
+    ) -> Option<String> {
         if !(200..300).contains(&response.status) {
-            return;
+            return None;
         }
 
         let extracted = match extraction::apply(&pending.rules, response, &pending.variables) {
             Ok(e) => e,
-            Err(e) => {
-                self.session_notice = Some(format!("extraction failed: {e}"));
-                return;
-            }
+            Err(e) => return Some(format!("extraction failed: {e}")),
         };
 
         let result: anyhow::Result<()> = match self.active_project() {
@@ -1099,7 +1318,7 @@ impl CurlyApp {
         if result.is_ok() {
             self.refresh_session_variables();
         }
-        self.session_notice = Some(message);
+        Some(message)
     }
 
     /// Build a `SavedRequest` from the editor's current fields (FR-20) — a
@@ -1138,7 +1357,12 @@ impl CurlyApp {
                 token: self.auth.token.clone(),
             }),
         };
-        saved.extract = self.extract_rules.clone();
+        saved.extract = self
+            .extract_rules
+            .iter()
+            .filter(|e| !e.name().trim().is_empty())
+            .cloned()
+            .collect();
         Ok(saved)
     }
 
@@ -1166,6 +1390,7 @@ impl CurlyApp {
             body: std::mem::take(&mut self.body),
             auth: std::mem::take(&mut self.auth),
             response: self.response.take(),
+            response_image: self.response_image.take(),
             in_flight: std::mem::take(&mut self.in_flight),
             rx: self.rx.take(),
             var_overrides: std::mem::take(&mut self.var_overrides),
@@ -1175,13 +1400,18 @@ impl CurlyApp {
             load_notice: self.load_notice.take(),
             loaded_request: self.loaded_request.take(),
             response_search: std::mem::take(&mut self.response_search),
+            response_search_current: std::mem::take(&mut self.response_search_current),
             response_save_rx: self.response_save_rx.take(),
             response_save_notice: self.response_save_notice.take(),
+            // The active tab never shows its own "response ready" badge —
+            // see the field's doc comment.
+            has_unseen_response: false,
         }
     }
 
     /// The inverse of `take_active_tab` — moves `tab`'s fields back onto
-    /// `self`, making it the live, active state.
+    /// `self`, making it the live, active state. `tab.has_unseen_response`
+    /// is deliberately dropped here — see that field's doc comment.
     fn restore_active_tab(&mut self, tab: RequestTab) {
         self.method = tab.method;
         self.url = tab.url;
@@ -1189,6 +1419,7 @@ impl CurlyApp {
         self.body = tab.body;
         self.auth = tab.auth;
         self.response = tab.response;
+        self.response_image = tab.response_image;
         self.in_flight = tab.in_flight;
         self.rx = tab.rx;
         self.var_overrides = tab.var_overrides;
@@ -1198,6 +1429,7 @@ impl CurlyApp {
         self.load_notice = tab.load_notice;
         self.loaded_request = tab.loaded_request;
         self.response_search = tab.response_search;
+        self.response_search_current = tab.response_search_current;
         self.response_save_rx = tab.response_save_rx;
         self.response_save_notice = tab.response_save_notice;
     }
@@ -1316,6 +1548,7 @@ impl CurlyApp {
             name,
             error: None,
         });
+        self.path_dialog = None;
     }
 
     fn cancel_save_dialog(&mut self) {
@@ -1514,6 +1747,181 @@ impl CurlyApp {
             Err(e) => self.collection_notice = Some(format!("failed to delete \"{path}\": {e}")),
         }
     }
+
+    /// Open the "Rename/Move" or "Duplicate" dialog for the request at
+    /// `path` in `collection` (the sidebar tree's "✎"/"⧉" buttons),
+    /// pre-filled from its current location.
+    fn open_path_dialog(&mut self, mode: PathDialogMode, collection: String, path: String) {
+        let (folder_path, name) = split_folder_and_name(&path);
+        self.path_dialog = Some(PathDialog {
+            mode,
+            collection,
+            old_path: path,
+            folder_path,
+            name,
+            error: None,
+        });
+        self.save_dialog = None;
+    }
+
+    fn cancel_path_dialog(&mut self) {
+        self.path_dialog = None;
+    }
+
+    /// Render the "Rename/Move"/"Duplicate" floating window if `path_dialog`
+    /// is `Some` — same local-flags structure as `show_save_dialog`, for
+    /// the same borrow-checking reason (acting on `self` while `dialog`
+    /// still borrows `self.path_dialog` wouldn't compile).
+    fn show_path_dialog(&mut self, ctx: &egui::Context) {
+        let mut confirmed = false;
+        let mut cancelled = false;
+
+        if let Some(dialog) = self.path_dialog.as_mut() {
+            let title = match dialog.mode {
+                PathDialogMode::Rename => "Rename / Move Request",
+                PathDialogMode::Duplicate => "Duplicate Request",
+            };
+            let mut open = true;
+            egui::Window::new(title)
+                .collapsible(false)
+                .resizable(false)
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    ui.label(format!("From: \"{}/{}\"", dialog.collection, dialog.old_path));
+                    ui.horizontal(|ui| {
+                        ui.label("Folder (optional):");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut dialog.folder_path).hint_text("Auth/OAuth"),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Name:");
+                        ui.text_edit_singleline(&mut dialog.name);
+                    });
+                    if let Some(err) = &dialog.error {
+                        ui.colored_label(egui::Color32::from_rgb(220, 80, 80), err);
+                    }
+                    ui.horizontal(|ui| {
+                        let confirm_label = match dialog.mode {
+                            PathDialogMode::Rename => "Rename",
+                            PathDialogMode::Duplicate => "Duplicate",
+                        };
+                        if ui.button(confirm_label).clicked() {
+                            confirmed = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            cancelled = true;
+                        }
+                    });
+                });
+            if !open {
+                cancelled = true;
+            }
+        }
+
+        if confirmed {
+            self.confirm_path_dialog();
+        } else if cancelled {
+            self.cancel_path_dialog();
+        }
+    }
+
+    /// Apply the rename/move or duplicate the dialog describes. On success,
+    /// a rename that moved the currently *loaded* request updates
+    /// `loaded_request` to point at its new location (mirrors
+    /// `delete_saved_request`'s "is this the thing that's loaded?" check);
+    /// a duplicate leaves `loaded_request` untouched — the original stays
+    /// loaded, the copy isn't auto-loaded.
+    fn confirm_path_dialog(&mut self) {
+        let Some(dialog) = self.path_dialog.as_ref() else {
+            return;
+        };
+        let name = dialog.name.trim().to_string();
+        if name.is_empty() {
+            self.path_dialog.as_mut().unwrap().error = Some("name is required".to_string());
+            return;
+        }
+        let folder = dialog.folder_path.trim().trim_matches('/').to_string();
+        let new_path = if folder.is_empty() { name } else { format!("{folder}/{name}") };
+        let collection_name = dialog.collection.clone();
+        let old_path = dialog.old_path.clone();
+        let mode = dialog.mode;
+
+        let result: anyhow::Result<()> = match self.active_project() {
+            Some(project) => (|| {
+                let mut collection = project.storage.load_collection(&collection_name)?;
+                match mode {
+                    PathDialogMode::Rename => collection.rename_or_move_request(&old_path, &new_path)?,
+                    PathDialogMode::Duplicate => collection.duplicate_request(&old_path, &new_path)?,
+                }
+                project.storage.save_collection(&collection)
+            })(),
+            None => Err(anyhow::anyhow!("no project is open")),
+        };
+
+        match result {
+            Ok(()) => {
+                if mode == PathDialogMode::Rename
+                    && self
+                        .loaded_request
+                        .as_ref()
+                        .is_some_and(|r| r.collection == collection_name && r.path == old_path)
+                {
+                    self.loaded_request = Some(LoadedRequestRef {
+                        collection: collection_name.clone(),
+                        path: new_path.clone(),
+                    });
+                }
+                self.refresh_project_lists();
+                self.collection_notice = Some(match mode {
+                    PathDialogMode::Rename => format!("renamed \"{old_path}\" to \"{new_path}\""),
+                    PathDialogMode::Duplicate => format!("duplicated \"{old_path}\" to \"{new_path}\""),
+                });
+                self.path_dialog = None;
+            }
+            Err(e) => self.path_dialog.as_mut().unwrap().error = Some(e.to_string()),
+        }
+    }
+
+    /// Snapshot the fields `persistence` cares about — every tab, with the
+    /// active index's live top-level fields substituted in for
+    /// `tabs[active_tab_idx]`'s own stale placeholder (same "idx ==
+    /// active_tab_idx reads self, else reads tabs[idx]" pattern
+    /// `tab_label` uses).
+    fn persisted_state(&self) -> persistence::PersistedState {
+        let tabs = (0..self.tabs.len())
+            .map(|i| {
+                if i == self.active_tab_idx {
+                    persistence::PersistedTab {
+                        method: self.method.clone(),
+                        url: self.url.clone(),
+                        headers: self.headers.clone(),
+                        body: self.body.clone(),
+                        auth: self.auth.clone(),
+                        loaded_request: self.loaded_request.clone(),
+                    }
+                } else {
+                    let tab = &self.tabs[i];
+                    persistence::PersistedTab {
+                        method: tab.method.clone(),
+                        url: tab.url.clone(),
+                        headers: tab.headers.clone(),
+                        body: tab.body.clone(),
+                        auth: tab.auth.clone(),
+                        loaded_request: tab.loaded_request.clone(),
+                    }
+                }
+            })
+            .collect();
+
+        persistence::PersistedState {
+            zoom: self.last_zoom,
+            theme: self.last_theme.into(),
+            theme_follows_system: self.theme_follows_system,
+            tabs,
+            active_tab_idx: self.active_tab_idx,
+        }
+    }
 }
 
 /// Split `"Auth/OAuth/login"` into (`"Auth/OAuth"`, `"login"`) — a bare
@@ -1526,19 +1934,31 @@ fn split_folder_and_name(path: &str) -> (String, String) {
     }
 }
 
-/// Detect the OS's light/dark preference on GNOME via `gsettings` — the
-/// same source GTK/GNOME apps themselves read. Needed because winit 0.30
+/// Detect the OS's light/dark preference. Needed because winit 0.30
 /// (egui/eframe's windowing backend) unconditionally returns `None` from
 /// `EventLoop::system_theme()` on both X11 and Wayland, so egui's own
 /// `ThemePreference::System` (the default) silently falls back to a
-/// hardcoded dark theme on Linux rather than actually following the OS —
-/// there's no live "OS theme changed" signal wired up either way; this is
-/// a one-shot check at startup, not a running watch (see the sidebar's
-/// light/dark toggle for changing it after launch). Returns `None` (leave
-/// egui's own default alone) if `gsettings` isn't installed, the call
-/// fails, or the value doesn't parse — most likely a non-GNOME desktop,
-/// where this specific heuristic doesn't apply.
+/// hardcoded dark theme on Linux rather than actually following the OS.
+/// Dispatches on `$XDG_CURRENT_DESKTOP` to the matching desktop-specific
+/// heuristic (GNOME via `gsettings`, KDE via reading `kdeglobals` directly);
+/// `None` (leave whatever theme is already set alone) on any other desktop,
+/// or if the check fails — the manual toggle always works regardless.
+/// Called both once at startup and periodically while `theme_follows_system`
+/// is true (see `ui()`), so it needs to stay cheap.
 fn detect_system_theme() -> Option<egui::Theme> {
+    let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().to_lowercase();
+    if desktop.contains("gnome") {
+        detect_gnome_theme()
+    } else if desktop.contains("kde") {
+        detect_kde_theme()
+    } else {
+        None
+    }
+}
+
+/// GNOME's light/dark preference via `gsettings` — the same source GTK/GNOME
+/// apps themselves read.
+fn detect_gnome_theme() -> Option<egui::Theme> {
     let output = std::process::Command::new("gsettings")
         .args(["get", "org.gnome.desktop.interface", "color-scheme"])
         .output()
@@ -1559,6 +1979,41 @@ fn parse_gnome_color_scheme(raw: &str) -> Option<egui::Theme> {
         "prefer-light" | "default" => Some(egui::Theme::Light),
         _ => None,
     }
+}
+
+/// KDE's light/dark preference by reading `~/.config/kdeglobals` directly
+/// (every KDE user has this file) rather than shelling out to
+/// `kreadconfig5`/`kreadconfig6` — the binary name differs between KDE
+/// major versions and may not even be installed, whereas the config file
+/// itself is guaranteed to exist. Looks for the `[General]` section's
+/// `ColorScheme=` key and treats a scheme name containing "dark"
+/// (case-insensitively — e.g. `BreezeDark`) as dark, anything else as
+/// light; `None` if the file, section, or key is missing.
+fn detect_kde_theme() -> Option<egui::Theme> {
+    let path = dirs::config_dir()?.join("kdeglobals");
+    let contents = std::fs::read_to_string(path).ok()?;
+    parse_kde_globals(&contents)
+}
+
+fn parse_kde_globals(contents: &str) -> Option<egui::Theme> {
+    let mut in_general = false;
+    for line in contents.lines() {
+        let line = line.trim();
+        if let Some(section) = line.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+            in_general = section == "General";
+            continue;
+        }
+        if in_general {
+            if let Some(value) = line.strip_prefix("ColorScheme=") {
+                return Some(if value.to_lowercase().contains("dark") {
+                    egui::Theme::Dark
+                } else {
+                    egui::Theme::Light
+                });
+            }
+        }
+    }
+    None
 }
 
 // --- FR-22: JSON syntax highlighting + in-body search (Response pane) ---
@@ -1652,6 +2107,13 @@ struct JsonColors {
     default: egui::Color32,
     highlight_bg: egui::Color32,
     highlight_fg: egui::Color32,
+    /// The *current* find-next/previous match gets this instead of
+    /// `highlight_bg`/`highlight_fg` — a visibly different color from every
+    /// other match's plain highlight, since otherwise "next"/"previous"
+    /// has nothing distinguishable to show (every match already looks the
+    /// same under highlight-all).
+    current_highlight_bg: egui::Color32,
+    current_highlight_fg: egui::Color32,
 }
 
 fn json_colors(dark_mode: bool) -> JsonColors {
@@ -1664,6 +2126,8 @@ fn json_colors(dark_mode: bool) -> JsonColors {
             default: egui::Color32::from_rgb(220, 220, 220),
             highlight_bg: egui::Color32::from_rgb(255, 220, 90),
             highlight_fg: egui::Color32::BLACK,
+            current_highlight_bg: egui::Color32::from_rgb(255, 140, 0),
+            current_highlight_fg: egui::Color32::BLACK,
         }
     } else {
         JsonColors {
@@ -1674,6 +2138,8 @@ fn json_colors(dark_mode: bool) -> JsonColors {
             default: egui::Color32::from_rgb(30, 30, 30),
             highlight_bg: egui::Color32::from_rgb(255, 230, 120),
             highlight_fg: egui::Color32::BLACK,
+            current_highlight_bg: egui::Color32::from_rgb(255, 140, 0),
+            current_highlight_fg: egui::Color32::BLACK,
         }
     }
 }
@@ -1681,20 +2147,35 @@ fn json_colors(dark_mode: bool) -> JsonColors {
 /// Append `text` to `job` in `color`, splitting further at every
 /// case-insensitive occurrence of `search_lower` (already lowercased by
 /// the caller, once, rather than per-call) to give matches a highlighted
-/// background — a no-op split when `search_lower` is empty. Byte-slicing
-/// `text`/`text.to_lowercase()` in lockstep is exact for ASCII search
-/// terms (the overwhelming common case — field names, tokens); a
-/// non-ASCII search term whose lowercasing changes byte length could
-/// mis-slice, an accepted approximation rather than pulling in a full
-/// Unicode-aware search library for a highlight-only feature.
+/// background — a no-op split when `search_lower` is empty. `token_start`
+/// is `text`'s own byte offset within the *whole* response body (0 for a
+/// single-call-covers-everything caller like `plain_layout_job`, a
+/// per-token offset for `json_layout_job`, which calls this once per
+/// syntax token) — added to a local match's offset to get its global byte
+/// position, compared against `current_match_byte` (the byte offset of
+/// whichever match find-next/previous currently points at) so that one
+/// match, if any falls within this call, renders with
+/// `current_highlight_bg`/`current_highlight_fg` instead of the plain
+/// `highlight_bg`/`highlight_fg` every other match gets — otherwise
+/// next/previous would have no visible effect, since every match already
+/// looks identical under highlight-all. Byte-slicing `text`/
+/// `text.to_lowercase()` in lockstep is exact for ASCII search terms (the
+/// overwhelming common case — field names, tokens); a non-ASCII search
+/// term whose lowercasing changes byte length could mis-slice, an accepted
+/// approximation rather than pulling in a full Unicode-aware search
+/// library for a highlight-only feature.
 fn append_with_search_highlight(
     job: &mut egui::text::LayoutJob,
     text: &str,
     color: egui::Color32,
     font_id: egui::FontId,
     search_lower: &str,
+    token_start: usize,
+    current_match_byte: Option<usize>,
     highlight_bg: egui::Color32,
     highlight_fg: egui::Color32,
+    current_highlight_bg: egui::Color32,
+    current_highlight_fg: egui::Color32,
 ) {
     if search_lower.is_empty() {
         job.append(text, 0.0, egui::text::TextFormat {
@@ -1718,10 +2199,16 @@ fn append_with_search_highlight(
             });
         }
         if let Some(matched) = text.get(match_start..match_end) {
+            let is_current = current_match_byte == Some(token_start + match_start);
+            let (bg, fg) = if is_current {
+                (current_highlight_bg, current_highlight_fg)
+            } else {
+                (highlight_bg, highlight_fg)
+            };
             job.append(matched, 0.0, egui::text::TextFormat {
                 font_id: font_id.clone(),
-                color: highlight_fg,
-                background: highlight_bg,
+                color: fg,
+                background: bg,
                 ..Default::default()
             });
         }
@@ -1737,8 +2224,15 @@ fn append_with_search_highlight(
 }
 
 /// Build a syntax-highlighted (+ search-highlighted) `LayoutJob` for a JSON
-/// response body.
-fn json_layout_job(text: &str, dark_mode: bool, search_lower: &str) -> egui::text::LayoutJob {
+/// response body. `current_match_byte` — see `append_with_search_highlight`'s
+/// doc comment — is the byte offset (into `text`) of whichever match
+/// find-next/previous currently points at, or `None`.
+fn json_layout_job(
+    text: &str,
+    dark_mode: bool,
+    search_lower: &str,
+    current_match_byte: Option<usize>,
+) -> egui::text::LayoutJob {
     let colors = json_colors(dark_mode);
     let font_id = egui::FontId::monospace(13.0);
     let mut job = egui::text::LayoutJob::default();
@@ -1751,14 +2245,19 @@ fn json_layout_job(text: &str, dark_mode: bool, search_lower: &str) -> egui::tex
             JsonTokenKind::Punct => colors.punct,
             JsonTokenKind::Other => colors.default,
         };
+        let token_start = range.start;
         append_with_search_highlight(
             &mut job,
             &text[range],
             color,
             font_id.clone(),
             search_lower,
+            token_start,
+            current_match_byte,
             colors.highlight_bg,
             colors.highlight_fg,
+            colors.current_highlight_bg,
+            colors.current_highlight_fg,
         );
     }
 
@@ -1767,7 +2266,12 @@ fn json_layout_job(text: &str, dark_mode: bool, search_lower: &str) -> egui::tex
 
 /// Same search-highlighting as `json_layout_job`, but no syntax coloring —
 /// for a non-JSON response body (plain text, XML, HTML, ...).
-fn plain_layout_job(text: &str, dark_mode: bool, search_lower: &str) -> egui::text::LayoutJob {
+fn plain_layout_job(
+    text: &str,
+    dark_mode: bool,
+    search_lower: &str,
+    current_match_byte: Option<usize>,
+) -> egui::text::LayoutJob {
     let colors = json_colors(dark_mode);
     let font_id = egui::FontId::monospace(13.0);
     let mut job = egui::text::LayoutJob::default();
@@ -1777,8 +2281,12 @@ fn plain_layout_job(text: &str, dark_mode: bool, search_lower: &str) -> egui::te
         colors.default,
         font_id,
         search_lower,
+        0,
+        current_match_byte,
         colors.highlight_bg,
         colors.highlight_fg,
+        colors.current_highlight_bg,
+        colors.current_highlight_fg,
     );
     job
 }
@@ -1791,6 +2299,70 @@ fn count_matches(text: &str, search: &str) -> usize {
         return 0;
     }
     text.to_lowercase().matches(&search.to_lowercase()).count()
+}
+
+// --- FR-22: image preview for a response ---
+
+/// Whether `headers` name a `Content-Type` starting with `image/` — the
+/// signal for switching the Response pane from the text/JSON viewer to an
+/// image preview. Header-name matching is case-insensitive (HTTP headers
+/// are); the value check only looks at the prefix, ignoring anything after
+/// a `;` (e.g. `image/png; charset=binary`, unusual but not unheard of).
+fn is_image_content_type(headers: &[(String, String)]) -> bool {
+    headers.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("content-type")
+            && value.split(';').next().unwrap_or("").trim().to_lowercase().starts_with("image/")
+    })
+}
+
+/// A filename extension guessed from the `Content-Type` header (`png` for
+/// `image/png`, `jpg` for `image/jpeg`, etc.) — purely a starting suggestion
+/// for "Save Response…"'s default filename, same spirit as the existing
+/// `response.json`/`response.txt` guess for text bodies. Falls back to
+/// `bin` if there's no recognizable `image/*` content type.
+fn image_file_extension(headers: &[(String, String)]) -> String {
+    headers
+        .iter()
+        .find_map(|(name, value)| {
+            if !name.eq_ignore_ascii_case("content-type") {
+                return None;
+            }
+            let subtype = value.split(';').next().unwrap_or("").trim().to_lowercase();
+            subtype.strip_prefix("image/").map(|s| match s {
+                "jpeg" => "jpg".to_string(),
+                other => other.to_string(),
+            })
+        })
+        .unwrap_or_else(|| "bin".to_string())
+}
+
+// --- FR-22: find-next/scroll-to-match for the response search ---
+
+/// Byte offsets (into `text`) of every case-insensitive occurrence of
+/// `search_lower`, in order — the same lowercasing approach
+/// `count_matches`/`append_with_search_highlight` already use (and the
+/// same accepted assumption that lowercasing doesn't shift byte length for
+/// realistic search terms/content). `search_lower` must already be
+/// lowercased by the caller (avoids repeating that work — `find_next_match`
+/// below shares one lowercased copy across a whole frame).
+fn find_match_starts(text: &str, search_lower: &str) -> Vec<usize> {
+    if search_lower.is_empty() {
+        return Vec::new();
+    }
+    text.to_lowercase().match_indices(search_lower).map(|(i, _)| i).collect()
+}
+
+/// Advance (or retreat) `current` by one match, wrapping in both directions —
+/// `total == 0` always yields `0` (nothing to wrap around).
+fn advance_match(current: usize, total: usize, forward: bool) -> usize {
+    if total == 0 {
+        return 0;
+    }
+    if forward {
+        (current + 1) % total
+    } else {
+        (current + total - 1) % total
+    }
 }
 
 // --- Toolbar: zoom ---
@@ -1832,11 +2404,31 @@ fn apply_ctrl_scroll_zoom(ctx: &egui::Context) {
 
 impl eframe::App for CurlyApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.last_zoom = ui.ctx().zoom_factor();
+        self.last_theme = ui.ctx().theme();
+
         self.poll_response();
         self.poll_project_dialog();
         self.poll_response_save();
         self.show_save_dialog(ui.ctx());
+        self.show_path_dialog(ui.ctx());
         apply_ctrl_scroll_zoom(ui.ctx());
+
+        // Live-follow the OS theme while the user hasn't manually pinned it
+        // (see `theme_follows_system`'s doc comment) — polled on a timer
+        // rather than reacting to some "OS theme changed" event, since none
+        // of winit/egui/gsettings/kdeglobals expose one on Linux.
+        if self.theme_follows_system {
+            if self.last_theme_check.elapsed() >= Duration::from_secs(2) {
+                self.last_theme_check = std::time::Instant::now();
+                if let Some(theme) = detect_system_theme() {
+                    if theme != ui.ctx().theme() {
+                        ui.ctx().set_theme(theme);
+                    }
+                }
+            }
+            ui.ctx().request_repaint_after(Duration::from_secs(2));
+        }
 
         egui::Panel::top("toolbar").show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -1861,6 +2453,7 @@ impl eframe::App for CurlyApp {
                 };
                 if ui.button(icon).on_hover_text(hover).clicked() {
                     ui.ctx().set_theme(next);
+                    self.theme_follows_system = false;
                 }
 
                 ui.separator();
@@ -1956,6 +2549,12 @@ impl eframe::App for CurlyApp {
                         }
                         TreeAction::Delete(path) => {
                             self.delete_saved_request(&collection_name, &path);
+                        }
+                        TreeAction::Rename(path) => {
+                            self.open_path_dialog(PathDialogMode::Rename, collection_name, path);
+                        }
+                        TreeAction::Duplicate(path) => {
+                            self.open_path_dialog(PathDialogMode::Duplicate, collection_name, path);
                         }
                     }
                 }
@@ -2109,8 +2708,13 @@ impl eframe::App for CurlyApp {
                     let mut close: Option<usize> = None;
                     for i in 0..self.tabs.len() {
                         let selected = i == self.active_tab_idx;
+                        let label = if !selected && self.tabs[i].has_unseen_response {
+                            format!("● {}", self.tab_label(i))
+                        } else {
+                            self.tab_label(i)
+                        };
                         ui.horizontal(|ui| {
-                            if ui.selectable_label(selected, self.tab_label(i)).clicked() {
+                            if ui.selectable_label(selected, label).clicked() {
                                 switch_to = Some(i);
                             }
                             if ui.small_button("✕").clicked() {
@@ -2143,6 +2747,83 @@ impl eframe::App for CurlyApp {
                     names.join(", ")
                 ));
             }
+
+            egui::CollapsingHeader::new(format!("Extraction rules ({})", self.extract_rules.len()))
+                .default_open(false)
+                .show(ui, |ui| {
+                    ui.weak(
+                        "Pulls a value out of a successful response into the active \
+                         environment's session — the GUI equivalent of `curly collections \
+                         add-request --extract-body/--extract-header/--extract-template`.",
+                    );
+                    let mut remove_idx = None;
+                    for (i, rule) in self.extract_rules.iter_mut().enumerate() {
+                        ui.horizontal(|ui| {
+                            let current_kind = extraction_kind(rule);
+                            let mut kind = current_kind;
+                            ui.selectable_value(&mut kind, ExtractionKindTag::Body, "Body");
+                            ui.selectable_value(&mut kind, ExtractionKindTag::Header, "Header");
+                            ui.selectable_value(&mut kind, ExtractionKindTag::Template, "Template");
+                            if kind != current_kind {
+                                *rule = rebuild_extraction(rule, kind);
+                            }
+                            match rule {
+                                Extraction::Body { name, path, secret } => {
+                                    ui.add(
+                                        egui::TextEdit::singleline(name)
+                                            .hint_text("NAME")
+                                            .desired_width(80.0),
+                                    );
+                                    ui.add(
+                                        egui::TextEdit::singleline(path)
+                                            .hint_text("JSON path")
+                                            .desired_width(140.0),
+                                    );
+                                    ui.checkbox(secret, "secret");
+                                }
+                                Extraction::Header { name, header, secret } => {
+                                    ui.add(
+                                        egui::TextEdit::singleline(name)
+                                            .hint_text("NAME")
+                                            .desired_width(80.0),
+                                    );
+                                    ui.add(
+                                        egui::TextEdit::singleline(header)
+                                            .hint_text("Header name")
+                                            .desired_width(140.0),
+                                    );
+                                    ui.checkbox(secret, "secret");
+                                }
+                                Extraction::Template { name, template, secret } => {
+                                    ui.add(
+                                        egui::TextEdit::singleline(name)
+                                            .hint_text("NAME")
+                                            .desired_width(80.0),
+                                    );
+                                    ui.add(
+                                        egui::TextEdit::singleline(template)
+                                            .hint_text("template, e.g. Bearer {{TOKEN}}")
+                                            .desired_width(180.0),
+                                    );
+                                    ui.checkbox(secret, "secret");
+                                }
+                            }
+                            if ui.small_button("✕").clicked() {
+                                remove_idx = Some(i);
+                            }
+                        });
+                    }
+                    if let Some(i) = remove_idx {
+                        self.extract_rules.remove(i);
+                    }
+                    if ui.button("+ Add rule").clicked() {
+                        self.extract_rules.push(Extraction::Body {
+                            name: String::new(),
+                            path: String::new(),
+                            secret: false,
+                        });
+                    }
+                });
 
             if let Some(notice) = &self.session_notice {
                 ui.colored_label(egui::Color32::from_rgb(120, 190, 130), notice);
@@ -2341,7 +3022,12 @@ impl eframe::App for CurlyApp {
             // that the method never touches `self.response`), so the actual
             // call has to wait until this match's borrow of `self.response`
             // has ended.
-            let mut save_response_request: Option<(String, String)> = None;
+            let mut save_response_request: Option<(Vec<u8>, String)> = None;
+            // Same deferred-write reason as `save_response_request` above —
+            // `ui.ctx().load_texture(...)` itself doesn't need `&mut self`,
+            // but caching the result into `self.response_image` does, and
+            // `resp` below still borrows `self.response` at that point.
+            let mut decoded_image_texture: Option<egui::TextureHandle> = None;
 
             match &self.response {
                 None if self.in_flight => {
@@ -2373,62 +3059,161 @@ impl eframe::App for CurlyApp {
                         }
                     });
 
-                    let is_json = serde_json::from_str::<serde_json::Value>(&resp.body).is_ok();
-                    let mut pretty = if is_json {
-                        serde_json::from_str::<serde_json::Value>(&resp.body)
-                            .ok()
-                            .and_then(|v| serde_json::to_string_pretty(&v).ok())
-                            .unwrap_or_else(|| resp.body.clone())
-                    } else {
-                        resp.body.clone()
-                    };
-
-                    ui.horizontal(|ui| {
-                        ui.label("Search:");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.response_search)
-                                .desired_width(180.0)
-                                .hint_text("filter body…"),
-                        );
-                        if !self.response_search.is_empty() {
-                            ui.weak(format!(
-                                "{} match(es)",
-                                count_matches(&pretty, &self.response_search)
-                            ));
+                    if is_image_content_type(&resp.headers) {
+                        if self.response_image.is_none() {
+                            if let Ok(decoded) = image::load_from_memory(&resp.body_bytes) {
+                                let rgba = decoded.into_rgba8();
+                                let (width, height) = rgba.dimensions();
+                                let color_image = egui::ColorImage::from_rgba_unmultiplied(
+                                    [width as usize, height as usize],
+                                    rgba.as_raw(),
+                                );
+                                decoded_image_texture = Some(ui.ctx().load_texture(
+                                    "response-image",
+                                    color_image,
+                                    egui::TextureOptions::default(),
+                                ));
+                            }
                         }
+
                         if ui.button("Save Response…").clicked() {
-                            let default_name =
-                                if is_json { "response.json" } else { "response.txt" }.to_string();
-                            save_response_request = Some((resp.body.clone(), default_name));
+                            let default_name = format!("response.{}", image_file_extension(&resp.headers));
+                            save_response_request = Some((resp.body_bytes.clone(), default_name));
                         }
-                    });
+                        if let Some(notice) = &self.response_save_notice {
+                            ui.colored_label(egui::Color32::from_rgb(120, 190, 130), notice);
+                        }
 
-                    if let Some(notice) = &self.response_save_notice {
-                        ui.colored_label(egui::Color32::from_rgb(120, 190, 130), notice);
-                    }
-
-                    let dark_mode = ui.visuals().dark_mode;
-                    let search_lower = self.response_search.to_lowercase();
-                    let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap_width: f32| {
-                        let text = buf.as_str();
-                        let mut job = if is_json {
-                            json_layout_job(text, dark_mode, &search_lower)
+                        match self.response_image.as_ref().or(decoded_image_texture.as_ref()) {
+                            Some(texture) => {
+                                egui::ScrollArea::both().show(ui, |ui| {
+                                    ui.add(
+                                        egui::Image::from_texture(texture)
+                                            .max_width(ui.available_width())
+                                            .shrink_to_fit(),
+                                    );
+                                });
+                            }
+                            None => {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(220, 80, 80),
+                                    "Content-Type looks like an image, but the body couldn't be decoded.",
+                                );
+                            }
+                        }
+                    } else {
+                        let is_json = serde_json::from_str::<serde_json::Value>(&resp.body).is_ok();
+                        let mut pretty = if is_json {
+                            serde_json::from_str::<serde_json::Value>(&resp.body)
+                                .ok()
+                                .and_then(|v| serde_json::to_string_pretty(&v).ok())
+                                .unwrap_or_else(|| resp.body.clone())
                         } else {
-                            plain_layout_job(text, dark_mode, &search_lower)
+                            resp.body.clone()
                         };
-                        job.wrap.max_width = wrap_width;
-                        ui.fonts_mut(|f| f.layout_job(job))
-                    };
 
-                    egui::ScrollArea::vertical().show(ui, |ui| {
-                        ui.add(
-                            egui::TextEdit::multiline(&mut pretty)
+                        let mut jump_to_current_match = false;
+                        ui.horizontal(|ui| {
+                            ui.label("Search:");
+                            let search_response = ui.add(
+                                egui::TextEdit::singleline(&mut self.response_search)
+                                    .desired_width(180.0)
+                                    .hint_text("filter body…"),
+                            );
+                            if search_response.changed() {
+                                self.response_search_current = 0;
+                            }
+                            if !self.response_search.is_empty() {
+                                let match_count = count_matches(&pretty, &self.response_search);
+                                if match_count > 0 {
+                                    if ui.small_button("◀").on_hover_text("Previous match").clicked() {
+                                        self.response_search_current = advance_match(
+                                            self.response_search_current,
+                                            match_count,
+                                            false,
+                                        );
+                                        jump_to_current_match = true;
+                                    }
+                                    ui.weak(format!(
+                                        "match {} of {match_count}",
+                                        self.response_search_current + 1
+                                    ));
+                                    if ui.small_button("▶").on_hover_text("Next match").clicked() {
+                                        self.response_search_current = advance_match(
+                                            self.response_search_current,
+                                            match_count,
+                                            true,
+                                        );
+                                        jump_to_current_match = true;
+                                    }
+                                } else {
+                                    ui.weak("0 match(es)");
+                                }
+                            }
+                            if ui.button("Save Response…").clicked() {
+                                let default_name =
+                                    if is_json { "response.json" } else { "response.txt" }.to_string();
+                                save_response_request = Some((resp.body_bytes.clone(), default_name));
+                            }
+                        });
+
+                        if let Some(notice) = &self.response_save_notice {
+                            ui.colored_label(egui::Color32::from_rgb(120, 190, 130), notice);
+                        }
+
+                        let dark_mode = ui.visuals().dark_mode;
+                        let search_lower = self.response_search.to_lowercase();
+                        // The byte offset of whichever match find-next/previous
+                        // currently points at (if any) — computed once per
+                        // frame and threaded into the layouter so *that*
+                        // match, specifically, renders in a different color
+                        // from every other match's plain highlight (see
+                        // `append_with_search_highlight`'s doc comment for why
+                        // that distinction matters: without it, clicking
+                        // next/previous has no visible effect at all, since
+                        // highlight-all already marks every match the same).
+                        let current_match_byte =
+                            find_match_starts(&pretty, &search_lower).get(self.response_search_current).copied();
+                        let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap_width: f32| {
+                            let text = buf.as_str();
+                            let mut job = if is_json {
+                                json_layout_job(text, dark_mode, &search_lower, current_match_byte)
+                            } else {
+                                plain_layout_job(text, dark_mode, &search_lower, current_match_byte)
+                            };
+                            job.wrap.max_width = wrap_width;
+                            ui.fonts_mut(|f| f.layout_job(job))
+                        };
+
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            let output = egui::TextEdit::multiline(&mut pretty)
+                                .id_salt("response_body")
                                 .font(egui::TextStyle::Monospace)
                                 .desired_width(f32::INFINITY)
-                                .layouter(&mut layouter),
-                        );
-                    });
+                                .layouter(&mut layouter)
+                                .show(ui);
+                            // Scroll to the *exact* on-screen position of the
+                            // current match, via the just-laid-out galley —
+                            // `Response::scroll_to_me` on the whole multiline
+                            // box wouldn't target a specific position inside
+                            // it, which is the point of "next"/"previous".
+                            if jump_to_current_match {
+                                if let Some(byte_start) = current_match_byte {
+                                    let char_start = pretty[..byte_start].chars().count();
+                                    let cursor_rect = output
+                                        .galley
+                                        .pos_from_cursor(egui::text::CCursor::new(char_start));
+                                    let screen_rect = cursor_rect.translate(output.galley_pos.to_vec2());
+                                    ui.scroll_to_rect(screen_rect, Some(egui::Align::Center));
+                                }
+                            }
+                        });
+                    }
                 }
+            }
+
+            if let Some(texture) = decoded_image_texture {
+                self.response_image = Some(texture);
             }
 
             if let Some((body, default_name)) = save_response_request {
@@ -2443,6 +3228,14 @@ impl eframe::App for CurlyApp {
         if self.in_flight {
             ui.ctx().request_repaint_after(Duration::from_millis(100));
         }
+    }
+
+    /// Persist zoom/theme/open tabs (see `persistence`) — the only hook
+    /// `eframe::App` gives on window close; there's no `egui::Context` here,
+    /// which is why `last_zoom`/`last_theme` are cached once per frame in
+    /// `ui()` instead of read directly.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        persistence::save(&self.persisted_state());
     }
 }
 
@@ -2483,6 +3276,12 @@ fn show_collection_tree(
             let label = format!("{:<7} {}", request.method, request.name);
             if ui.selectable_label(false, label).clicked() {
                 action = Some(TreeAction::Load(path.clone(), request.clone()));
+            }
+            if ui.small_button("✎").on_hover_text("Rename / Move").clicked() {
+                action = Some(TreeAction::Rename(path.clone()));
+            }
+            if ui.small_button("⧉").on_hover_text("Duplicate").clicked() {
+                action = Some(TreeAction::Duplicate(path.clone()));
             }
             if ui.small_button("✕").clicked() {
                 action = Some(TreeAction::Delete(path.clone()));
@@ -2840,6 +3639,7 @@ mod tests {
             status: 200,
             headers: vec![],
             body: "stale".to_string(),
+            body_bytes: b"stale".to_vec(),
             elapsed: Duration::from_millis(1),
         }));
         let saved = SavedRequest::new("get-me", Method::GET, "https://example.com");
@@ -3353,6 +4153,7 @@ mod tests {
             status,
             headers: vec![],
             body: body.to_string(),
+            body_bytes: body.as_bytes().to_vec(),
             elapsed: Duration::from_millis(1),
         }
     }
@@ -3703,6 +4504,76 @@ mod tests {
     }
 
     #[test]
+    fn build_saved_request_drops_blank_named_extraction_rules() {
+        let mut app = CurlyApp::default_state();
+        app.extract_rules = vec![
+            Extraction::Body {
+                name: "ID".to_string(),
+                path: "id".to_string(),
+                secret: false,
+            },
+            Extraction::Header {
+                name: "   ".to_string(),
+                header: "X-Trace".to_string(),
+                secret: false,
+            },
+        ];
+
+        let saved = app.build_saved_request("x").unwrap();
+
+        assert_eq!(saved.extract.len(), 1);
+        assert_eq!(saved.extract[0].name(), "ID");
+    }
+
+    #[test]
+    fn extraction_kind_identifies_each_variant() {
+        assert!(matches!(
+            extraction_kind(&Extraction::Body {
+                name: "a".to_string(),
+                path: "p".to_string(),
+                secret: false
+            }),
+            ExtractionKindTag::Body
+        ));
+        assert!(matches!(
+            extraction_kind(&Extraction::Header {
+                name: "a".to_string(),
+                header: "h".to_string(),
+                secret: false
+            }),
+            ExtractionKindTag::Header
+        ));
+        assert!(matches!(
+            extraction_kind(&Extraction::Template {
+                name: "a".to_string(),
+                template: "t".to_string(),
+                secret: false
+            }),
+            ExtractionKindTag::Template
+        ));
+    }
+
+    #[test]
+    fn rebuild_extraction_carries_over_name_and_secret() {
+        let rule = Extraction::Body {
+            name: "TOKEN".to_string(),
+            path: "token".to_string(),
+            secret: true,
+        };
+
+        let rebuilt = rebuild_extraction(&rule, ExtractionKindTag::Header);
+
+        match rebuilt {
+            Extraction::Header { name, header, secret } => {
+                assert_eq!(name, "TOKEN");
+                assert!(header.is_empty());
+                assert!(secret);
+            }
+            other => panic!("expected Header, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn build_saved_request_empty_body_is_none() {
         let app = CurlyApp::default_state();
         let saved = app.build_saved_request("x").unwrap();
@@ -3915,6 +4786,128 @@ mod tests {
     }
 
     #[test]
+    fn open_path_dialog_prefills_folder_and_name_from_the_path() {
+        let mut app = CurlyApp::default_state();
+        app.open_path_dialog(PathDialogMode::Rename, "my-api".to_string(), "Auth/login".to_string());
+
+        let dialog = app.path_dialog.unwrap();
+        assert_eq!(dialog.mode, PathDialogMode::Rename);
+        assert_eq!(dialog.collection, "my-api");
+        assert_eq!(dialog.old_path, "Auth/login");
+        assert_eq!(dialog.folder_path, "Auth");
+        assert_eq!(dialog.name, "login");
+    }
+
+    #[test]
+    fn opening_the_path_dialog_closes_an_open_save_dialog_and_vice_versa() {
+        let mut app = CurlyApp::default_state();
+        app.open_save_dialog();
+        assert!(app.save_dialog.is_some());
+
+        app.open_path_dialog(PathDialogMode::Rename, "my-api".to_string(), "login".to_string());
+        assert!(app.save_dialog.is_none());
+        assert!(app.path_dialog.is_some());
+
+        app.open_save_dialog();
+        assert!(app.path_dialog.is_none());
+    }
+
+    #[test]
+    fn cancel_path_dialog_clears_it() {
+        let mut app = CurlyApp::default_state();
+        app.open_path_dialog(PathDialogMode::Rename, "my-api".to_string(), "login".to_string());
+        app.cancel_path_dialog();
+        assert!(app.path_dialog.is_none());
+    }
+
+    #[test]
+    fn confirm_path_dialog_renames_and_updates_the_loaded_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = project_with(&dir);
+        let mut collection = Collection::new("my-api");
+        collection.add_request("login", SavedRequest::new("login", Method::GET, "https://example.com")).unwrap();
+        app.active_project().unwrap().storage.save_collection(&collection).unwrap();
+        app.loaded_request = Some(LoadedRequestRef {
+            collection: "my-api".to_string(),
+            path: "login".to_string(),
+        });
+        app.open_path_dialog(PathDialogMode::Rename, "my-api".to_string(), "login".to_string());
+        app.path_dialog.as_mut().unwrap().name = "sign-in".to_string();
+
+        app.confirm_path_dialog();
+
+        assert!(app.path_dialog.is_none());
+        let reloaded = app.active_project().unwrap().storage.load_collection("my-api").unwrap();
+        assert!(reloaded.find_request("login").is_none());
+        assert!(reloaded.find_request("sign-in").is_some());
+        assert_eq!(
+            app.loaded_request.unwrap(),
+            LoadedRequestRef {
+                collection: "my-api".to_string(),
+                path: "sign-in".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn confirm_path_dialog_duplicate_leaves_the_loaded_request_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = project_with(&dir);
+        let mut collection = Collection::new("my-api");
+        collection.add_request("login", SavedRequest::new("login", Method::GET, "https://example.com")).unwrap();
+        app.active_project().unwrap().storage.save_collection(&collection).unwrap();
+        app.loaded_request = Some(LoadedRequestRef {
+            collection: "my-api".to_string(),
+            path: "login".to_string(),
+        });
+        app.open_path_dialog(PathDialogMode::Duplicate, "my-api".to_string(), "login".to_string());
+        app.path_dialog.as_mut().unwrap().name = "login-copy".to_string();
+
+        app.confirm_path_dialog();
+
+        assert!(app.path_dialog.is_none());
+        let reloaded = app.active_project().unwrap().storage.load_collection("my-api").unwrap();
+        assert!(reloaded.find_request("login").is_some());
+        assert!(reloaded.find_request("login-copy").is_some());
+        assert_eq!(
+            app.loaded_request.unwrap(),
+            LoadedRequestRef {
+                collection: "my-api".to_string(),
+                path: "login".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn confirm_path_dialog_rejects_a_blank_name() {
+        let mut app = CurlyApp::default_state();
+        app.open_path_dialog(PathDialogMode::Rename, "my-api".to_string(), "login".to_string());
+        app.path_dialog.as_mut().unwrap().name = "  ".to_string();
+
+        app.confirm_path_dialog();
+
+        assert!(app.path_dialog.is_some());
+        assert!(app.path_dialog.unwrap().error.unwrap().contains("name"));
+    }
+
+    #[test]
+    fn confirm_path_dialog_reports_a_collision_without_closing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = project_with(&dir);
+        let mut collection = Collection::new("my-api");
+        collection.add_request("login", SavedRequest::new("login", Method::GET, "https://example.com")).unwrap();
+        collection.add_request("logout", SavedRequest::new("logout", Method::GET, "https://example.com")).unwrap();
+        app.active_project().unwrap().storage.save_collection(&collection).unwrap();
+        app.open_path_dialog(PathDialogMode::Rename, "my-api".to_string(), "login".to_string());
+        app.path_dialog.as_mut().unwrap().name = "logout".to_string();
+
+        app.confirm_path_dialog();
+
+        assert!(app.path_dialog.is_some());
+        assert!(app.path_dialog.unwrap().error.is_some());
+    }
+
+    #[test]
     fn save_over_loaded_opens_the_dialog_when_nothing_is_loaded() {
         let mut app = CurlyApp::default_state();
         app.save_over_loaded();
@@ -4034,6 +5027,34 @@ mod tests {
         assert_eq!(parse_gnome_color_scheme(""), None);
     }
 
+    #[test]
+    fn parse_kde_globals_dark_scheme() {
+        let contents = "[General]\nColorScheme=BreezeDark\nName=Breeze Dark\n";
+        assert_eq!(parse_kde_globals(contents), Some(egui::Theme::Dark));
+    }
+
+    #[test]
+    fn parse_kde_globals_light_scheme() {
+        let contents = "[General]\nColorScheme=Breeze\n";
+        assert_eq!(parse_kde_globals(contents), Some(egui::Theme::Light));
+    }
+
+    #[test]
+    fn parse_kde_globals_ignores_color_scheme_outside_general_section() {
+        let contents = "[Other]\nColorScheme=BreezeDark\n[General]\nSomethingElse=1\n";
+        assert_eq!(parse_kde_globals(contents), None);
+    }
+
+    #[test]
+    fn parse_kde_globals_missing_key_is_none() {
+        assert_eq!(parse_kde_globals("[General]\nSomethingElse=1\n"), None);
+    }
+
+    #[test]
+    fn parse_kde_globals_empty_is_none() {
+        assert_eq!(parse_kde_globals(""), None);
+    }
+
     // --- FR-22: JSON syntax highlighting + in-body search ---
 
     #[test]
@@ -4124,7 +5145,99 @@ mod tests {
         assert_eq!(count_matches("hello world", "xyz"), 0);
     }
 
+    #[test]
+    fn is_image_content_type_detects_image_png() {
+        let headers = vec![("Content-Type".to_string(), "image/png".to_string())];
+        assert!(is_image_content_type(&headers));
+    }
+
+    #[test]
+    fn is_image_content_type_is_case_insensitive_on_header_name() {
+        let headers = vec![("content-type".to_string(), "image/jpeg".to_string())];
+        assert!(is_image_content_type(&headers));
+    }
+
+    #[test]
+    fn is_image_content_type_ignores_charset_suffix() {
+        let headers = vec![("Content-Type".to_string(), "image/png; charset=binary".to_string())];
+        assert!(is_image_content_type(&headers));
+    }
+
+    #[test]
+    fn is_image_content_type_false_for_json() {
+        let headers = vec![("Content-Type".to_string(), "application/json".to_string())];
+        assert!(!is_image_content_type(&headers));
+    }
+
+    #[test]
+    fn is_image_content_type_false_with_no_header() {
+        assert!(!is_image_content_type(&[]));
+    }
+
+    #[test]
+    fn image_file_extension_maps_jpeg_to_jpg() {
+        let headers = vec![("Content-Type".to_string(), "image/jpeg".to_string())];
+        assert_eq!(image_file_extension(&headers), "jpg");
+    }
+
+    #[test]
+    fn image_file_extension_uses_subtype_directly_for_png() {
+        let headers = vec![("Content-Type".to_string(), "image/png".to_string())];
+        assert_eq!(image_file_extension(&headers), "png");
+    }
+
+    #[test]
+    fn image_file_extension_falls_back_to_bin_with_no_image_header() {
+        assert_eq!(image_file_extension(&[]), "bin");
+    }
+
+    #[test]
+    fn find_match_starts_empty_search_is_empty() {
+        assert_eq!(find_match_starts("hello world", ""), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn find_match_starts_no_match_is_empty() {
+        assert_eq!(find_match_starts("hello world", "xyz"), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn find_match_starts_finds_every_occurrence_in_order() {
+        assert_eq!(find_match_starts("Hello HELLO hello", "hello"), vec![0, 6, 12]);
+    }
+
+    #[test]
+    fn find_match_starts_single_match() {
+        assert_eq!(find_match_starts("hello world", "world"), vec![6]);
+    }
+
+    #[test]
+    fn advance_match_wraps_forward() {
+        assert_eq!(advance_match(0, 3, true), 1);
+        assert_eq!(advance_match(2, 3, true), 0);
+    }
+
+    #[test]
+    fn advance_match_wraps_backward() {
+        assert_eq!(advance_match(1, 3, false), 0);
+        assert_eq!(advance_match(0, 3, false), 2);
+    }
+
+    #[test]
+    fn advance_match_with_no_matches_stays_zero() {
+        assert_eq!(advance_match(0, 0, true), 0);
+        assert_eq!(advance_match(0, 0, false), 0);
+    }
+
     fn highlight_job(text: &str, search_lower: &str) -> egui::text::LayoutJob {
+        highlight_job_with_current(text, search_lower, None)
+    }
+
+    fn highlight_job_with_current(
+        text: &str,
+        search_lower: &str,
+        current_match_byte: Option<usize>,
+    ) -> egui::text::LayoutJob {
         let mut job = egui::text::LayoutJob::default();
         append_with_search_highlight(
             &mut job,
@@ -4132,7 +5245,11 @@ mod tests {
             egui::Color32::WHITE,
             egui::FontId::monospace(13.0),
             search_lower,
+            0,
+            current_match_byte,
             egui::Color32::YELLOW,
+            egui::Color32::BLACK,
+            egui::Color32::ORANGE,
             egui::Color32::BLACK,
         );
         job
@@ -4214,6 +5331,41 @@ mod tests {
         assert_eq!(job.sections[1].format.background, egui::Color32::YELLOW);
     }
 
+    #[test]
+    fn append_with_search_highlight_marks_the_current_match_distinctly() {
+        // Two matches ("X" at byte 1 and byte 3) — mark the second as current.
+        let job = highlight_job_with_current("aXbXc", "x", Some(3));
+        assert_eq!(job.sections[1].format.background, egui::Color32::YELLOW); // first X: not current
+        assert_eq!(job.sections[3].format.background, egui::Color32::ORANGE); // second X: current
+    }
+
+    #[test]
+    fn append_with_search_highlight_no_current_match_uses_plain_highlight_for_all() {
+        let job = highlight_job_with_current("aXbXc", "x", None);
+        assert_eq!(job.sections[1].format.background, egui::Color32::YELLOW);
+        assert_eq!(job.sections[3].format.background, egui::Color32::YELLOW);
+    }
+
+    #[test]
+    fn append_with_search_highlight_current_match_byte_is_relative_to_token_start() {
+        // token_start = 10, so a match at local byte 1 is global byte 11.
+        let mut job = egui::text::LayoutJob::default();
+        append_with_search_highlight(
+            &mut job,
+            "aXb",
+            egui::Color32::WHITE,
+            egui::FontId::monospace(13.0),
+            "x",
+            10,
+            Some(11),
+            egui::Color32::YELLOW,
+            egui::Color32::BLACK,
+            egui::Color32::ORANGE,
+            egui::Color32::BLACK,
+        );
+        assert_eq!(job.sections[1].format.background, egui::Color32::ORANGE);
+    }
+
     // --- Toolbar: zoom ---
     //
     // set_zoom_factor/apply_zoom_delta themselves aren't unit-tested here:
@@ -4293,6 +5445,78 @@ mod tests {
         app.switch_to_tab(1);
         assert_eq!(app.url, "https://example.com/second");
         assert_eq!(app.method, "DELETE");
+    }
+
+    #[test]
+    fn poll_response_marks_a_background_tab_with_an_unseen_response() {
+        let mut app = CurlyApp::default_state();
+        app.open_new_tab();
+        assert_eq!(app.active_tab_idx, 1);
+
+        let (tx, rx) = mpsc::channel();
+        app.tabs[0].rx = Some(rx);
+        app.tabs[0].in_flight = true;
+        tx.send(SendOutcome::Success(response(200, "ok"))).unwrap();
+
+        app.poll_response();
+
+        assert!(app.tabs[0].has_unseen_response);
+        assert!(!app.tabs[0].in_flight);
+        assert!(app.tabs[0].rx.is_none());
+        assert!(matches!(app.tabs[0].response, Some(Ok(_))));
+    }
+
+    #[test]
+    fn poll_response_does_not_mark_the_active_tab() {
+        let mut app = CurlyApp::default_state();
+        let (tx, rx) = mpsc::channel();
+        app.rx = Some(rx);
+        tx.send(SendOutcome::Success(response(200, "ok"))).unwrap();
+
+        app.poll_response();
+
+        // The active tab's "unseen" state has nowhere to live (no such
+        // field on CurlyApp) — its parked placeholder should also read
+        // false once it's actually parked.
+        let parked = app.take_active_tab();
+        assert!(!parked.has_unseen_response);
+    }
+
+    #[test]
+    fn switching_to_a_tab_leaves_a_fresh_unseen_marker_behind() {
+        let mut app = CurlyApp::default_state();
+        app.open_new_tab();
+        let (tx, rx) = mpsc::channel();
+        app.tabs[0].rx = Some(rx);
+        tx.send(SendOutcome::Success(response(200, "ok"))).unwrap();
+        app.poll_response();
+        assert!(app.tabs[0].has_unseen_response);
+
+        app.switch_to_tab(0);
+
+        // tabs[0]'s content (including the marker) moved onto `self`; the
+        // slot left behind (now holding the *other* tab, parked) is a
+        // fresh default.
+        assert!(!app.tabs[1].has_unseen_response);
+    }
+
+    #[test]
+    fn persisted_state_reflects_every_tabs_content_including_the_active_one() {
+        let mut app = CurlyApp::default_state();
+        app.url = "https://example.com/first".to_string();
+        app.method = "POST".to_string();
+
+        app.open_new_tab();
+        app.url = "https://example.com/second".to_string();
+        app.method = "DELETE".to_string();
+
+        let state = app.persisted_state();
+        assert_eq!(state.tabs.len(), 2);
+        assert_eq!(state.tabs[0].url, "https://example.com/first");
+        assert_eq!(state.tabs[0].method, "POST");
+        assert_eq!(state.tabs[1].url, "https://example.com/second");
+        assert_eq!(state.tabs[1].method, "DELETE");
+        assert_eq!(state.active_tab_idx, 1);
     }
 
     #[test]

@@ -207,6 +207,7 @@ mod tests {
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
             body: body.to_string(),
+            body_bytes: body.as_bytes().to_vec(),
             elapsed: Duration::from_millis(1),
         }
     }

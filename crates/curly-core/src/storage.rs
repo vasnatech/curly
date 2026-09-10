@@ -291,6 +291,45 @@ impl Collection {
         requests.len() != before
     }
 
+    /// Rename and/or move the request at `old_path` to `new_path` (FR-20) —
+    /// a no-op if the two paths are identical. Errors, leaving `old_path`
+    /// untouched, if nothing exists at `old_path` or something already
+    /// exists at `new_path` (checked *before* anything is removed, so a
+    /// failed rename never loses the original). Preserves the request's
+    /// `id`/body/auth/extraction rules exactly; any missing folders along
+    /// `new_path` are created, same as [`Collection::add_request`].
+    pub fn rename_or_move_request(&mut self, old_path: &str, new_path: &str) -> Result<()> {
+        if old_path == new_path {
+            return Ok(());
+        }
+        let request = self
+            .find_request(old_path)
+            .ok_or_else(|| anyhow!("no request found at \"{old_path}\""))?
+            .clone();
+        if self.find_request(new_path).is_some() {
+            bail!("a request already exists at \"{new_path}\"");
+        }
+        self.remove_request(old_path);
+        self.add_request(new_path, request)
+    }
+
+    /// Copy the request at `path` to `new_path` (FR-20), leaving the
+    /// original in place. The copy gets a fresh `id` — a duplicate is a
+    /// distinct entity, same as what "Save As" already produces via
+    /// [`SavedRequest::new`]. Errors if nothing exists at `path` or
+    /// something already exists at `new_path`.
+    pub fn duplicate_request(&mut self, path: &str, new_path: &str) -> Result<()> {
+        let mut request = self
+            .find_request(path)
+            .ok_or_else(|| anyhow!("no request found at \"{path}\""))?
+            .clone();
+        if self.find_request(new_path).is_some() {
+            bail!("a request already exists at \"{new_path}\"");
+        }
+        request.id = Uuid::new_v4();
+        self.add_request(new_path, request)
+    }
+
     /// Create a folder at `path` (and any missing ancestor folders).
     /// Idempotent: a no-op, not an error, if the exact folder already exists.
     pub fn add_folder(&mut self, path: &str) {

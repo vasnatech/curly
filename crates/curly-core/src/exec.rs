@@ -2,10 +2,11 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use reqwest::multipart;
+use serde::Serialize;
 
 use crate::model::{Auth, Body, MultipartField, Request};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ResponseSummary {
     pub status: u16,
     pub headers: Vec<(String, String)>,

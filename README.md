@@ -2,14 +2,12 @@
 
 A lightweight REST client, written in Rust, with two faces sharing one core:
 
-- **`curly` (CLI)** — a curl-like command-line tool for sending requests and managing saved collections/environments from the terminal.
-- **Curly (GUI)** — a Postman-like desktop app for building, organizing, and inspecting HTTP requests visually.
-
-Both ship as native, single-binary executables for Linux, macOS, and Windows.
+- **`curly` (CLI)** — a curl-like command-line tool for sending requests and managing saved collections/environments from the terminal. Ships as a native, single-binary executable for Linux, macOS, and Windows.
+- **Curly (GUI)** — a Postman-like desktop app for building, organizing, and inspecting HTTP requests visually. Now a separate **Tauri + React + TypeScript** app (`curly-gui-tauri/`), not bundled into the `curly` binary — see "Using the GUI" below.
 
 ## Status
 
-M1 (core + CLI one-shot mode), M2 (local storage — saved requests, collections, environments, `{{variable}}` substitution, history), and M3 (import from Postman Collection v2.1/Environment/Globals and curl command strings) are implemented, plus several post-M2 additions (folders/sub-folders, project-local storage via `curly init`, post-response variable extraction + sessions). **M4 (GUI) is in progress** — it can open a project, browse collections, load a saved request, switch environments to resolve `{{variable}}` tokens, build a request from scratch, send it, and show the response; see [docs/GUI.md](docs/GUI.md) for exactly what's built vs. not yet. See [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) and [docs/DESIGN.md](docs/DESIGN.md) for scope and shipped-milestone status, and [docs/ROADMAP.md](docs/ROADMAP.md) for not-yet-committed feature ideas.
+M1 (core + CLI one-shot mode), M2 (local storage — saved requests, collections, environments, `{{variable}}` substitution, history), and M3 (import from Postman Collection v2.1/Environment/Globals and curl command strings) are implemented, plus several post-M2 additions (folders/sub-folders, project-local storage via `curly init`, post-response variable extraction + sessions). **GUI (M4 + M8's redesign, now M9's rewrite) reaches the full designed feature set** — open/switch projects, browse collections with per-row rename/duplicate/delete/new-folder/new-request/save-all, environments with create/edit/delete, multiple request tabs with dirty tracking, ad-hoc variable overrides, an extraction-rule editor, dedicated Collection/Folder/Environment tabs, and a response pane with JSON syntax highlighting, search, and per-request history; see [docs/GUI.md](docs/GUI.md) for the full user guide and what's still not there (a packaged build, an automated frontend test suite). See [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) and [docs/DESIGN.md](docs/DESIGN.md) for scope and shipped-milestone status (§9's M9 entry has the GUI rewrite's own story), and [docs/ROADMAP.md](docs/ROADMAP.md) for not-yet-committed feature ideas.
 
 ## Using the CLI
 
@@ -22,7 +20,13 @@ cargo build --release
 
 ## Using the GUI
 
-See [docs/GUI.md](docs/GUI.md). Launch it with `curly` (no arguments) or `curly gui`.
+See [docs/GUI.md](docs/GUI.md) for the full guide, including Linux build prerequisites. In short:
+
+```sh
+cd curly-gui-tauri
+npm install        # first time only
+npm run tauri dev
+```
 
 ## Layout
 
@@ -30,8 +34,11 @@ See [docs/GUI.md](docs/GUI.md). Launch it with `curly` (no arguments) or `curly 
 curly/
 ├── crates/
 │   ├── curly-core/   # shared HTTP client, data model, storage
-│   ├── curly-cli/    # CLI binary ("curly"), also launches the GUI
-│   └── curly-gui/    # egui/eframe GUI (lib, linked into the "curly" binary — M4, in progress)
+│   ├── curly-cli/    # CLI binary ("curly")
+│   └── curly-gui/    # egui/eframe GUI — parked/frozen, superseded by curly-gui-tauri/ (see DESIGN.md's M9 entry)
+├── curly-gui-tauri/  # the current GUI: Tauri (Rust) + React/TypeScript, its own Cargo workspace
+│   ├── src-tauri/    # Rust shell — Tauri commands wrapping curly-core
+│   └── src/          # React frontend
 ├── docs/
-└── Cargo.toml         # workspace root
+└── Cargo.toml         # workspace root (crates/ only — curly-gui-tauri/src-tauri is deliberately its own workspace)
 ```

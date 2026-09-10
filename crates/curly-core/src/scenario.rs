@@ -237,7 +237,7 @@ pub fn resolve_request_ref<'a, V>(reference: &'a str, known_aliases: &BTreeMap<S
 /// `default`). Only a plain `request` node ever produces `HttpFailure`;
 /// every composite node either propagates a child's `Halted` or resolves to
 /// `Ok`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StepOutcome {
     Ok,
     HttpFailure,
@@ -248,7 +248,7 @@ pub enum StepOutcome {
 /// "back-to-back" log this module produces isn't a final decision on
 /// output format (still open, see ROADMAP.md), just a first pass simple
 /// enough to build on.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StepLog {
     pub reference: String,
     pub method: String,
@@ -260,6 +260,7 @@ pub struct StepLog {
     pub extracted: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScenarioRun {
     pub outcome: StepOutcome,
     pub steps: Vec<StepLog>,

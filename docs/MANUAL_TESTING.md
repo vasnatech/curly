@@ -249,7 +249,9 @@ EOF
 | 15.5 | `CURLY_DATA_DIR=/tmp/other2 curly env list` (run from inside `/tmp/proj/backend`, which has its own `.curly`) | Uses `/tmp/other2` — the env var beats auto-detection, even though a `.curly` is sitting right there. |
 | 15.6 | From a directory with no `.curly` anywhere in its ancestry and no `--data-dir`/`CURLY_DATA_DIR` set, `curly env list` | Falls back to the OS default (`~/.local/share/curly` on Linux) — unchanged pre-M2 behavior. |
 
-## 16. GUI (M4, first slice — see GUI.md)
+## 16. Rust/egui GUI (M4 + M8 — parked, see GUI.md and DESIGN.md §9's M9 entry)
+
+> **This GUI is superseded** by the Tauri + React rewrite (§20 below) and is no longer developed — `crates/curly-gui` is kept in the tree, frozen, as a fallback until it's deleted in its own commit. The rows below are left as-is, a historical record of what was verified about it; don't use them to judge the current GUI's behavior.
 
 Requires an actual display (X11 or Wayland) — not scriptable the way the rest of this doc is; run these by hand. `cargo build --release` first.
 
@@ -268,7 +270,7 @@ Requires an actual display (X11 or Wayland) — not scriptable the way the rest 
 | 16.11 | Add a header row with a blank name, leave it checked, send | No error — a blank-name header is silently excluded (matches `build_request`'s unit-tested behavior). |
 | 16.12 | Method → POST, Body → `{"a":1}`, send to `https://httpbin.org/post` | Response's `data`/`json` field shows `{"a": 1}` — raw body sent correctly. |
 | 16.13 | Send to an invalid URL (e.g. `not-a-url`) | Error shown in red in the response pane — window doesn't crash or freeze. |
-| 16.14 | Collapse/expand the "Headers", "Body", and "Response Headers" sections | Each toggles independently, state persists while the window stays open. |
+| 16.14 | Click between the request's **Headers**/**Body** sub-tabs and the response's **Body**/**Headers** sub-tabs | Each switches independently — request sub-tab selection doesn't affect the response's, and vice versa. |
 | 16.15 | `cargo build -p curly-cli --no-default-features --release` then run `./target/release/curly` (zero args) and `curly gui` | Both print "this build of curly was compiled without the gui feature..." and exit 1 — no window, no panic. |
 | 16.16 | Launch from a directory with no `.curly` anywhere above it (e.g. `cd /tmp && curly gui`) | Sidebar shows project label **"Default"**; Collections/Environments lists are empty unless the OS-wide default already has some. |
 | 16.17 | Launch from inside a project directory that already has a `.curly` (e.g. `cd health-record-backend-spring && curly gui`) | Sidebar auto-opens *that* project (label = the folder's name, e.g. "health-record-backend-spring") — same auto-detection the CLI uses, not "Default". |
@@ -295,14 +297,14 @@ Requires an actual display (X11 or Wayland) — not scriptable the way the rest 
 | 16.38 | Open a *different* project (via "Open Project…") while an environment is selected | The active environment resets to **"(none selected)"** — the old project's environment name may not even exist in the new one. |
 | 16.39 | Send a request whose URL/headers/body reference the same undefined variable twice (e.g. `{{TOKEN}}` in both a header and the body) with no environment resolving it | The error names `TOKEN` once, not twice — undefined variables are deduplicated in the message. |
 | 16.40 | Type a name into the "new environment" field with nothing entered, check the `+ New` button | Button is disabled (greyed out) — an empty name can't be submitted. |
-| 16.41 | Type `staging` into the field and click `+ New` | `staging` appears in the Environments list, is immediately selected, an "Edit \"staging\"" panel opens below (empty), the text field clears itself, and a green "created environment..." notice appears. Confirm with `curly env list` from a terminal — `staging` shows up there too. |
-| 16.42 | In the `staging` editor, click `+ Add variable`, type a key/value (e.g. `FOO`/`bar`), leave "secret" unchecked, click **Save** | A green "saved 1 variable(s)..." notice appears. Confirm with `curly env show staging` from a terminal — shows `FOO=bar`. |
+| 16.41 | Type `staging` into the field and click `+ New` | `staging` appears in the Environments list, is immediately selected, the main panel switches to the **Environment** tab showing "Environment: staging" (empty), the sidebar's text field clears itself, and a green "created environment..." notice appears. Confirm with `curly env list` from a terminal — `staging` shows up there too. |
+| 16.42 | In the Environment tab, click `+ Add variable`, type a key/value (e.g. `FOO`/`bar`), leave "secret" unchecked, click **Save** | A green "saved 1 variable(s)..." notice appears. Confirm with `curly env show staging` from a terminal — shows `FOO=bar`. |
 | 16.43 | Add another variable, check its "secret" box, type a key/value, click **Save** | `curly env show staging` shows the secret one masked as `***`, the non-secret one still in plain text — same masking `env show` always did, now reachable from data the GUI wrote. |
 | 16.44 | Add a variable row, leave its key blank, fill in a value, click **Save** | The blank-key row is silently dropped — `curly env show staging` doesn't show a nameless entry, and the notice's count doesn't include it. |
 | 16.45 | With `staging` selected and defining `{{FOO}}`, type `{{FOO}}` into the URL field's path and Send (to any reachable base) | Resolves to `bar` (or whatever you set) — confirms a GUI-created/edited environment is immediately usable for substitution, no restart needed. |
 | 16.46 | Click a variable row's `✕` in the editor, then **Save** | That variable is gone from `curly env show staging` afterward — removal via the GUI persists the same as an addition does. |
-| 16.47 | Click **Delete environment** on `staging` | `staging` disappears from the sidebar's Environments list immediately, the editor panel closes, a green "deleted environment..." notice appears, and `curly env list` from a terminal no longer lists it. |
-| 16.48 | Click a different, pre-existing environment (e.g. `health-record-backend-spring`'s `global`), edit one of its real variable values in the editor, click **Save**, then click **`(none selected)`** without reloading anything, then re-click `global` | Editor reloads from disk showing your saved edit — confirms Save actually persisted rather than just updating the in-memory row. |
+| 16.47 | Click **Delete environment** on `staging` (in the Environment tab) | `staging` disappears from the sidebar's Environments list immediately, the Environment tab shows "No environment selected", a green "deleted environment..." notice appears, and `curly env list` from a terminal no longer lists it. |
+| 16.48 | Click a different, pre-existing environment (e.g. `health-record-backend-spring`'s `global`), edit one of its real variable values in the Environment tab, click **Save**, then click **`(none selected)`** without reloading anything, then re-click `global` | Tab reloads from disk showing your saved edit — confirms Save actually persisted rather than just updating the in-memory row. |
 | 16.49 | With no environment selected, expand **"Variable overrides"**, add a row `BASE_URL` / `http://localhost:8080`, load `Auth/login` | The undefined-variable notice no longer lists `BASE_URL` — an override satisfies the check the same as an environment variable would. |
 | 16.50 | With that override still set and `EMAIL`/`PASSWORD` still undefined, click **Send** | Fails with an error naming `EMAIL`/`PASSWORD` only — confirms overrides participate in substitution per-key, not all-or-nothing. |
 | 16.51 | Select an environment that already defines `BASE_URL` (e.g. `global`), then add an override row `BASE_URL` with a *different* value, and Send a request using `{{BASE_URL}}` | Request goes to the override's value, not the environment's — confirms override precedence beats the selected environment. |
@@ -320,17 +322,17 @@ Requires an actual display (X11 or Wayland) — not scriptable the way the rest 
 | 16.63 | Load a request with **no** extraction rules (most requests) | No extraction note appears above the editor at all — the line only shows up when there's actually something to extract. |
 | 16.64 | Click **"Open Project…"** and watch the window (title bar / try dragging it) while the native picker is open | Window keeps responding — no OS "Not Responding" indicator, title bar redraws normally, you can move the window. Button reads "Choosing…" and is disabled for as long as the picker is open. |
 | 16.65 | Cancel that folder picker (Escape or its own Cancel) | Nothing changes — same as before (16.21), still true with the async picker. |
-| 16.66 | With no request loaded ("New request (not saved)" showing), fill in a URL/headers/body, click **Save** | Opens the Save dialog (no loaded request to overwrite) — Collection/Folder/Name fields, Folder empty by default. |
-| 16.67 | In that dialog, type a new collection name (one that doesn't exist yet) plus a name, click **Save** | Dialog closes; the new collection appears in the sidebar's Collections list with the one request in it; the "Editing…" label updates to the new collection/path; `curly collections show <name>` from a terminal confirms it. |
+| 16.66 | With no request loaded (breadcrumb reading "New request — not yet saved in a collection"), fill in a URL/headers/body, click the green **Save** button | Opens the Save dialog (no loaded request to overwrite) — Collection/Folder/Name fields, Folder empty by default. |
+| 16.67 | In that dialog, type a new collection name (one that doesn't exist yet) plus a name, click **Save** | Dialog closes; the new collection appears in the sidebar's Collections list with the one request in it; the breadcrumb now shows `<collection> › <name>` with the name editable; `curly collections show <name>` from a terminal confirms it. |
 | 16.68 | Click that request in the tree to reload it, change the URL, click **Save** (not Save As) | No dialog — overwrites immediately; `curly collections show` still shows it at the same path, `curly run <collection>/<path>` (or reloading it in the GUI) shows the updated URL. |
 | 16.69 | With that same request loaded, press **Ctrl+S** (Cmd+S on macOS) instead of clicking Save | Same as clicking Save — overwrites in place. |
 | 16.70 | With a request loaded, click **Save As…**, change only the Name field, click Save | A second request appears in the tree at the same folder, under the new name — the original is untouched (a "duplicate" via Save As). |
 | 16.71 | Click **Save As…** on a loaded request, don't change anything, click Save | Fails with an error in the dialog ("a request already exists at ...") — the dialog stays open, nothing is overwritten; use plain Save if overwriting was the goal. |
 | 16.72 | Leave Collection or Name blank in the Save dialog and click Save | A clear validation error appears in the dialog ("collection name is required" / "request name is required") — nothing is written, dialog stays open. |
 | 16.73 | Click **Cancel** in the Save dialog (or its window-close ✕) | Dialog closes, nothing is written, editor content is unchanged. |
-| 16.74 | Click **New**, then build a request from scratch, Send it | Works normally — Save/New/Delete are independent of Send; a from-scratch request with nothing loaded sends exactly as before this feature existed. |
-| 16.75 | Load a request, click a *different* request's **✕** in the tree (not the loaded one) | Deletes that other request; the "Editing…" label and loaded editor content are unaffected. |
-| 16.76 | Load a request, then click **its own ✕** in the tree | Deletes it; "Editing…" reverts to "New request (not saved)" — Save would now open the dialog instead of trying to overwrite something gone. |
+| 16.74 | Click **+** to open a fresh tab, then build a request from scratch, Send it | Works normally — Save/Delete are independent of Send; a from-scratch request with nothing loaded sends exactly as before this feature existed. (The old standalone "New" button was removed — a new tab is how you get a blank editor now, see 16.103+.) |
+| 16.75 | Load a request, hover a *different* request's row in the tree and click its **⋯** → **Delete** (not the loaded one) | Deletes that other request; the breadcrumb and loaded editor content are unaffected. |
+| 16.76 | Load a request, then hover its own row and click **⋯** → **Delete** | Deletes it; the breadcrumb reverts to "New request — not yet saved in a collection" — Save would now open the dialog instead of trying to overwrite something gone. |
 | 16.77 | Launch `curly gui` fresh on GNOME, note the initial theme | Matches whatever `gsettings get org.gnome.desktop.interface color-scheme` reports on that machine (`prefer-dark` → dark, `prefer-light`/`default` → light). |
 | 16.78 | Click the ☀/🌙 button next to "Project" in the sidebar | Theme switches instantly (backgrounds, text, all widgets) and the icon flips to the *other* mode's symbol. |
 | 16.79 | Click it again | Switches back — toggling is fully reversible, no restart needed. |
@@ -375,8 +377,8 @@ Requires an actual display (X11 or Wayland) — not scriptable the way the rest 
 | 16.118 | Enter a Bearer token of `{{TOKEN}}` with an active environment defining `TOKEN=abc123`, send | Sends with the real value substituted — confirms Authorization fields go through the same `{{variable}}` substitution as headers/body. |
 | 16.119 | Set Authorization to **Basic**, then switch to **Bearer**, then back to **Basic** | The username/password you typed are still there — switching kinds doesn't clear what you entered. |
 | 16.120 | Send a request with **no** Authorization set | No `Authorization` header appears on the wire (check against `https://httpbin.org/headers`) — `None` really means none, not an empty Basic/Bearer. |
-| 16.121 | With a project open, send a few different requests (mix of successful and a 404), then look at the sidebar's **History** section | Lists them newest-first, each showing method/status/url/elapsed — matches what `curly history` prints for the same project. |
-| 16.122 | Click a history entry | Loads its method/URL/headers/body straight into the current tab; the label under Save reads "New request (not saved)" (not tied to any collection entry). |
+| 16.121 | With a project open, send a few different requests (mix of successful and a 404), then switch the sidebar to its **History** tab | Lists them newest-first, each showing method/status/url/elapsed — matches what `curly history` prints for the same project. |
+| 16.122 | Click a history entry | Loads its method/URL/headers/body straight into the current tab; the breadcrumb reads "New request — not yet saved in a collection" (not tied to any collection entry). |
 | 16.123 | Send a request with a custom header, then click its History entry | The header reloads correctly (a non-redacted header round-trips exactly). |
 | 16.124 | Send a request with `Authorization: Bearer sekrit` set as a plain header (not via the Authorization section), then click its History entry | That header is **not** present in the reloaded editor — a yellow notice mentions redacted header(s) weren't restored. |
 | 16.125 | Send a request using the Authorization section's Bearer mode with a real token, then click its History entry | Authorization switches to Bearer but the Token field is **empty**; a yellow notice says credentials aren't stored in history and need re-entering. Confirms real credentials never round-trip through history, by design. |
@@ -391,11 +393,12 @@ Requires an actual display (X11 or Wayland) — not scriptable the way the rest 
 | 16.134 | Send a request from one tab, immediately switch to a different tab before the response arrives, then wait for it to land while looking at the other tab | A small **●** appears before the sending tab's label once its response lands. |
 | 16.135 | Click the tab with the **●** marker | The marker disappears and the response (now visible) matches what actually came back — confirms it wasn't silently dropped while backgrounded. |
 | 16.136 | Repeat 16.134/16.135 but with the backgrounded tab's request having an extraction rule | The session panel updates with the extracted value as soon as the response lands in the background, not only after switching to that tab. |
-| 16.137 | In the sidebar, click a saved request's **✎** | A "Rename / Move" window opens, pre-filled with its current folder/name. |
-| 16.138 | Change just the Name field and confirm | The request moves to the new name within the same folder; clicking the old name in the tree no longer finds it, the new name does — and if it was the currently-loaded request, the "Editing…" label under Save now shows the new path. |
-| 16.139 | Repeat 16.137/138 but change the Folder field to move it into a different (possibly new) folder | The request now appears under the new folder in the Collections tree; the new folder is created automatically if it didn't exist. |
-| 16.140 | Try to rename a request to a name that collides with an existing one in the same folder | An error appears in the dialog (not closed); the original request is still exactly where it was. |
-| 16.141 | Click a saved request's **⧉**, confirm with a different name | A second copy appears in the tree under the new name; the original is untouched and (if it was loaded) stays loaded — the copy is not automatically loaded. |
+| 16.137 | In the sidebar, hover a saved request's row (not clicking anywhere) | A **⋯** button fades in at the row's trailing edge — invisible until hovered. Move the mouse off the row (without opening the menu) | It disappears again. |
+| 16.138 | Hover a saved request's row, click **⋯** → **Rename** | A "Rename / Move" window opens, pre-filled with its current folder/name. |
+| 16.139 | Change just the Name field and confirm | The request moves to the new name within the same folder; clicking the old name in the tree no longer finds it, the new name does — and if it was the currently-loaded request, the breadcrumb now shows the new name. |
+| 16.140 | Repeat 16.138/139 but change the Folder field to move it into a different (possibly new) folder | The request now appears under the new folder in the Collections tree; the new folder is created automatically if it didn't exist. |
+| 16.141 | Try to rename a request to a name that collides with an existing one in the same folder | An error appears in the dialog (not closed); the original request is still exactly where it was. |
+| 16.141b | Hover a saved request's row, click **⋯** → **Duplicate**, confirm with a different name | A second copy appears in the tree under the new name; the original is untouched and (if it was loaded) stays loaded — the copy is not automatically loaded. |
 | 16.142 | Open the **Extraction rules** section on a blank request, click **+ Add rule** | A new row appears defaulting to **Body** kind, with empty Name/JSON path fields and an unchecked secret box. |
 | 16.143 | Fill in Name `TOKEN`, JSON path `access_token`, send a request whose JSON response has that field | The "On a successful send, extracts TOKEN..." note appears, and after sending, the Session panel shows `TOKEN` with the extracted value. |
 | 16.144 | Switch the same row's kind to **Header**, then to **Template** | The Name and secret checkbox keep their values across each switch; the second field's label changes (JSON path → Header name → Template) and its own value resets each time. |
@@ -408,6 +411,41 @@ Requires an actual display (X11 or Wayland) — not scriptable the way the rest 
 | 16.151 | With that image response showing, click **Save Response…**, save it, then open the saved file in an image viewer | The saved file opens correctly as a valid PNG — confirms bytes were written exactly, not the lossy-text copy. |
 | 16.152 | Send a request to `https://httpbin.org/image/jpeg` and `https://httpbin.org/image/webp` | Each renders correctly as an image too — confirms more than just PNG decodes (the `image` crate's jpeg/webp features are actually wired up, not just declared). |
 | 16.153 | Send a request whose `Content-Type` is `image/png` but whose body isn't actually a valid image (e.g. point it at an HTML error page while spoofing the header isn't possible from the GUI directly — instead, use a URL that's briefly wrong, or skip if not easily reproducible) | A red notice explains the body couldn't be decoded, rather than a blank pane or a panic. |
+| 16.154 | Launch `curly gui` and look at the top of the left sidebar | Two labels, **Project** and **History**, act as a tab switcher; **Project** is selected by default, showing Collections/Environments/Session stacked underneath. |
+| 16.155 | Click **History** | The Collections/Environments/Session stack is replaced by the send-history list (same content as the old always-visible History section); click **Project** to switch back. |
+| 16.156 | Hover a folder row in the Collections tree | A **⋯** fades in at its trailing edge (same hover-reveal as request rows, 16.137). Click it | A menu with **New Folder**, **New Request**, **Delete Folder** appears. |
+| 16.157 | With a folder's **⋯** menu open, click **New Folder** | A "New Folder" window opens showing "In: `<collection>/<folder>`"; type a name and click **Create** | The new folder appears nested under the original one in the tree; `curly collections show <collection>` from a terminal confirms the nesting. |
+| 16.158 | Hover the collection's own row (its name, above all folders/requests) and click its **⋯** | A menu with **New Folder**, **New Request**, **Save All** appears — same three actions as a folder's menu, minus Delete (deleting a whole collection isn't exposed here). |
+| 16.159 | Click the collection's **⋯** → **New Folder**, leaving the "In:" line reading just the collection name (no folder) | Creates a top-level folder in that collection. |
+| 16.160 | Click a folder's **⋯** → **New Request** | A blank tab opens and the Save dialog appears pre-filled with that folder (and collection); type a name, click Save | The new request appears in the tree, correctly nested in that folder. |
+| 16.161 | Click a folder's **⋯** → **Delete Folder** on an **empty** folder | The folder disappears from the tree immediately, a green notice confirms it. |
+| 16.162 | Click a folder's **⋯** → **Delete Folder** on a folder that still has requests/sub-folders in it | A notice reads something like "folder ... is not empty" — nothing is deleted; delete its contents individually first, then retry. |
+| 16.163 | Type a URL into a blank tab (don't save) | The tab's label shows `* GET <url>` — a leading `*` since there's nothing on disk yet for this content. |
+| 16.164 | Load a saved request, then edit its URL or body without saving | Its tab label gains a leading `* ` (e.g. `* GET Auth/login` becomes... actually the label itself is the request's path, so it reads `* Auth/login`) — the tab needs saving. |
+| 16.165 | With that tab dirty (16.164), click **Save** (or Ctrl/Cmd+S) | The `*` disappears from the tab label — saving cleared the dirty state. |
+| 16.166 | With a request loaded, edit the breadcrumb's trailing (editable) name field but don't click its own **✓** yet, then switch to a different tab and back | The tab's `*` is gone and the breadcrumb shows the *saved* name again — an unconfirmed rename draft doesn't survive a tab switch (a known, documented limitation; re-type it if you switch away by accident). |
+| 16.167 | Load a request, edit its breadcrumb name field, click the small **✓** next to it (not the main Save button) | The request is renamed everywhere at once: the tab label, the Collections tree, and (if you reload the collection from a terminal) `curly collections show` — confirms the breadcrumb's rename is independent of, and doesn't require, clicking the main Save button. |
+| 16.168 | Edit only the breadcrumb name (not the URL/body/headers) and save it via **✓** | Only the rename happens — the request's content on disk is untouched, since the breadcrumb's Save and the main Save/Save As buttons are two separate actions. |
+| 16.169 | Leave the breadcrumb name field blank and click **✓** | A notice says a name is required; nothing is renamed. |
+| 16.170 | With a request loaded, look at the row right above the method/URL/Send row | A breadcrumb reads `<collection> › <folder> › <name>` (or `<collection> › <name>` with no folder) with the trailing name in an editable text box — positioned *above* the URL row, not below it. |
+| 16.171 | With no request loaded, look at the same spot | Reads "New request — not yet saved in a collection", no editable field. |
+| 16.172 | Look at the **Save**/**Save As…** buttons below the URL row | Both are filled green, visually as prominent as the **Send** button (which stays its default color) — not plain/grey like an ordinary button. |
+| 16.173 | Click a collection's name (not its **⋯**, not a folder inside it) in the sidebar tree | A new main tab opens (or focuses, if already open) labeled with the collection's name, showing its top-level folders and requests plus **Save All**/**New Folder**/**New Request** buttons. |
+| 16.174 | In that Collection tab, click one of the listed folders | Opens (or focuses) *that* folder's own tab, showing its own requests/sub-folders. |
+| 16.175 | In a Folder tab, click one of its listed requests | Loads it into the request editor and switches the central view back to the normal request-editing layout (method/breadcrumb/response). |
+| 16.176 | With a Collection tab and a Folder tab both open, click each one's own **✕** in the tab strip | Each closes independently; closing the one that was currently showing falls back to the normal request view (whatever tab was last active). |
+| 16.177 | Open the same collection's tab twice in a row (click its name, navigate away, click its name again) | Only one tab for it ever exists — the second click just refocuses the existing one instead of duplicating it. |
+| 16.178 | Dirty two different requests that both belong to the same collection (edit but don't save either), open that collection's tab, click **Save All** | Both requests' tabs lose their `*`; a green notice reads "saved 2 request(s) in ...". Confirm via `curly collections show` that both edits actually landed on disk. |
+| 16.179 | With nothing dirty in a collection, open its tab and click **Save All** | A notice reads "nothing to save in ..." — no-op, no error. |
+| 16.180 | Look at the tab strip's trailing entries, after the last request tab and any open Collection/Folder tabs | A permanent **Environment** tab is always there (no `✕` — it can't be closed), plus, to the right, an "Active environment:" dropdown. |
+| 16.181 | Click the **Environment** tab | Shows "Environment: `<name>`" with the same KEY/value/secret editable table that used to be inline in the sidebar, plus Save/Delete environment buttons — see 16.41-16.48 (now exercised through this tab instead of the old sidebar panel). |
+| 16.182 | With no environment selected, click the **Environment** tab | Reads "No environment selected — pick or create one in the sidebar." instead of an editor. |
+| 16.183 | While a request tab is active (not the Environment tab), use the **"Active environment:"** dropdown at the top-right of the tab strip to pick a different environment | The active substitution environment changes (verify via Send, or by checking the undefined-variable notice) **without** navigating away from the request tab you were on. |
+| 16.184 | Click an environment's name in the sidebar's Environments list (not the dropdown) | Same as clicking the dropdown *plus* it navigates to the **Environment** tab — confirms the sidebar-list click and the tab-strip dropdown are two different affordances (one navigates, one doesn't). |
+| 16.185 | With a response showing, click between the response's **Body** / **Headers** / **History** sub-tabs | Each swaps independently; Body shows the syntax-highlighted/search box content as before, Headers lists the raw response headers (now only visible under this sub-tab, no longer a collapsing section), History shows a new list. |
+| 16.186 | Send the *same* request (same method + URL) two or three times, then click the response's **History** sub-tab | Lists every past send of *this specific request*, newest first (status, timestamp, elapsed) — distinct from the sidebar's project-wide History tab (16.155), which lists every request sent, not just this one. |
+| 16.187 | Change the URL, then click the response's **History** sub-tab | Shows "No history for this request yet..." (assuming this exact method+URL was never sent before) — confirms the filter is keyed on the current tab's method+URL, not just "any history". |
+| 16.188 | Click an entry in the response's History sub-tab | Loads it back into the editor exactly like clicking an entry in the sidebar's History tab (16.122) — same underlying re-run behavior, reached from a second place. |
 
 ## 17. Scenarios — `curly scenario` (M6, FR-25)
 
@@ -441,3 +479,72 @@ When adding a new flag or subcommand, add at minimum:
 - A unit test covering the pure parsing/building logic — `crates/curly-cli/src/one_shot.rs`, `args.rs`, or `commands/*.rs`'s `#[cfg(test)] mod tests` depending on where the logic lives, plus `crates/curly-core/tests/` for anything storage- or substitution-related.
 - One row in the relevant table above exercising it against a real server (or a real temp storage directory for env/collections/history).
 - A corresponding entry in [CLI.md](CLI.md) (an example in the relevant section + a reference entry).
+
+## 20. Tauri + React GUI (M9 — see GUI.md)
+
+The current GUI — supersedes §16 above. Requires an actual display; not scriptable, run by hand from `curly-gui-tauri/`: `npm install` (first time), then `npm run tauri dev`. No automated frontend test suite exists yet (see GUI.md's own testing note), so this checklist is the only verification these behaviors get beyond `tsc --noEmit`.
+
+Set `CURLY_DATA_DIR` to a scratch directory before starting, same reasoning as the top of this doc:
+```sh
+export CURLY_DATA_DIR=/tmp/curly-tauri-manual-test-data
+rm -rf "$CURLY_DATA_DIR"
+```
+
+| # | Steps | Expected |
+|---|---|---|
+| 20.1 | `npm run tauri dev` from `curly-gui-tauri/` with no `.curly` anywhere above the cwd and `CURLY_DATA_DIR` unset | Window opens; sidebar shows project label "Default". |
+| 20.2 | Same, with `CURLY_DATA_DIR` set to an empty scratch dir | Sidebar shows a project label derived from that directory; `ls "$CURLY_DATA_DIR"` shows nothing was created yet (created lazily on first save, same as the CLI/egui GUI). |
+| 20.3 | `curly collections add-request smoke-test login https://example.com/login` (CLI, same `CURLY_DATA_DIR`) then relaunch the GUI | Sidebar's Collections list shows `smoke-test`. |
+| 20.4 | Click **"Open Project…"**, pick a different directory that already has a `.curly` | Native folder picker opens (no window freeze); sidebar switches to that project's label/collections/environments. |
+| 20.5 | Click **"Open Project…"**, pick an empty directory | A new `.curly` is created there on the spot (`ls <dir>/.curly` afterward); sidebar opens it, empty. |
+| 20.6 | Click **"Open Project…"** and cancel the picker | Nothing changes. |
+| 20.7 | Click the collection's **arrow** (not its name) | Expands/collapses the tree; doesn't open a tab. |
+| 20.8 | Click the collection's **name** (not its arrow, not its ⋯) | Opens a Collection main tab next to request tabs, showing its folders/requests + New Folder/New Request/Save All. |
+| 20.9 | Click the same collection's name again | Focuses the already-open tab rather than opening a second one. |
+| 20.10 | In the Collection tab, click a listed folder | Opens (or focuses) that folder's own Folder tab. |
+| 20.11 | In a Folder tab, click a listed request | Loads it into the active request tab and switches the central view back to the normal request editor. |
+| 20.12 | Hover a request row in the sidebar tree | A **⋯** fades in at the row's trailing edge; move the mouse off without clicking it, it fades back out. |
+| 20.13 | Click a request row's **⋯** → **Rename**, change the name, confirm | Request renamed in the tree; if it was the loaded request, the breadcrumb updates too. |
+| 20.14 | Click a request row's **⋯** → **Duplicate**, confirm with a different name | A second copy appears; original untouched. |
+| 20.15 | Click a request row's **⋯** → **Delete** | Removed from the tree immediately, no confirmation dialog. |
+| 20.16 | Hover a folder row, click **⋯** → **New Folder**, name it | Nested folder created under that one. |
+| 20.17 | Folder **⋯** → **New Request**, fill in a name in the Save dialog that opens | New blank tab opens pre-targeted at that folder; saving places the request there. |
+| 20.18 | Folder **⋯** → **Delete Folder** on an empty folder | Removed immediately. |
+| 20.19 | Folder **⋯** → **Delete Folder** on a non-empty one | Refuses with a notice; nothing deleted. |
+| 20.20 | Collection's own **⋯** → **New Folder** / **New Request** | Same as 20.16/20.17 but at the collection's top level. |
+| 20.21 | Dirty two different requests in the same collection (edit, don't save either), open that collection's tab, click **Save All** | Both saved; their tabs' `*` clears; notice names the count. |
+| 20.22 | **Save All** with nothing dirty in that collection | Notice says "nothing to save", no-op. |
+| 20.23 | Load a request, edit the URL | Tab label gains a leading `* `. |
+| 20.24 | Click **Save** | `*` clears. |
+| 20.25 | Edit the breadcrumb's trailing name field, click its own **✓** (not the main Save button) | Renamed in the tree and the tab label — content on disk untouched (only the name/path changed). |
+| 20.26 | Edit breadcrumb name, leave it blank, click **✓** | Notice says a name is required; nothing renamed. |
+| 20.27 | With no request loaded, look at the breadcrumb | Reads "New request — not yet saved in a collection", no editable field. |
+| 20.28 | Look at the Save/Save As buttons | Both green-filled, as visually prominent as Send. |
+| 20.29 | Build a request from scratch (no load), click **Save** | Opens the Save As dialog (nothing loaded to overwrite). |
+| 20.30 | In that dialog, type a new collection name + request name, confirm | New collection appears in the sidebar with the request in it. |
+| 20.31 | Load a request, click **Save As…**, don't change anything, confirm | Fails with a collision error in the dialog; nothing overwritten. |
+| 20.32 | Click **+** to open a new tab | Blank tab appears and becomes active; previous tab's content untouched. |
+| 20.33 | Open two tabs, load different requests into each, edit one | Only that tab's label gets a `*` — the other tab is unaffected. |
+| 20.34 | Click a tab's own **✕** (not the active one) | Closes immediately; active tab unaffected. |
+| 20.35 | With only one tab open, close it | Resets to a blank tab instead of leaving zero tabs open. |
+| 20.36 | Open the **Variables** sub-tab, add an override (e.g. `BASE_URL` / a local URL), leave a variable in the URL referencing it, Send | Sends using the override's value — confirm via the actual request target. |
+| 20.37 | Restart the app after adding an override | Gone — overrides are never saved anywhere. |
+| 20.38 | Open the **Extraction** sub-tab, **+ Add rule**, pick Body, fill in Name + JSON path matching a real response field, Send to a URL returning that field | Response comes back; a notice names the extracted variable. |
+| 20.39 | Switch that same rule's kind to Header, then Template | Name/secret carry over; the kind-specific field resets each time. |
+| 20.40 | Sidebar: type a name in "new environment", click **+ New** | Environment created, selected, sidebar list shows it, and the main view switches to its Environment tab. |
+| 20.41 | In the Environment tab, **+ Add variable**, fill in a key/value, **Save** | `curly env show <name>` (CLI, same `CURLY_DATA_DIR`) confirms it landed on disk. |
+| 20.42 | Click a variable row's ✕, **Save** | Removed on disk too. |
+| 20.43 | Click **Delete environment** | Removed from the sidebar list; Environment tab reverts to "No environment selected". |
+| 20.44 | Click an environment's **name** in the sidebar (not "+ New") | Selects it *and* switches to its Environment tab. |
+| 20.45 | With a request tab active, use the tab strip's **"Active environment"** dropdown to pick a different environment | Active environment changes (verify via Send) *without* navigating away from the request tab. |
+| 20.46 | Click the permanent **Environment** tab in the tab strip | Always present, no `✕` — opens/focuses the Environment tab directly. |
+| 20.47 | Send a request whose response is JSON | Body sub-tab shows syntax coloring (strings/numbers/keywords/punctuation in different colors). |
+| 20.48 | Type a search term that appears in the body | Highlights every match; ◀/▶ + "match X of Y" appear once there's at least one. |
+| 20.49 | Click ▶ repeatedly past the last match | Wraps back to match 1; the current match's highlight is visually distinct from the others and scrolls into view. |
+| 20.50 | Search for something not in the body | "0 match(es)", nothing highlighted. |
+| 20.51 | Click the Response pane's **Headers** sub-tab | Shows raw response headers, one per line. |
+| 20.52 | Send the same request 2-3 times, then click the Response pane's **History** sub-tab | Lists just this request's past sends (not the whole project's), newest first. |
+| 20.53 | With that History sub-tab already open, send the request again | The list updates immediately, without needing to switch sub-tabs away and back. |
+| 20.54 | Click an entry in the Response History sub-tab | Reloads it into the editor, same as the sidebar's History tab. |
+| 20.55 | Switch the sidebar to its **History** tab, send a couple of requests | Lists them newest-first (method/status/url). |
+| 20.56 | `curly history` (CLI, same `CURLY_DATA_DIR`) after a GUI send | Shows the GUI's send too — same shared history. |

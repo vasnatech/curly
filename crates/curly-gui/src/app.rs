@@ -41,7 +41,7 @@ const MAX_ZOOM: f32 = 3.0;
 /// history`'s own CLI default (`--limit 20`).
 const HISTORY_DISPLAY_LIMIT: usize = 20;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct HeaderRow {
     pub(crate) name: String,
     pub(crate) value: String,
@@ -115,12 +115,78 @@ pub(crate) enum AuthKind {
 /// Editor state for the Authorization section — all three text fields stay
 /// populated regardless of `kind` so switching Basic/Bearer/None in the UI
 /// never loses what was typed.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub(crate) struct AuthEditor {
     pub(crate) kind: AuthKind,
     pub(crate) username: String,
     pub(crate) password: String,
     pub(crate) token: String,
+}
+
+/// A snapshot of everything that makes a request "unsaved" (M8) — captured
+/// whenever a tab's content is known to match disk (right after loading or
+/// saving) and compared against the live editor fields each frame to decide
+/// whether the tab needs a "*" (see `is_tab_dirty`). Deliberately narrower
+/// than `RequestTab` itself: no response/search/notice fields, none of
+/// which affect whether there's unsaved *request* content.
+#[derive(Clone, Default, PartialEq)]
+struct EditableSnapshot {
+    method: String,
+    url: String,
+    headers: Vec<HeaderRow>,
+    body: String,
+    auth: AuthEditor,
+    extract_rules: Vec<Extraction>,
+}
+
+impl EditableSnapshot {
+    fn capture(
+        method: &str,
+        url: &str,
+        headers: &[HeaderRow],
+        body: &str,
+        auth: &AuthEditor,
+        extract_rules: &[Extraction],
+    ) -> Self {
+        Self {
+            method: method.to_string(),
+            url: url.to_string(),
+            headers: headers.to_vec(),
+            body: body.to_string(),
+            auth: auth.clone(),
+            extract_rules: extract_rules.to_vec(),
+        }
+    }
+
+    /// What a freshly opened blank tab looks like — matches
+    /// `RequestTab::blank()`'s own fields exactly, so a genuinely untouched
+    /// new tab isn't flagged dirty the moment it's opened.
+    fn blank() -> Self {
+        Self::capture("GET", "", &[HeaderRow::empty()], "", &AuthEditor::default(), &[])
+    }
+}
+
+/// Whether the given editor fields differ from `snapshot` (the last known
+/// on-disk state, `None` meaning "never saved") — a pure function so it's
+/// directly unit-testable without an `egui::Context`. Used by `tab_label`
+/// for the "*" indicator and by `save_all_in_collection` to decide which
+/// open tabs actually need saving.
+fn is_tab_dirty(
+    snapshot: &Option<EditableSnapshot>,
+    method: &str,
+    url: &str,
+    headers: &[HeaderRow],
+    body: &str,
+    auth: &AuthEditor,
+    extract_rules: &[Extraction],
+) -> bool {
+    let current = EditableSnapshot::capture(method, url, headers, body, auth, extract_rules);
+    match snapshot {
+        Some(saved) => *saved != current,
+        // No snapshot at all means this tab was never routed through
+        // `blank()`/a load/a save — treat as dirty rather than assume clean.
+        None => true,
+    }
 }
 
 /// Which `Extraction` variant a rule-editor row currently is — used only to
@@ -207,6 +273,63 @@ enum EnvAction {
     Create(String),
 }
 
+/// Which sub-tab the Response pane shows (M8) — Body/Headers used to be
+/// stacked (always both visible); History is new, reusing the project-wide
+/// send log filtered to the active tab's own request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+enum ResponseSubtab {
+    #[default]
+    Body,
+    Headers,
+    History,
+}
+
+/// Which top-level view the left sidebar shows (M8) — a small switcher
+/// above the Collections/Environments/Session stack, replacing what used to
+/// be one long always-visible scroll with History mixed in the middle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+enum SidebarTab {
+    #[default]
+    Project,
+    History,
+}
+
+/// Which collection/folder tab an `ExtraTabKind` entry in the tab strip
+/// resolves to when clicked — kept as a small conversion rather than
+/// duplicating the match everywhere `central_view` is set from one.
+impl ExtraTabKind {
+    fn central_view(&self) -> CentralView {
+        match self {
+            ExtraTabKind::Collection(name) => CentralView::Collection(name.clone()),
+            ExtraTabKind::Folder(collection, path) => CentralView::Folder(collection.clone(), path.clone()),
+        }
+    }
+}
+
+/// A collection or folder opened as its own main tab (M8) — on demand, by
+/// clicking its name in the sidebar tree (`open_or_focus_extra_tab`).
+/// Unlike request tabs, these don't exist until opened, and their content
+/// (`show_collection_tab`/`show_folder_tab`) is derived straight from the
+/// path here rather than from any per-tab editor state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ExtraTabKind {
+    Collection(String),
+    Folder(String, String),
+}
+
+/// What the central panel is currently showing (M8) — `Request` defers to
+/// `active_tab_idx`/the take-restore-backed top-level fields exactly as
+/// before M8; the other three are new, non-request views that leave
+/// whichever request tab is active completely untouched underneath.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+enum CentralView {
+    #[default]
+    Request,
+    Collection(String),
+    Folder(String, String),
+    Environment,
+}
+
 /// Identifies where a loaded request lives, so a plain "Save" knows what to
 /// overwrite without re-asking — the collection's name plus its
 /// slash-separated path within that collection (e.g. `"Auth/OAuth/login"`,
@@ -226,6 +349,19 @@ enum TreeAction {
     Delete(String),
     Rename(String),
     Duplicate(String),
+    /// Create a new folder under the given parent path (`""` = the
+    /// collection's top level) — from a folder's or the collection root's
+    /// "⋯" menu (M8).
+    NewFolder(String),
+    /// Start a new blank request saved under the given parent path — from a
+    /// folder's or the collection root's "⋯" menu (M8).
+    NewRequest(String),
+    /// Remove the folder at the given path and everything inside it (M8).
+    DeleteFolder(String),
+    /// Open (or focus) the given folder's own main tab (M8) — clicking the
+    /// folder's name, as opposed to its "⋯" menu or its expand/collapse
+    /// arrow.
+    OpenFolder(String),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -245,6 +381,16 @@ struct PathDialog {
     collection: String,
     old_path: String,
     folder_path: String,
+    name: String,
+    error: Option<String>,
+}
+
+/// State for the "New Folder" floating window (M8) — opened from a
+/// collection's or folder's "⋯" menu; `parent_path` is `""` for a
+/// top-level folder.
+struct FolderDialog {
+    collection: String,
+    parent_path: String,
     name: String,
     error: Option<String>,
 }
@@ -317,6 +463,24 @@ struct RequestTab {
     response_search_current: usize,
     response_save_rx: Option<mpsc::Receiver<Option<String>>>,
     response_save_notice: Option<String>,
+    /// Which Response sub-tab is showing (M8).
+    response_subtab: ResponseSubtab,
+    /// The editor content as of the last load or save (M8) — compared
+    /// against the live fields to drive the tab strip's "*" indicator. See
+    /// `is_tab_dirty`.
+    saved_snapshot: Option<EditableSnapshot>,
+    /// The breadcrumb's editable trailing segment (M8) — the loaded
+    /// request's name, editable independent of the rest of the request;
+    /// saving it renames the request (see `save_breadcrumb_name`). Kept in
+    /// sync with `loaded_request` reactively (see `sync_breadcrumb`) rather
+    /// than threaded through every place that sets `loaded_request`.
+    breadcrumb_name: String,
+    /// Which `loaded_request.path` `breadcrumb_name` was last synced from —
+    /// `sync_breadcrumb` resyncs whenever this no longer matches
+    /// `loaded_request`, so an external change (a different request loaded,
+    /// or this one renamed elsewhere) is picked up without every call site
+    /// needing to remember to call a sync method itself.
+    breadcrumb_synced_path: Option<String>,
     /// Set when a response arrives while this tab isn't the active one
     /// (see `poll_background_tab_responses`) — drives a "response ready"
     /// marker on the tab strip. Naturally resets to `false` on its own once
@@ -338,6 +502,7 @@ impl RequestTab {
         Self {
             method: "GET".to_string(),
             headers: vec![HeaderRow::empty()],
+            saved_snapshot: Some(EditableSnapshot::blank()),
             ..Default::default()
         }
     }
@@ -452,6 +617,9 @@ pub struct CurlyApp {
     /// `None` otherwise. Opening this closes `save_dialog` and vice versa —
     /// only one floating dialog is ever open at a time.
     path_dialog: Option<PathDialog>,
+    /// Open while the "New Folder" window is showing (M8); `None` otherwise.
+    /// Same one-at-a-time rule as `save_dialog`/`path_dialog`.
+    folder_dialog: Option<FolderDialog>,
     /// Feedback from saving/deleting a request in a collection — separate
     /// from `load_notice` (about the editor's own content) and
     /// `env_notice`/`session_notice` (environments/sessions).
@@ -472,6 +640,17 @@ pub struct CurlyApp {
     /// `None` after a cancelled dialog, deliberately — cancelling isn't
     /// worth a notice.
     response_save_notice: Option<String>,
+    /// See `RequestTab::response_subtab` — the active tab's copy, swapped
+    /// like every other top-level field of the same name.
+    response_subtab: ResponseSubtab,
+    /// See `RequestTab::saved_snapshot` — this is the active tab's copy,
+    /// swapped like every other top-level field of the same name.
+    saved_snapshot: Option<EditableSnapshot>,
+    /// See `RequestTab::breadcrumb_name`/`breadcrumb_synced_path` — the
+    /// active tab's copies, swapped like every other top-level field of the
+    /// same name.
+    breadcrumb_name: String,
+    breadcrumb_synced_path: Option<String>,
     /// Every tab's state (FR-19) — see `RequestTab`'s own doc comment for
     /// the swap-based design: `tabs[active_tab_idx]` is a stale placeholder
     /// while `CurlyApp`'s own top-level fields above hold that tab's real,
@@ -479,6 +658,17 @@ pub struct CurlyApp {
     /// instead of leaving zero tabs open.
     tabs: Vec<RequestTab>,
     active_tab_idx: usize,
+
+    /// What the central panel is currently showing (M8) — workspace-level,
+    /// not per-tab: switching to a Collection/Folder/Environment view
+    /// leaves whichever request tab is active untouched underneath.
+    central_view: CentralView,
+    /// Collection/folder tabs opened on demand (M8) — see `ExtraTabKind`.
+    extra_tabs: Vec<ExtraTabKind>,
+
+    /// Which top-level view the left sidebar shows (M8) — Project
+    /// (Collections/Environments/Session) or History.
+    sidebar_tab: SidebarTab,
 
     /// Cached copies of `ui.ctx().zoom_factor()`/`.theme()`, refreshed once
     /// per frame — `eframe::App::on_exit` (where these get persisted) isn't
@@ -595,13 +785,21 @@ impl CurlyApp {
             loaded_request: None,
             save_dialog: None,
             path_dialog: None,
+            folder_dialog: None,
             collection_notice: None,
             response_search: String::new(),
             response_search_current: 0,
             response_save_rx: None,
             response_save_notice: None,
+            response_subtab: ResponseSubtab::default(),
+            saved_snapshot: Some(EditableSnapshot::blank()),
+            breadcrumb_name: String::new(),
+            breadcrumb_synced_path: None,
             tabs: vec![RequestTab::blank()],
             active_tab_idx: 0,
+            central_view: CentralView::default(),
+            extra_tabs: Vec::new(),
+            sidebar_tab: SidebarTab::default(),
             last_zoom: 1.0,
             last_theme: egui::Theme::Dark,
             theme_follows_system: true,
@@ -982,6 +1180,7 @@ impl CurlyApp {
             Some(format!("Loaded \"{}\", but {}.", saved.name, notices.join("; and ")))
         };
         self.response = None;
+        self.saved_snapshot = Some(self.current_snapshot());
     }
 
     /// Load a history entry back into the editor for a re-run (FR-6). Unlike
@@ -1054,6 +1253,14 @@ impl CurlyApp {
                 notices.join("; and ")
             ))
         };
+        // Unlike a saved request, there's nothing on disk this matches — it
+        // shows as needing a save (Save As) rather than falsely "clean".
+        self.saved_snapshot = None;
+    }
+
+    /// Capture the active tab's current editor fields as an `EditableSnapshot`.
+    fn current_snapshot(&self) -> EditableSnapshot {
+        EditableSnapshot::capture(&self.method, &self.url, &self.headers, &self.body, &self.auth, &self.extract_rules)
     }
 
     fn active_project(&self) -> Option<&Project> {
@@ -1403,6 +1610,10 @@ impl CurlyApp {
             response_search_current: std::mem::take(&mut self.response_search_current),
             response_save_rx: self.response_save_rx.take(),
             response_save_notice: self.response_save_notice.take(),
+            response_subtab: std::mem::take(&mut self.response_subtab),
+            saved_snapshot: self.saved_snapshot.take(),
+            breadcrumb_name: std::mem::take(&mut self.breadcrumb_name),
+            breadcrumb_synced_path: self.breadcrumb_synced_path.take(),
             // The active tab never shows its own "response ready" badge —
             // see the field's doc comment.
             has_unseen_response: false,
@@ -1432,6 +1643,10 @@ impl CurlyApp {
         self.response_search_current = tab.response_search_current;
         self.response_save_rx = tab.response_save_rx;
         self.response_save_notice = tab.response_save_notice;
+        self.response_subtab = tab.response_subtab;
+        self.saved_snapshot = tab.saved_snapshot;
+        self.breadcrumb_name = tab.breadcrumb_name;
+        self.breadcrumb_synced_path = tab.breadcrumb_synced_path;
     }
 
     /// Open a new blank tab and make it active — the editor equivalent of
@@ -1503,11 +1718,29 @@ impl CurlyApp {
     /// `RequestTab`'s doc comment), so the tab bar reflects what you're
     /// typing right now, not what was there before you last switched away.
     fn tab_label(&self, idx: usize) -> String {
-        let (loaded, method, url) = if idx == self.active_tab_idx {
-            (&self.loaded_request, self.method.as_str(), self.url.as_str())
+        let (loaded, method, url, headers, body, auth, extract_rules, snapshot) = if idx == self.active_tab_idx {
+            (
+                &self.loaded_request,
+                self.method.as_str(),
+                self.url.as_str(),
+                self.headers.as_slice(),
+                self.body.as_str(),
+                &self.auth,
+                self.extract_rules.as_slice(),
+                &self.saved_snapshot,
+            )
         } else {
             let tab = &self.tabs[idx];
-            (&tab.loaded_request, tab.method.as_str(), tab.url.as_str())
+            (
+                &tab.loaded_request,
+                tab.method.as_str(),
+                tab.url.as_str(),
+                tab.headers.as_slice(),
+                tab.body.as_str(),
+                &tab.auth,
+                tab.extract_rules.as_slice(),
+                &tab.saved_snapshot,
+            )
         };
 
         let label = if let Some(loaded) = loaded {
@@ -1519,8 +1752,16 @@ impl CurlyApp {
         };
 
         const MAX_LEN: usize = 24;
-        if label.chars().count() > MAX_LEN {
+        let label = if label.chars().count() > MAX_LEN {
             format!("{}…", label.chars().take(MAX_LEN).collect::<String>())
+        } else {
+            label
+        };
+
+        // "*" (M8) — needs saving, mirroring how most editors mark an
+        // unsaved buffer.
+        if is_tab_dirty(snapshot, method, url, headers, body, auth, extract_rules) {
+            format!("* {label}")
         } else {
             label
         }
@@ -1549,6 +1790,7 @@ impl CurlyApp {
             error: None,
         });
         self.path_dialog = None;
+        self.folder_dialog = None;
     }
 
     fn cancel_save_dialog(&mut self) {
@@ -1667,6 +1909,7 @@ impl CurlyApp {
                 self.refresh_project_lists();
                 self.collection_notice = Some(format!("saved \"{path}\" in \"{collection_name}\""));
                 self.save_dialog = None;
+                self.saved_snapshot = Some(self.current_snapshot());
             }
             Err(e) => self.save_dialog.as_mut().unwrap().error = Some(e.to_string()),
         }
@@ -1709,6 +1952,7 @@ impl CurlyApp {
 
         if result.is_ok() {
             self.refresh_project_lists();
+            self.saved_snapshot = Some(self.current_snapshot());
         }
         self.collection_notice = Some(match result {
             Ok(()) => format!("saved \"{}\" in \"{}\"", loaded.path, loaded.collection),
@@ -1762,6 +2006,7 @@ impl CurlyApp {
             error: None,
         });
         self.save_dialog = None;
+        self.folder_dialog = None;
     }
 
     fn cancel_path_dialog(&mut self) {
@@ -1826,12 +2071,69 @@ impl CurlyApp {
         }
     }
 
-    /// Apply the rename/move or duplicate the dialog describes. On success,
-    /// a rename that moved the currently *loaded* request updates
-    /// `loaded_request` to point at its new location (mirrors
-    /// `delete_saved_request`'s "is this the thing that's loaded?" check);
-    /// a duplicate leaves `loaded_request` untouched — the original stays
-    /// loaded, the copy isn't auto-loaded.
+    /// Rename/move the request at `old_path` in `collection_name` to
+    /// `new_path` on disk — shared by `confirm_path_dialog`'s Rename mode
+    /// and the breadcrumb's inline rename-Save (M8), so there's one
+    /// implementation of "rename and update whatever currently points at
+    /// the old path," not two. If the currently *loaded* request is the
+    /// one being moved, `loaded_request` is updated to its new location
+    /// (mirrors `delete_saved_request`'s "is this the thing that's
+    /// loaded?" check). Returns an error message on failure — the caller
+    /// decides where to show it (a dialog's own `error` field, or
+    /// `collection_notice`).
+    fn rename_saved_request(&mut self, collection_name: &str, old_path: &str, new_path: &str) -> Result<(), String> {
+        let result: anyhow::Result<()> = match self.active_project() {
+            Some(project) => (|| {
+                let mut collection = project.storage.load_collection(collection_name)?;
+                collection.rename_or_move_request(old_path, new_path)?;
+                project.storage.save_collection(&collection)
+            })(),
+            None => Err(anyhow::anyhow!("no project is open")),
+        };
+        match result {
+            Ok(()) => {
+                if self
+                    .loaded_request
+                    .as_ref()
+                    .is_some_and(|r| r.collection == collection_name && r.path == old_path)
+                {
+                    self.loaded_request = Some(LoadedRequestRef {
+                        collection: collection_name.to_string(),
+                        path: new_path.to_string(),
+                    });
+                }
+                self.refresh_project_lists();
+                Ok(())
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    /// Copy the request at `path` in `collection_name` to `new_path`,
+    /// leaving the original (and `loaded_request`) untouched — the
+    /// original stays loaded, the copy isn't auto-loaded. Shared by
+    /// `confirm_path_dialog`'s Duplicate mode; kept separate from
+    /// `rename_saved_request` since a duplicate never touches
+    /// `loaded_request`.
+    fn duplicate_saved_request(&mut self, collection_name: &str, path: &str, new_path: &str) -> Result<(), String> {
+        let result: anyhow::Result<()> = match self.active_project() {
+            Some(project) => (|| {
+                let mut collection = project.storage.load_collection(collection_name)?;
+                collection.duplicate_request(path, new_path)?;
+                project.storage.save_collection(&collection)
+            })(),
+            None => Err(anyhow::anyhow!("no project is open")),
+        };
+        match result {
+            Ok(()) => {
+                self.refresh_project_lists();
+                Ok(())
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    /// Apply the rename/move or duplicate the dialog describes.
     fn confirm_path_dialog(&mut self) {
         let Some(dialog) = self.path_dialog.as_ref() else {
             return;
@@ -1847,13 +2149,111 @@ impl CurlyApp {
         let old_path = dialog.old_path.clone();
         let mode = dialog.mode;
 
+        let result = match mode {
+            PathDialogMode::Rename => self.rename_saved_request(&collection_name, &old_path, &new_path),
+            PathDialogMode::Duplicate => self.duplicate_saved_request(&collection_name, &old_path, &new_path),
+        };
+
+        match result {
+            Ok(()) => {
+                self.collection_notice = Some(match mode {
+                    PathDialogMode::Rename => format!("renamed \"{old_path}\" to \"{new_path}\""),
+                    PathDialogMode::Duplicate => format!("duplicated \"{old_path}\" to \"{new_path}\""),
+                });
+                self.path_dialog = None;
+            }
+            Err(e) => self.path_dialog.as_mut().unwrap().error = Some(e),
+        }
+    }
+
+    /// Open the "New Folder" window (M8) — from a collection's or folder's
+    /// "⋯" menu. `parent_path` is `""` for a new top-level folder.
+    fn open_folder_dialog(&mut self, collection: String, parent_path: String) {
+        self.folder_dialog = Some(FolderDialog {
+            collection,
+            parent_path,
+            name: String::new(),
+            error: None,
+        });
+        self.save_dialog = None;
+        self.path_dialog = None;
+    }
+
+    fn cancel_folder_dialog(&mut self) {
+        self.folder_dialog = None;
+    }
+
+    /// Render the "New Folder" floating window if `folder_dialog` is
+    /// `Some` — same local-flags structure as `show_save_dialog`/
+    /// `show_path_dialog`.
+    fn show_folder_dialog(&mut self, ctx: &egui::Context) {
+        let mut confirmed = false;
+        let mut cancelled = false;
+
+        if let Some(dialog) = self.folder_dialog.as_mut() {
+            let mut open = true;
+            egui::Window::new("New Folder")
+                .collapsible(false)
+                .resizable(false)
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    let parent = if dialog.parent_path.is_empty() {
+                        dialog.collection.clone()
+                    } else {
+                        format!("{}/{}", dialog.collection, dialog.parent_path)
+                    };
+                    ui.label(format!("In: \"{parent}\""));
+                    ui.horizontal(|ui| {
+                        ui.label("Name:");
+                        ui.text_edit_singleline(&mut dialog.name);
+                    });
+                    if let Some(err) = &dialog.error {
+                        ui.colored_label(egui::Color32::from_rgb(220, 80, 80), err);
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("Create").clicked() {
+                            confirmed = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            cancelled = true;
+                        }
+                    });
+                });
+            if !open {
+                cancelled = true;
+            }
+        }
+
+        if confirmed {
+            self.confirm_folder_dialog();
+        } else if cancelled {
+            self.cancel_folder_dialog();
+        }
+    }
+
+    fn confirm_folder_dialog(&mut self) {
+        let Some(dialog) = self.folder_dialog.as_ref() else {
+            return;
+        };
+        let name = dialog.name.trim().trim_matches('/').to_string();
+        if name.is_empty() {
+            self.folder_dialog.as_mut().unwrap().error = Some("name is required".to_string());
+            return;
+        }
+        let path = if dialog.parent_path.is_empty() {
+            name.clone()
+        } else {
+            format!("{}/{name}", dialog.parent_path)
+        };
+        let collection_name = dialog.collection.clone();
+
         let result: anyhow::Result<()> = match self.active_project() {
             Some(project) => (|| {
-                let mut collection = project.storage.load_collection(&collection_name)?;
-                match mode {
-                    PathDialogMode::Rename => collection.rename_or_move_request(&old_path, &new_path)?,
-                    PathDialogMode::Duplicate => collection.duplicate_request(&old_path, &new_path)?,
-                }
+                let mut collection = project
+                    .storage
+                    .load_collection_opt(&collection_name)?
+                    .unwrap_or_else(|| Collection::new(&collection_name));
+                collection.add_folder(&path);
                 project.storage.save_collection(&collection)
             })(),
             None => Err(anyhow::anyhow!("no project is open")),
@@ -1861,26 +2261,296 @@ impl CurlyApp {
 
         match result {
             Ok(()) => {
-                if mode == PathDialogMode::Rename
-                    && self
-                        .loaded_request
-                        .as_ref()
-                        .is_some_and(|r| r.collection == collection_name && r.path == old_path)
-                {
-                    self.loaded_request = Some(LoadedRequestRef {
-                        collection: collection_name.clone(),
-                        path: new_path.clone(),
-                    });
-                }
                 self.refresh_project_lists();
-                self.collection_notice = Some(match mode {
-                    PathDialogMode::Rename => format!("renamed \"{old_path}\" to \"{new_path}\""),
-                    PathDialogMode::Duplicate => format!("duplicated \"{old_path}\" to \"{new_path}\""),
-                });
-                self.path_dialog = None;
+                self.collection_notice = Some(format!("created folder \"{path}\" in \"{collection_name}\""));
+                self.folder_dialog = None;
             }
-            Err(e) => self.path_dialog.as_mut().unwrap().error = Some(e.to_string()),
+            Err(e) => self.folder_dialog.as_mut().unwrap().error = Some(e.to_string()),
         }
+    }
+
+    /// Same as `open_save_dialog`, but pre-filled with an explicit
+    /// collection/folder instead of defaulting from `loaded_request` —
+    /// used by a folder's/collection's "⋯" → New Request (M8), where the
+    /// blank tab just opened has no `loaded_request` of its own to infer
+    /// a location from.
+    fn open_save_dialog_in(&mut self, collection: String, folder_path: String) {
+        self.save_dialog = Some(SaveDialog {
+            collection,
+            folder_path,
+            name: String::new(),
+            error: None,
+        });
+        self.path_dialog = None;
+        self.folder_dialog = None;
+    }
+
+    /// Remove the folder at `path` (M8) — refuses (surfacing the error via
+    /// `collection_notice`, same as every other collection-mutating method
+    /// here) rather than cascading through a non-empty folder; delete its
+    /// contents individually first. Mirrors `delete_saved_request`'s
+    /// "acts immediately, no confirmation dialog" convention for the empty
+    /// case.
+    fn delete_folder(&mut self, collection_name: &str, path: &str) {
+        let result: anyhow::Result<bool> = match self.active_project() {
+            Some(project) => (|| {
+                let mut collection = project.storage.load_collection(collection_name)?;
+                let removed = collection.remove_folder(path, false)?;
+                project.storage.save_collection(&collection)?;
+                Ok(removed)
+            })(),
+            None => Err(anyhow::anyhow!("no project is open")),
+        };
+
+        match result {
+            Ok(true) => {
+                self.refresh_project_lists();
+                self.collection_notice = Some(format!("deleted folder \"{path}\" from \"{collection_name}\""));
+            }
+            Ok(false) => {
+                self.collection_notice = Some(format!("no folder found at \"{path}\""));
+            }
+            Err(e) => self.collection_notice = Some(format!("failed to delete \"{path}\": {e}")),
+        }
+    }
+
+    /// Save every open tab whose loaded request lives in `collection_name`
+    /// and has unsaved changes (M8's collection "⋯" → Save All). Reuses
+    /// `switch_to_tab`/`save_over_loaded` as-is for each dirty tab in turn
+    /// — the same take/restore swap that already backs normal tab
+    /// switching — rather than a parallel "save a background tab" code
+    /// path, then restores whichever tab was active beforehand.
+    fn save_all_in_collection(&mut self, collection_name: &str) {
+        let original_active = self.active_tab_idx;
+        let mut saved_count = 0;
+        for i in 0..self.tabs.len() {
+            let (loaded, dirty) = if i == self.active_tab_idx {
+                (self.loaded_request.clone(), self.is_active_tab_dirty())
+            } else {
+                let tab = &self.tabs[i];
+                (
+                    tab.loaded_request.clone(),
+                    is_tab_dirty(
+                        &tab.saved_snapshot,
+                        &tab.method,
+                        &tab.url,
+                        &tab.headers,
+                        &tab.body,
+                        &tab.auth,
+                        &tab.extract_rules,
+                    ),
+                )
+            };
+            let matches = loaded.is_some_and(|l| l.collection == collection_name);
+            if matches && dirty {
+                self.switch_to_tab(i);
+                self.save_over_loaded();
+                saved_count += 1;
+            }
+        }
+        self.switch_to_tab(original_active);
+        self.collection_notice = Some(if saved_count == 0 {
+            format!("nothing to save in \"{collection_name}\"")
+        } else {
+            format!("saved {saved_count} request(s) in \"{collection_name}\"")
+        });
+    }
+
+    /// Resync `breadcrumb_name` from `loaded_request` if it's fallen out of
+    /// date (a different request just loaded, this one was just renamed
+    /// elsewhere, or nothing's loaded at all) — called once per frame
+    /// before the breadcrumb renders, rather than threaded through every
+    /// place that sets `loaded_request`. A no-op once synced, so it's safe
+    /// to call unconditionally every frame even while the user is mid-edit.
+    fn sync_breadcrumb(&mut self) {
+        let current_path = self.loaded_request.as_ref().map(|l| l.path.clone());
+        if self.breadcrumb_synced_path != current_path {
+            self.breadcrumb_name = current_path
+                .as_deref()
+                .map(|p| split_folder_and_name(p).1)
+                .unwrap_or_default();
+            self.breadcrumb_synced_path = current_path;
+        }
+    }
+
+    /// Commit the breadcrumb's editable trailing segment as the loaded
+    /// request's new name (M8) — the folder stays fixed; only the request's
+    /// own name changes. A no-op if nothing's loaded or the name didn't
+    /// actually change.
+    fn save_breadcrumb_name(&mut self) {
+        let Some(loaded) = self.loaded_request.clone() else {
+            return;
+        };
+        let new_name = self.breadcrumb_name.trim().to_string();
+        if new_name.is_empty() {
+            self.collection_notice = Some("name is required".to_string());
+            return;
+        }
+        let (folder, _old_name) = split_folder_and_name(&loaded.path);
+        let new_path = if folder.is_empty() { new_name } else { format!("{folder}/{new_name}") };
+        if new_path == loaded.path {
+            return;
+        }
+        match self.rename_saved_request(&loaded.collection, &loaded.path, &new_path) {
+            Ok(()) => {
+                self.collection_notice = Some(format!("renamed \"{}\" to \"{new_path}\"", loaded.path));
+                self.sync_breadcrumb();
+            }
+            Err(e) => self.collection_notice = Some(format!("failed to rename: {e}")),
+        }
+    }
+
+    /// Open (or, if already open, just focus) the one collection/folder tab
+    /// for `entry` — shared by the sidebar's collection-name and
+    /// folder-name clicks (M8).
+    fn open_or_focus_extra_tab(&mut self, entry: ExtraTabKind) {
+        if !self.extra_tabs.contains(&entry) {
+            self.extra_tabs.push(entry.clone());
+        }
+        self.central_view = entry.central_view();
+    }
+
+    /// Render a Collection main tab's content (M8) — the collection's
+    /// top-level folders/requests, plus the same New Folder/New
+    /// Request/Save All actions as its sidebar "⋯" menu.
+    fn show_collection_tab(&mut self, ui: &mut egui::Ui, collection_name: &str) {
+        ui.heading(collection_name);
+        let Some(collection) = self.collections.iter().find(|c| c.name == collection_name).cloned() else {
+            ui.weak("This collection no longer exists — it may have been renamed or deleted.");
+            return;
+        };
+        ui.horizontal(|ui| {
+            if ui.button("Save All").clicked() {
+                self.save_all_in_collection(collection_name);
+            }
+            if ui.button("New Folder").clicked() {
+                self.open_folder_dialog(collection_name.to_string(), String::new());
+            }
+            if ui.button("New Request").clicked() {
+                self.open_new_tab();
+                self.open_save_dialog_in(collection_name.to_string(), String::new());
+            }
+        });
+        if let Some(notice) = &self.collection_notice {
+            ui.colored_label(egui::Color32::from_rgb(120, 190, 130), notice);
+        }
+        ui.separator();
+        for folder in &collection.folders {
+            if ui.selectable_label(false, format!("{}/", folder.name)).clicked() {
+                self.open_or_focus_extra_tab(ExtraTabKind::Folder(collection_name.to_string(), folder.name.clone()));
+            }
+        }
+        for request in &collection.requests {
+            let label = format!("{:<7} {}", request.method, request.name);
+            if ui.selectable_label(false, label).clicked() {
+                self.loaded_request = Some(LoadedRequestRef {
+                    collection: collection_name.to_string(),
+                    path: request.name.clone(),
+                });
+                self.load_saved_request(request);
+                self.central_view = CentralView::Request;
+            }
+        }
+    }
+
+    /// Render a Folder main tab's content (M8) — the folder's own
+    /// sub-folders/requests, plus New Folder/New Request scoped to it.
+    fn show_folder_tab(&mut self, ui: &mut egui::Ui, collection_name: &str, folder_path: &str) {
+        let leaf = split_folder_and_name(folder_path).1;
+        ui.heading(format!("{leaf}/"));
+        ui.weak(format!("{collection_name} › {folder_path}"));
+        let Some(collection) = self.collections.iter().find(|c| c.name == collection_name).cloned() else {
+            ui.weak("This collection no longer exists — it may have been renamed or deleted.");
+            return;
+        };
+        let Some(folder) = find_folder(&collection.folders, folder_path).cloned() else {
+            ui.weak("This folder no longer exists — it may have been renamed or deleted.");
+            return;
+        };
+        ui.horizontal(|ui| {
+            if ui.button("New Folder").clicked() {
+                self.open_folder_dialog(collection_name.to_string(), folder_path.to_string());
+            }
+            if ui.button("New Request").clicked() {
+                self.open_new_tab();
+                self.open_save_dialog_in(collection_name.to_string(), folder_path.to_string());
+            }
+        });
+        if let Some(notice) = &self.collection_notice {
+            ui.colored_label(egui::Color32::from_rgb(120, 190, 130), notice);
+        }
+        ui.separator();
+        for sub in &folder.folders {
+            let sub_path = format!("{folder_path}/{}", sub.name);
+            if ui.selectable_label(false, format!("{}/", sub.name)).clicked() {
+                self.open_or_focus_extra_tab(ExtraTabKind::Folder(collection_name.to_string(), sub_path));
+            }
+        }
+        for request in &folder.requests {
+            let label = format!("{:<7} {}", request.method, request.name);
+            if ui.selectable_label(false, label).clicked() {
+                let path = format!("{folder_path}/{}", request.name);
+                self.loaded_request = Some(LoadedRequestRef {
+                    collection: collection_name.to_string(),
+                    path,
+                });
+                self.load_saved_request(request);
+                self.central_view = CentralView::Request;
+            }
+        }
+    }
+
+    /// Render the active environment's variable-table editor (M8) — the
+    /// Environment main tab's content, extracted from what used to be an
+    /// inline sidebar "Edit "{name}"" section, since a full tab gives it
+    /// more room (more consistent with request tabs' own real estate). The
+    /// sidebar's Environments section keeps only the name list + "+ New".
+    fn show_environment_editor(&mut self, ui: &mut egui::Ui) {
+        let Some(name) = self.active_environment.clone() else {
+            ui.weak("No environment selected — pick or create one in the sidebar.");
+            return;
+        };
+        ui.heading(format!("Environment: {name}"));
+        let mut remove_idx = None;
+        for (i, v) in self.env_editor_variables.iter_mut().enumerate() {
+            ui.horizontal(|ui| {
+                ui.add(egui::TextEdit::singleline(&mut v.key).hint_text("KEY").desired_width(140.0));
+                ui.add(egui::TextEdit::singleline(&mut v.value).hint_text("value").desired_width(240.0));
+                ui.checkbox(&mut v.secret, "secret");
+                if ui.small_button("✕").clicked() {
+                    remove_idx = Some(i);
+                }
+            });
+        }
+        if let Some(i) = remove_idx {
+            self.env_editor_variables.remove(i);
+        }
+        if ui.button("+ Add variable").clicked() {
+            self.env_editor_variables.push(VariableRow::empty());
+        }
+        ui.horizontal(|ui| {
+            if ui.button("Save").clicked() {
+                self.save_active_environment();
+            }
+            if ui.button("Delete environment").clicked() {
+                self.delete_active_environment();
+            }
+        });
+        if let Some(notice) = &self.env_notice {
+            ui.colored_label(egui::Color32::from_rgb(120, 190, 130), notice);
+        }
+    }
+
+    fn is_active_tab_dirty(&self) -> bool {
+        is_tab_dirty(
+            &self.saved_snapshot,
+            &self.method,
+            &self.url,
+            &self.headers,
+            &self.body,
+            &self.auth,
+            &self.extract_rules,
+        )
     }
 
     /// Snapshot the fields `persistence` cares about — every tab, with the
@@ -2412,6 +3082,7 @@ impl eframe::App for CurlyApp {
         self.poll_response_save();
         self.show_save_dialog(ui.ctx());
         self.show_path_dialog(ui.ctx());
+        self.show_folder_dialog(ui.ctx());
         apply_ctrl_scroll_zoom(ui.ctx());
 
         // Live-follow the OS theme while the user hasn't manually pinned it
@@ -2523,20 +3194,92 @@ impl eframe::App for CurlyApp {
 
                 ui.separator();
 
+                ui.horizontal(|ui| {
+                    if ui
+                        .selectable_label(self.sidebar_tab == SidebarTab::Project, "Project")
+                        .clicked()
+                    {
+                        self.sidebar_tab = SidebarTab::Project;
+                    }
+                    if ui
+                        .selectable_label(self.sidebar_tab == SidebarTab::History, "History")
+                        .clicked()
+                    {
+                        self.sidebar_tab = SidebarTab::History;
+                    }
+                });
+                ui.separator();
+
+                if self.sidebar_tab == SidebarTab::History {
+                    let mut history_click: Option<usize> = None;
+                    if self.history_entries.is_empty() {
+                        ui.weak("  (no history yet)");
+                    }
+                    for (i, entry) in self.history_entries.iter().enumerate() {
+                        let mut label = format!(
+                            "{} {}  {}  ({} ms)",
+                            entry.method, entry.status, entry.url, entry.elapsed_ms
+                        );
+                        if label.len() > 60 {
+                            label.truncate(57);
+                            label.push_str("...");
+                        }
+                        if ui.selectable_label(false, label).clicked() {
+                            history_click = Some(i);
+                        }
+                    }
+                    if let Some(i) = history_click {
+                        let entry = self.history_entries[i].clone();
+                        self.load_history_entry(&entry);
+                    }
+                    return;
+                }
+
                 ui.label(format!("Collections ({})", self.collections.len()));
                 if self.collections.is_empty() {
                     ui.weak("  (none yet)");
                 }
                 let mut tree_action: Option<(String, TreeAction)> = None;
+                let mut save_all_collection: Option<String> = None;
+                let mut open_collection: Option<String> = None;
                 for collection in &self.collections {
-                    egui::CollapsingHeader::new(&collection.name)
-                        .id_salt(collection.id)
-                        .show(ui, |ui| {
-                            if let Some(a) = show_collection_tree(ui, "", &collection.folders, &collection.requests)
-                            {
-                                tree_action = Some((collection.name.clone(), a));
+                    let state_id = ui.make_persistent_id(("collection_state", collection.id));
+                    let header = egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), state_id, false)
+                        .show_header(ui, |ui| {
+                            if let Some(i) = hover_ellipsis_row(
+                                ui,
+                                ("collection_ellipsis", collection.id),
+                                &["New Folder", "New Request", "Save All"],
+                                |ui| {
+                                    if ui.selectable_label(false, &collection.name).clicked() {
+                                        open_collection = Some(collection.name.clone());
+                                    }
+                                },
+                            ) {
+                                match i {
+                                    0 => {
+                                        tree_action =
+                                            Some((collection.name.clone(), TreeAction::NewFolder(String::new())))
+                                    }
+                                    1 => {
+                                        tree_action =
+                                            Some((collection.name.clone(), TreeAction::NewRequest(String::new())))
+                                    }
+                                    _ => save_all_collection = Some(collection.name.clone()),
+                                }
                             }
                         });
+                    header.body(|ui| {
+                        if let Some(a) = show_collection_tree(ui, "", &collection.folders, &collection.requests) {
+                            tree_action = Some((collection.name.clone(), a));
+                        }
+                    });
+                }
+                if let Some(name) = open_collection {
+                    self.open_or_focus_extra_tab(ExtraTabKind::Collection(name));
+                }
+                if let Some(collection_name) = save_all_collection {
+                    self.save_all_in_collection(&collection_name);
                 }
                 if let Some((collection_name, action)) = tree_action {
                     match action {
@@ -2556,39 +3299,31 @@ impl eframe::App for CurlyApp {
                         TreeAction::Duplicate(path) => {
                             self.open_path_dialog(PathDialogMode::Duplicate, collection_name, path);
                         }
+                        TreeAction::NewFolder(parent) => {
+                            self.open_folder_dialog(collection_name, parent);
+                        }
+                        TreeAction::NewRequest(parent) => {
+                            self.open_new_tab();
+                            self.open_save_dialog_in(collection_name, parent);
+                        }
+                        TreeAction::DeleteFolder(path) => {
+                            self.delete_folder(&collection_name, &path);
+                        }
+                        TreeAction::OpenFolder(path) => {
+                            self.open_or_focus_extra_tab(ExtraTabKind::Folder(collection_name, path));
+                        }
                     }
                 }
 
                 ui.separator();
 
-                let mut history_click: Option<usize> = None;
-                egui::CollapsingHeader::new(format!("History ({})", self.history_entries.len()))
-                    .default_open(false)
-                    .show(ui, |ui| {
-                        if self.history_entries.is_empty() {
-                            ui.weak("  (no history yet)");
-                        }
-                        for (i, entry) in self.history_entries.iter().enumerate() {
-                            let mut label = format!(
-                                "{} {}  {}  ({} ms)",
-                                entry.method, entry.status, entry.url, entry.elapsed_ms
-                            );
-                            if label.len() > 60 {
-                                label.truncate(57);
-                                label.push_str("...");
-                            }
-                            if ui.selectable_label(false, label).clicked() {
-                                history_click = Some(i);
-                            }
-                        }
-                    });
-                if let Some(i) = history_click {
-                    let entry = self.history_entries[i].clone();
-                    self.load_history_entry(&entry);
-                }
-
-                ui.separator();
-
+                // Compact list only (M8) — the actual variable-editing
+                // table moved to the Environment main tab
+                // (`show_environment_editor`), which has more room.
+                // Clicking a name here both selects it (for substitution)
+                // and navigates to that tab to edit it; the tab strip's own
+                // "Active environment" selector, by contrast, only selects
+                // without navigating away from whatever you're editing.
                 ui.label(format!("Environments ({})", self.environments.len()));
 
                 let mut env_action: Option<EnvAction> = None;
@@ -2619,53 +3354,22 @@ impl eframe::App for CurlyApp {
 
                 if let Some(action) = env_action {
                     match action {
-                        EnvAction::Select(name) => self.select_environment(name),
-                        EnvAction::Create(name) => self.create_environment(name),
+                        EnvAction::Select(name) => {
+                            let navigate = name.is_some();
+                            self.select_environment(name);
+                            if navigate {
+                                self.central_view = CentralView::Environment;
+                            }
+                        }
+                        EnvAction::Create(name) => {
+                            self.create_environment(name);
+                            self.central_view = CentralView::Environment;
+                        }
                     }
                 }
 
                 if let Some(notice) = &self.env_notice {
                     ui.colored_label(egui::Color32::from_rgb(120, 190, 130), notice);
-                }
-
-                if let Some(name) = self.active_environment.clone() {
-                    egui::CollapsingHeader::new(format!("Edit \"{name}\""))
-                        .default_open(true)
-                        .show(ui, |ui| {
-                            let mut remove_idx = None;
-                            for (i, v) in self.env_editor_variables.iter_mut().enumerate() {
-                                ui.horizontal(|ui| {
-                                    ui.add(
-                                        egui::TextEdit::singleline(&mut v.key)
-                                            .hint_text("KEY")
-                                            .desired_width(70.0),
-                                    );
-                                    ui.add(
-                                        egui::TextEdit::singleline(&mut v.value)
-                                            .hint_text("value")
-                                            .desired_width(80.0),
-                                    );
-                                    ui.checkbox(&mut v.secret, "secret");
-                                    if ui.small_button("✕").clicked() {
-                                        remove_idx = Some(i);
-                                    }
-                                });
-                            }
-                            if let Some(i) = remove_idx {
-                                self.env_editor_variables.remove(i);
-                            }
-                            if ui.button("+ Add variable").clicked() {
-                                self.env_editor_variables.push(VariableRow::empty());
-                            }
-                            ui.horizontal(|ui| {
-                                if ui.button("Save").clicked() {
-                                    self.save_active_environment();
-                                }
-                                if ui.button("Delete environment").clicked() {
-                                    self.delete_active_environment();
-                                }
-                            });
-                        });
                 }
 
                 ui.separator();
@@ -2701,6 +3405,22 @@ impl eframe::App for CurlyApp {
         egui::CentralPanel::default().show(ui, |ui| {
             let ctx = ui.ctx().clone();
             let mut should_send = false;
+            // Deferred like every other `self`-mutating action triggered
+            // from inside a `match &self.response { ... }` arm below: `resp`
+            // there borrows `self.response` specifically, but
+            // `save_response_to_file` takes `&mut self` (opaque to the
+            // borrow checker — it can't see that the method never touches
+            // `self.response`), so the actual call has to wait until that
+            // match's borrow of `self.response` has ended. Declared up here
+            // (not inside the `CentralView::Request` match arm below) so
+            // they're still in scope where they're read, after that arm's
+            // block closes.
+            let mut save_response_request: Option<(Vec<u8>, String)> = None;
+            // Same deferred-write reason as `save_response_request` above —
+            // `ui.ctx().load_texture(...)` itself doesn't need `&mut self`,
+            // but caching the result into `self.response_image` does, and
+            // `resp` below still borrows `self.response` at that point.
+            let mut decoded_image_texture: Option<egui::TextureHandle> = None;
 
             egui::ScrollArea::horizontal().id_salt("tab_bar").show(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -2727,13 +3447,92 @@ impl eframe::App for CurlyApp {
                     }
                     if let Some(i) = switch_to {
                         self.switch_to_tab(i);
+                        self.central_view = CentralView::Request;
                     }
                     if let Some(i) = close {
                         self.close_tab(i);
                     }
+
+                    // Collection/Folder tabs (M8) — opened on demand by
+                    // clicking a collection's or folder's name in the
+                    // sidebar tree (`open_or_focus_extra_tab`); they persist
+                    // in the strip until explicitly closed, same as request
+                    // tabs, but don't participate in the take/restore swap
+                    // (their content is derived straight from `central_view`,
+                    // not from any `RequestTab`).
+                    let mut focus_extra: Option<usize> = None;
+                    let mut close_extra: Option<usize> = None;
+                    for i in 0..self.extra_tabs.len() {
+                        let entry = self.extra_tabs[i].clone();
+                        let label = match &entry {
+                            ExtraTabKind::Collection(name) => name.clone(),
+                            ExtraTabKind::Folder(_, path) => format!("{path}/"),
+                        };
+                        let selected = self.central_view == entry.central_view();
+                        ui.horizontal(|ui| {
+                            if ui.selectable_label(selected, label).clicked() {
+                                focus_extra = Some(i);
+                            }
+                            if ui.small_button("✕").clicked() {
+                                close_extra = Some(i);
+                            }
+                        });
+                    }
+                    if let Some(i) = focus_extra {
+                        self.central_view = self.extra_tabs[i].central_view();
+                    }
+                    if let Some(i) = close_extra {
+                        let closed = self.extra_tabs.remove(i);
+                        if self.central_view == closed.central_view() {
+                            self.central_view = CentralView::Request;
+                        }
+                    }
+
+                    // Environment (M8) — always present, symmetric with
+                    // request tabs (more room to edit variables than the
+                    // sidebar's compact list); see `show_environment_editor`.
+                    if ui
+                        .selectable_label(self.central_view == CentralView::Environment, "Environment")
+                        .clicked()
+                    {
+                        self.central_view = CentralView::Environment;
+                    }
                 });
             });
+
+            // Active-environment selector (M8) — unlike clicking "Environment"
+            // above or a name in the sidebar, this only changes which
+            // environment `{{variable}}` tokens resolve against; it doesn't
+            // navigate away from whatever tab you're editing.
+            ui.horizontal(|ui| {
+                ui.label("Active environment:");
+                egui::ComboBox::from_id_salt("active_env_selector")
+                    .selected_text(self.active_environment.clone().unwrap_or_else(|| "(none)".to_string()))
+                    .show_ui(ui, |ui| {
+                        if ui.selectable_label(self.active_environment.is_none(), "(none)").clicked() {
+                            self.select_environment(None);
+                        }
+                        for name in self.environments.clone() {
+                            let selected = self.active_environment.as_deref() == Some(name.as_str());
+                            if ui.selectable_label(selected, &name).clicked() {
+                                self.select_environment(Some(name));
+                            }
+                        }
+                    });
+            });
             ui.separator();
+
+            match self.central_view.clone() {
+            CentralView::Collection(name) => {
+                self.show_collection_tab(ui, &name);
+            }
+            CentralView::Folder(collection, path) => {
+                self.show_folder_tab(ui, &collection, &path);
+            }
+            CentralView::Environment => {
+                self.show_environment_editor(ui);
+            }
+            CentralView::Request => {
 
             if let Some(notice) = &self.load_notice {
                 ui.colored_label(egui::Color32::from_rgb(230, 190, 60), notice);
@@ -2829,6 +3628,38 @@ impl eframe::App for CurlyApp {
                 ui.colored_label(egui::Color32::from_rgb(120, 190, 130), notice);
             }
 
+            // Breadcrumb (M8) — collection/folder trail with an editable
+            // trailing segment, positioned above the URL row per the .jfd
+            // reference. Saving it renames the request; it does not touch
+            // the request's content (that's plain Save/Save As, below).
+            self.sync_breadcrumb();
+            ui.horizontal(|ui| {
+                match &self.loaded_request {
+                    Some(loaded) => {
+                        let (folder, _name) = split_folder_and_name(&loaded.path);
+                        let prefix = if folder.is_empty() {
+                            format!("{} › ", loaded.collection)
+                        } else {
+                            format!("{} › {folder} › ", loaded.collection)
+                        };
+                        ui.weak(prefix);
+                        let name_response = ui.add(
+                            egui::TextEdit::singleline(&mut self.breadcrumb_name)
+                                .id_salt("breadcrumb_name")
+                                .desired_width(160.0),
+                        );
+                        let enter_pressed =
+                            name_response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        if ui.small_button("✓").on_hover_text("Save name").clicked() || enter_pressed {
+                            self.save_breadcrumb_name();
+                        }
+                    }
+                    None => {
+                        ui.weak("New request — not yet saved in a collection");
+                    }
+                }
+            });
+
             ui.horizontal(|ui| {
                 egui::ComboBox::from_id_salt("method")
                     .selected_text(self.method.clone())
@@ -2865,17 +3696,14 @@ impl eframe::App for CurlyApp {
             });
 
             ui.horizontal(|ui| {
-                match &self.loaded_request {
-                    Some(loaded) => ui.weak(format!("Editing \"{}/{}\"", loaded.collection, loaded.path)),
-                    None => ui.weak("New request (not saved)"),
-                };
-                if ui.button("New").clicked() {
-                    self.new_request();
-                }
-                if ui.button("Save").clicked() {
+                // Save/Save As styled as prominently as Send (M8) — same
+                // green fill so they read as the primary actions they are,
+                // distinguished from Send by color rather than shape.
+                let save_fill = egui::Color32::from_rgb(46, 125, 50);
+                if ui.add(egui::Button::new("Save").fill(save_fill)).clicked() {
                     self.save_over_loaded();
                 }
-                if ui.button("Save As…").clicked() {
+                if ui.add(egui::Button::new("Save As…").fill(save_fill)).clicked() {
                     self.open_save_dialog();
                 }
             });
@@ -3015,20 +3843,52 @@ impl eframe::App for CurlyApp {
             ui.separator();
             ui.heading("Response");
 
-            // Deferred like every other `self`-mutating action triggered from
-            // inside a `match &self.response { ... }` arm: `resp` there
-            // borrows `self.response` specifically, but `save_response_to_file`
-            // takes `&mut self` (opaque to the borrow checker — it can't see
-            // that the method never touches `self.response`), so the actual
-            // call has to wait until this match's borrow of `self.response`
-            // has ended.
-            let mut save_response_request: Option<(Vec<u8>, String)> = None;
-            // Same deferred-write reason as `save_response_request` above —
-            // `ui.ctx().load_texture(...)` itself doesn't need `&mut self`,
-            // but caching the result into `self.response_image` does, and
-            // `resp` below still borrows `self.response` at that point.
-            let mut decoded_image_texture: Option<egui::TextureHandle> = None;
+            // Sub-tabs (M8) — Body/Headers were stacked (always both
+            // visible) before this; History is new, reusing the
+            // project-wide send log (`history_entries`) filtered to the
+            // active tab's own method+URL, rather than a separate
+            // per-request history feature curly doesn't otherwise have.
+            ui.horizontal(|ui| {
+                for (subtab, label) in [
+                    (ResponseSubtab::Body, "Body"),
+                    (ResponseSubtab::Headers, "Headers"),
+                    (ResponseSubtab::History, "History"),
+                ] {
+                    if ui.selectable_label(self.response_subtab == subtab, label).clicked() {
+                        self.response_subtab = subtab;
+                    }
+                }
+            });
 
+            if self.response_subtab == ResponseSubtab::History {
+                let matching: Vec<usize> = self
+                    .history_entries
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, e)| e.method == self.method && e.url == self.url)
+                    .map(|(i, _)| i)
+                    .collect();
+                if matching.is_empty() {
+                    ui.weak("No history for this request yet — send it to start building history.");
+                }
+                let mut history_click: Option<usize> = None;
+                for i in matching {
+                    let entry = &self.history_entries[i];
+                    let label = format!(
+                        "{}  {}  ({} ms)",
+                        entry.status,
+                        entry.sent_at.format("%Y-%m-%d %H:%M:%S"),
+                        entry.elapsed_ms
+                    );
+                    if ui.selectable_label(false, label).clicked() {
+                        history_click = Some(i);
+                    }
+                }
+                if let Some(i) = history_click {
+                    let entry = self.history_entries[i].clone();
+                    self.load_history_entry(&entry);
+                }
+            } else {
             match &self.response {
                 None if self.in_flight => {
                     ui.label("Sending…");
@@ -3053,13 +3913,11 @@ impl eframe::App for CurlyApp {
                         ui.label(format!("{} bytes", resp.body.len()));
                     });
 
-                    egui::CollapsingHeader::new("Response Headers").show(ui, |ui| {
+                    if self.response_subtab == ResponseSubtab::Headers {
                         for (k, v) in &resp.headers {
                             ui.label(format!("{k}: {v}"));
                         }
-                    });
-
-                    if is_image_content_type(&resp.headers) {
+                    } else if is_image_content_type(&resp.headers) {
                         if self.response_image.is_none() {
                             if let Ok(decoded) = image::load_from_memory(&resp.body_bytes) {
                                 let rgba = decoded.into_rgba8();
@@ -3211,6 +4069,9 @@ impl eframe::App for CurlyApp {
                     }
                 }
             }
+            }
+            } // end CentralView::Request
+            }
 
             if let Some(texture) = decoded_image_texture {
                 self.response_image = Some(texture);
@@ -3239,10 +4100,73 @@ impl eframe::App for CurlyApp {
     }
 }
 
+/// Renders a row's trailing "⋯" menu button, visible only while the row is
+/// hovered (M8) — checked from last frame's hover state, since egui has no
+/// live CSS `:hover` (a one-frame reveal lag, imperceptible in practice) —
+/// or while its own popup is already open, so opening the menu doesn't
+/// immediately hide the button that opened it. `row` renders everything to
+/// the button's left, inside the same `ui.horizontal`, so hovering anywhere
+/// across the row (not just over the button itself) keeps it visible.
+/// Returns the index into `actions` that was clicked this frame, if any.
+fn hover_ellipsis_row(
+    ui: &mut egui::Ui,
+    id_salt: impl std::hash::Hash + std::fmt::Debug,
+    actions: &[&str],
+    row: impl FnOnce(&mut egui::Ui),
+) -> Option<usize> {
+    let row_id = ui.make_persistent_id(id_salt);
+    let popup_id = row_id.with("ellipsis_popup");
+    let was_hovered = ui.ctx().data(|d| d.get_temp::<bool>(row_id)).unwrap_or(false);
+    let show = was_hovered || egui::Popup::is_id_open(ui.ctx(), popup_id);
+
+    let mut clicked = None;
+    let row_response = ui
+        .horizontal(|ui| {
+            row(ui);
+            let btn = ui.add_visible(show, egui::Button::new("⋯").small());
+            if show {
+                egui::Popup::new(popup_id, ui.ctx().clone(), &btn, btn.layer_id)
+                    .open_memory(btn.clicked().then_some(egui::SetOpenCommand::Toggle))
+                    .kind(egui::PopupKind::Menu)
+                    .layout(egui::Layout::top_down_justified(egui::Align::Min))
+                    .gap(0.0)
+                    .show(|ui| {
+                        for (i, label) in actions.iter().enumerate() {
+                            if ui.button(*label).clicked() {
+                                clicked = Some(i);
+                                ui.close();
+                            }
+                        }
+                    });
+            }
+        })
+        .response;
+
+    let now_hovered = row_response.hovered();
+    if now_hovered != was_hovered {
+        ui.ctx().data_mut(|d| d.insert_temp(row_id, now_hovered));
+        ui.ctx().request_repaint();
+    }
+
+    clicked
+}
+
 /// Render a collection's (or folder's) sub-folders and requests, recursing
-/// into each sub-folder as its own collapsing section. Returns the request
-/// clicked this frame, if any — a free function rather than a method since
-/// it only needs the tree data, not the rest of `CurlyApp`.
+/// into each sub-folder as its own collapsing section. Returns the tree
+/// action clicked this frame, if any — a free function rather than a
+/// method since it only needs the tree data, not the rest of `CurlyApp`.
+/// Navigate `folders` by a slash-separated path (M8, `show_folder_tab`) —
+/// `None` if any segment along the way doesn't exist.
+fn find_folder<'a>(folders: &'a [Folder], path: &str) -> Option<&'a Folder> {
+    let mut current = folders;
+    let mut found = None;
+    for segment in path.split('/').filter(|s| !s.is_empty()) {
+        found = current.iter().find(|f| f.name == segment);
+        current = found.map(|f| f.folders.as_slice()).unwrap_or(&[]);
+    }
+    found
+}
+
 fn show_collection_tree(
     ui: &mut egui::Ui,
     prefix: &str,
@@ -3257,13 +4181,31 @@ fn show_collection_tree(
         } else {
             format!("{prefix}/{}", folder.name)
         };
-        egui::CollapsingHeader::new(format!("{}/", folder.name))
-            .id_salt(folder.id)
-            .show(ui, |ui| {
-                if let Some(a) = show_collection_tree(ui, &folder_prefix, &folder.folders, &folder.requests) {
-                    action = Some(a);
+        let state_id = ui.make_persistent_id(("folder_state", folder.id));
+        let header = egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), state_id, false)
+            .show_header(ui, |ui| {
+                if let Some(i) = hover_ellipsis_row(
+                    ui,
+                    ("folder_ellipsis", folder.id),
+                    &["New Folder", "New Request", "Delete Folder"],
+                    |ui| {
+                        if ui.selectable_label(false, format!("{}/", folder.name)).clicked() {
+                            action = Some(TreeAction::OpenFolder(folder_prefix.clone()));
+                        }
+                    },
+                ) {
+                    action = Some(match i {
+                        0 => TreeAction::NewFolder(folder_prefix.clone()),
+                        1 => TreeAction::NewRequest(folder_prefix.clone()),
+                        _ => TreeAction::DeleteFolder(folder_prefix.clone()),
+                    });
                 }
             });
+        header.body(|ui| {
+            if let Some(a) = show_collection_tree(ui, &folder_prefix, &folder.folders, &folder.requests) {
+                action = Some(a);
+            }
+        });
     }
 
     for request in requests {
@@ -3272,21 +4214,18 @@ fn show_collection_tree(
         } else {
             format!("{prefix}/{}", request.name)
         };
-        ui.horizontal(|ui| {
-            let label = format!("{:<7} {}", request.method, request.name);
-            if ui.selectable_label(false, label).clicked() {
+        let label = format!("{:<7} {}", request.method, request.name);
+        if let Some(i) = hover_ellipsis_row(ui, ("request_ellipsis", request.id), &["Rename", "Duplicate", "Delete"], |ui| {
+            if ui.selectable_label(false, &label).clicked() {
                 action = Some(TreeAction::Load(path.clone(), request.clone()));
             }
-            if ui.small_button("✎").on_hover_text("Rename / Move").clicked() {
-                action = Some(TreeAction::Rename(path.clone()));
-            }
-            if ui.small_button("⧉").on_hover_text("Duplicate").clicked() {
-                action = Some(TreeAction::Duplicate(path.clone()));
-            }
-            if ui.small_button("✕").clicked() {
-                action = Some(TreeAction::Delete(path.clone()));
-            }
-        });
+        }) {
+            action = Some(match i {
+                0 => TreeAction::Rename(path.clone()),
+                1 => TreeAction::Duplicate(path.clone()),
+                _ => TreeAction::Delete(path.clone()),
+            });
+        }
     }
 
     action
@@ -4459,6 +5398,51 @@ mod tests {
         assert_eq!(split_folder_and_name("login"), (String::new(), "login".to_string()));
     }
 
+    // --- M8: collection/folder tabs, environment tab ---
+
+    #[test]
+    fn find_folder_navigates_a_nested_path() {
+        let mut oauth = Folder::new("OAuth");
+        oauth.requests.push(SavedRequest::new("refresh", Method::POST, "https://example.com"));
+        let mut auth = Folder::new("Auth");
+        auth.folders.push(oauth);
+        let folders = vec![auth];
+
+        let found = find_folder(&folders, "Auth/OAuth").unwrap();
+        assert_eq!(found.name, "OAuth");
+        assert_eq!(found.requests[0].name, "refresh");
+    }
+
+    #[test]
+    fn find_folder_none_for_a_missing_segment() {
+        let folders = vec![Folder::new("Auth")];
+        assert!(find_folder(&folders, "Auth/Missing").is_none());
+    }
+
+    #[test]
+    fn open_or_focus_extra_tab_reuses_an_existing_entry_instead_of_duplicating_it() {
+        let mut app = CurlyApp::default_state();
+        app.open_or_focus_extra_tab(ExtraTabKind::Collection("my-api".to_string()));
+        app.central_view = CentralView::Request; // navigate away
+        app.open_or_focus_extra_tab(ExtraTabKind::Collection("my-api".to_string()));
+
+        assert_eq!(app.extra_tabs.len(), 1);
+        assert_eq!(app.central_view, CentralView::Collection("my-api".to_string()));
+    }
+
+    #[test]
+    fn open_or_focus_extra_tab_opens_distinct_folders_separately() {
+        let mut app = CurlyApp::default_state();
+        app.open_or_focus_extra_tab(ExtraTabKind::Folder("my-api".to_string(), "Auth".to_string()));
+        app.open_or_focus_extra_tab(ExtraTabKind::Folder("my-api".to_string(), "Health".to_string()));
+
+        assert_eq!(app.extra_tabs.len(), 2);
+        assert_eq!(
+            app.central_view,
+            CentralView::Folder("my-api".to_string(), "Health".to_string())
+        );
+    }
+
     #[test]
     fn build_saved_request_carries_over_editor_fields() {
         let mut app = CurlyApp::default_state();
@@ -4821,6 +5805,83 @@ mod tests {
     }
 
     #[test]
+    fn sync_breadcrumb_reflects_the_loaded_requests_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = project_with(&dir);
+        let mut collection = Collection::new("my-api");
+        collection.add_request("Auth/login", SavedRequest::new("login", Method::GET, "https://example.com")).unwrap();
+        app.active_project().unwrap().storage.save_collection(&collection).unwrap();
+        app.loaded_request = Some(LoadedRequestRef {
+            collection: "my-api".to_string(),
+            path: "Auth/login".to_string(),
+        });
+
+        app.sync_breadcrumb();
+
+        assert_eq!(app.breadcrumb_name, "login");
+    }
+
+    #[test]
+    fn sync_breadcrumb_is_empty_with_nothing_loaded() {
+        let mut app = CurlyApp::default_state();
+        app.breadcrumb_name = "stale".to_string();
+        app.breadcrumb_synced_path = Some("stale/path".to_string());
+
+        app.sync_breadcrumb();
+
+        assert_eq!(app.breadcrumb_name, "");
+    }
+
+    #[test]
+    fn save_breadcrumb_name_renames_the_request_and_resyncs() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = project_with(&dir);
+        let mut collection = Collection::new("my-api");
+        collection.add_request("Auth/login", SavedRequest::new("login", Method::GET, "https://example.com")).unwrap();
+        app.active_project().unwrap().storage.save_collection(&collection).unwrap();
+        app.loaded_request = Some(LoadedRequestRef {
+            collection: "my-api".to_string(),
+            path: "Auth/login".to_string(),
+        });
+        app.sync_breadcrumb();
+        app.breadcrumb_name = "sign-in".to_string();
+
+        app.save_breadcrumb_name();
+
+        assert_eq!(
+            app.loaded_request,
+            Some(LoadedRequestRef {
+                collection: "my-api".to_string(),
+                path: "Auth/sign-in".to_string(),
+            })
+        );
+        assert_eq!(app.breadcrumb_name, "sign-in");
+        let reloaded = app.active_project().unwrap().storage.load_collection("my-api").unwrap();
+        assert!(reloaded.find_request("Auth/login").is_none());
+        assert!(reloaded.find_request("Auth/sign-in").is_some());
+    }
+
+    #[test]
+    fn save_breadcrumb_name_rejects_a_blank_name_without_renaming() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = project_with(&dir);
+        let mut collection = Collection::new("my-api");
+        collection.add_request("login", SavedRequest::new("login", Method::GET, "https://example.com")).unwrap();
+        app.active_project().unwrap().storage.save_collection(&collection).unwrap();
+        app.loaded_request = Some(LoadedRequestRef {
+            collection: "my-api".to_string(),
+            path: "login".to_string(),
+        });
+        app.sync_breadcrumb();
+        app.breadcrumb_name = "   ".to_string();
+
+        app.save_breadcrumb_name();
+
+        assert_eq!(app.loaded_request.unwrap().path, "login");
+        assert!(app.collection_notice.unwrap().contains("name"));
+    }
+
+    #[test]
     fn confirm_path_dialog_renames_and_updates_the_loaded_request() {
         let dir = tempfile::tempdir().unwrap();
         let mut app = project_with(&dir);
@@ -4905,6 +5966,138 @@ mod tests {
 
         assert!(app.path_dialog.is_some());
         assert!(app.path_dialog.unwrap().error.is_some());
+    }
+
+    #[test]
+    fn confirm_folder_dialog_creates_a_folder_in_a_new_collection() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = project_with(&dir);
+        app.open_folder_dialog("my-api".to_string(), String::new());
+        app.folder_dialog.as_mut().unwrap().name = "Auth".to_string();
+
+        app.confirm_folder_dialog();
+
+        assert!(app.folder_dialog.is_none());
+        let reloaded = app.active_project().unwrap().storage.load_collection("my-api").unwrap();
+        assert!(reloaded.folders.iter().any(|f| f.name == "Auth"));
+    }
+
+    #[test]
+    fn confirm_folder_dialog_nests_under_the_given_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = project_with(&dir);
+        let mut collection = Collection::new("my-api");
+        collection.add_folder("Auth");
+        app.active_project().unwrap().storage.save_collection(&collection).unwrap();
+
+        app.open_folder_dialog("my-api".to_string(), "Auth".to_string());
+        app.folder_dialog.as_mut().unwrap().name = "OAuth".to_string();
+        app.confirm_folder_dialog();
+
+        let reloaded = app.active_project().unwrap().storage.load_collection("my-api").unwrap();
+        let auth = reloaded.folders.iter().find(|f| f.name == "Auth").unwrap();
+        assert!(auth.folders.iter().any(|f| f.name == "OAuth"));
+    }
+
+    #[test]
+    fn confirm_folder_dialog_rejects_a_blank_name() {
+        let mut app = CurlyApp::default_state();
+        app.open_folder_dialog("my-api".to_string(), String::new());
+        app.folder_dialog.as_mut().unwrap().name = "  ".to_string();
+
+        app.confirm_folder_dialog();
+
+        assert!(app.folder_dialog.is_some());
+        assert!(app.folder_dialog.unwrap().error.unwrap().contains("name"));
+    }
+
+    #[test]
+    fn delete_folder_removes_an_empty_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = project_with(&dir);
+        let mut collection = Collection::new("my-api");
+        collection.add_folder("Auth");
+        app.active_project().unwrap().storage.save_collection(&collection).unwrap();
+
+        app.delete_folder("my-api", "Auth");
+
+        let reloaded = app.active_project().unwrap().storage.load_collection("my-api").unwrap();
+        assert!(reloaded.folders.is_empty());
+        assert!(app.collection_notice.unwrap().contains("deleted"));
+    }
+
+    #[test]
+    fn delete_folder_refuses_a_non_empty_folder_without_deleting_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = project_with(&dir);
+        let mut collection = Collection::new("my-api");
+        collection.add_request("Auth/login", SavedRequest::new("login", Method::GET, "https://example.com")).unwrap();
+        app.active_project().unwrap().storage.save_collection(&collection).unwrap();
+
+        app.delete_folder("my-api", "Auth");
+
+        let reloaded = app.active_project().unwrap().storage.load_collection("my-api").unwrap();
+        assert!(reloaded.folders.iter().any(|f| f.name == "Auth"));
+        assert!(app.collection_notice.unwrap().contains("failed"));
+    }
+
+    #[test]
+    fn save_all_in_collection_saves_every_dirty_tab_in_that_collection_and_restores_the_active_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = project_with(&dir);
+        let mut collection = Collection::new("my-api");
+        collection.add_request("login", SavedRequest::new("login", Method::GET, "https://old.example.com")).unwrap();
+        collection.add_request("logout", SavedRequest::new("logout", Method::GET, "https://old.example.com")).unwrap();
+        app.active_project().unwrap().storage.save_collection(&collection).unwrap();
+
+        // Tab 0: load + dirty "login".
+        let login = collection.find_request("login").unwrap().clone();
+        app.loaded_request = Some(LoadedRequestRef {
+            collection: "my-api".to_string(),
+            path: "login".to_string(),
+        });
+        app.load_saved_request(&login);
+        app.url = "https://new.example.com/login".to_string();
+
+        // Tab 1 (active): load + dirty "logout" in a second, unrelated tab.
+        app.open_new_tab();
+        let logout = collection.find_request("logout").unwrap().clone();
+        app.loaded_request = Some(LoadedRequestRef {
+            collection: "my-api".to_string(),
+            path: "logout".to_string(),
+        });
+        app.load_saved_request(&logout);
+        app.url = "https://new.example.com/logout".to_string();
+
+        app.save_all_in_collection("my-api");
+
+        assert_eq!(app.active_tab_idx, 1, "the originally active tab should still be active afterward");
+        assert_eq!(app.url, "https://new.example.com/logout", "the active tab's live state must survive the swap");
+        let reloaded = app.active_project().unwrap().storage.load_collection("my-api").unwrap();
+        assert_eq!(reloaded.find_request("login").unwrap().url, "https://new.example.com/login");
+        assert_eq!(reloaded.find_request("logout").unwrap().url, "https://new.example.com/logout");
+        assert!(app.collection_notice.unwrap().contains("2 request"));
+    }
+
+    #[test]
+    fn save_all_in_collection_skips_clean_tabs_and_other_collections() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = project_with(&dir);
+        let mut collection = Collection::new("my-api");
+        collection.add_request("login", SavedRequest::new("login", Method::GET, "https://example.com")).unwrap();
+        app.active_project().unwrap().storage.save_collection(&collection).unwrap();
+
+        // Loaded, but never edited — not dirty.
+        let login = collection.find_request("login").unwrap().clone();
+        app.loaded_request = Some(LoadedRequestRef {
+            collection: "my-api".to_string(),
+            path: "login".to_string(),
+        });
+        app.load_saved_request(&login);
+
+        app.save_all_in_collection("my-api");
+
+        assert!(app.collection_notice.unwrap().contains("nothing to save"));
     }
 
     #[test]
@@ -5606,6 +6799,62 @@ mod tests {
     }
 
     #[test]
+    fn is_tab_dirty_a_blank_tab_matches_its_own_snapshot_and_is_clean() {
+        let snapshot = Some(EditableSnapshot::blank());
+        assert!(!is_tab_dirty(
+            &snapshot,
+            "GET",
+            "",
+            &[HeaderRow::empty()],
+            "",
+            &AuthEditor::default(),
+            &[]
+        ));
+    }
+
+    #[test]
+    fn is_tab_dirty_true_once_a_field_diverges_from_the_snapshot() {
+        let snapshot = Some(EditableSnapshot::blank());
+        assert!(is_tab_dirty(
+            &snapshot,
+            "GET",
+            "http://x.io",
+            &[HeaderRow::empty()],
+            "",
+            &AuthEditor::default(),
+            &[]
+        ));
+    }
+
+    #[test]
+    fn is_tab_dirty_false_once_the_field_reverts_to_match_the_snapshot() {
+        // Round-tripping a value back to what was last saved clears dirty —
+        // it's derived from a comparison, not a sticky flag.
+        let snapshot = Some(EditableSnapshot::capture(
+            "GET",
+            "http://x.io",
+            &[],
+            "",
+            &AuthEditor::default(),
+            &[],
+        ));
+        assert!(!is_tab_dirty(
+            &snapshot,
+            "GET",
+            "http://x.io",
+            &[],
+            "",
+            &AuthEditor::default(),
+            &[]
+        ));
+    }
+
+    #[test]
+    fn is_tab_dirty_with_no_snapshot_at_all_is_always_dirty() {
+        assert!(is_tab_dirty(&None, "GET", "", &[], "", &AuthEditor::default(), &[]));
+    }
+
+    #[test]
     fn tab_label_is_new_request_for_a_blank_tab() {
         let app = CurlyApp::default_state();
         assert_eq!(app.tab_label(0), "New Request");
@@ -5617,7 +6866,8 @@ mod tests {
         app.method = "POST".to_string();
         app.url = "http://x.io/a".to_string();
 
-        assert_eq!(app.tab_label(0), "POST http://x.io/a");
+        // Dirty (M8) — content was typed but nothing's been saved yet.
+        assert_eq!(app.tab_label(0), "* POST http://x.io/a");
     }
 
     #[test]
@@ -5650,7 +6900,7 @@ mod tests {
         // immediately, without needing to switch away and back first.
         app.url = "http://x.io/typing".to_string();
 
-        assert_eq!(app.tab_label(1), "GET http://x.io/typing");
+        assert_eq!(app.tab_label(1), "* GET http://x.io/typing");
     }
 
     #[test]

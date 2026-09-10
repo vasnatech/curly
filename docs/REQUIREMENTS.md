@@ -74,7 +74,7 @@ Curly is a REST API testing tool, positioned as a lighter, self-contained altern
 - Can fully replace Postman + curl for the health-record project's own API testing workflow (JSON REST, Bearer/Basic auth, environments for local/dev/prod).
 - A user can import an existing Postman collection and keep working without re-creating requests by hand.
 - CLI and GUI operate on the same saved collections interchangeably.
-- Single downloadable binary per OS that behaves as both CLI and GUI (resolved in DESIGN.md §3: one `curly` binary, GUI launched with no args or `curly gui`).
+- Single downloadable binary per OS that behaves as both CLI and GUI — **superseded**: DESIGN.md §3's original resolution (one `curly` binary, GUI launched with no args or `curly gui`) held through the egui-based GUI, but the GUI rewrite (DESIGN.md §9's M9 entry) moved it to a separate Tauri app (`curly-gui-tauri/`) with its own packaging story; CLI and GUI still share the same `.curly` storage (NFR-5 stands), just no longer the same executable.
 
 ## 8. Open Questions
 

@@ -21,7 +21,7 @@ use serde_json::Value;
 use crate::exec::ResponseSummary;
 use crate::substitution;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "source", rename_all = "snake_case")]
 pub enum Extraction {
     /// Pull a value out of the JSON response body at `path` (dot/bracket
@@ -78,7 +78,7 @@ impl Extraction {
 
 /// One successfully extracted variable: name, value, and whether it should
 /// be masked when displayed (`curly session show`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Extracted {
     pub name: String,
     pub value: String,

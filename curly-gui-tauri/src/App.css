@@ -1,0 +1,739 @@
+/* Theme tokens — dark-first (matches the egui GUI's default), overridden
+   under light via prefers-color-scheme. Status colors match
+   crates/curly-gui/src/app.rs's own Color32 constants exactly, so a
+   response looks the same regardless of which GUI you're looking at. */
+:root {
+  --bg: #1e1e1e;
+  --bg-alt: #262626;
+  --bg-hover: #333333;
+  --border: #3a3a3a;
+  --text: #e6e6e6;
+  --text-weak: #9a9a9a;
+  --accent: #4a7dfc;
+  --send-bg: #2f6fed;
+  --save-bg: #2e7d32;
+  --status-ok: #5ac864;
+  --status-redirect: #e6be3c;
+  --status-error: #dc5050;
+  --notice-bg: #2a3d2c;
+  --notice-fg: #78be82;
+  --error-bg: #3d2a2a;
+  --json-string: #ce9178;
+  --json-number: #b5cea8;
+  --json-keyword: #569cd6;
+  --match-bg: #7a6a1f;
+  --match-fg: #f5e6a0;
+  --match-current-bg: #d98c2b;
+  --match-current-fg: #1e1e1e;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #ffffff;
+    --bg-alt: #f2f2f2;
+    --bg-hover: #e6e6e6;
+    --border: #d5d5d5;
+    --text: #1a1a1a;
+    --text-weak: #6b6b6b;
+    --notice-bg: #e3f3e5;
+    --error-bg: #f7e3e3;
+    --json-string: #a31515;
+    --json-number: #098658;
+    --json-keyword: #0000ff;
+    --match-bg: #fff3b0;
+    --match-fg: #1a1a1a;
+    --match-current-bg: #f5a623;
+    --match-current-fg: #1a1a1a;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, "Segoe UI", Inter, Helvetica, Arial, sans-serif;
+  font-size: 14px;
+}
+
+.app {
+  display: flex;
+  height: 100vh;
+  width: 100vw;
+}
+
+.weak {
+  color: var(--text-weak);
+}
+
+/* --- Sidebar --- */
+
+.sidebar {
+  width: 260px;
+  min-width: 260px;
+  border-right: 1px solid var(--border);
+  background: var(--bg-alt);
+  overflow-y: auto;
+  padding: 8px;
+}
+
+.sidebar-project-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.sidebar-project-label {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.btn-open-project {
+  flex-shrink: 0;
+  font-size: 11px;
+  padding: 3px 8px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: var(--bg-alt);
+  color: var(--text);
+  cursor: pointer;
+}
+
+.sidebar-project-root {
+  color: var(--text-weak);
+  font-size: 12px;
+  word-break: break-all;
+  margin-bottom: 8px;
+}
+
+.sidebar-tabs {
+  display: flex;
+  gap: 4px;
+  margin: 8px 0;
+}
+
+.sidebar-tab {
+  flex: 1;
+  padding: 6px;
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text);
+  cursor: pointer;
+  border-radius: 4px;
+}
+
+.sidebar-tab.active {
+  background: var(--bg-hover);
+  font-weight: 600;
+}
+
+.sidebar-section {
+  margin-top: 12px;
+}
+
+.sidebar-heading {
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+
+.tree-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 4px;
+  cursor: pointer;
+  border-radius: 3px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tree-row:hover {
+  background: var(--bg-hover);
+}
+
+.tree-row.active {
+  background: var(--bg-hover);
+  font-weight: 600;
+}
+
+.tree-children {
+  margin-left: 14px;
+}
+
+.tree-arrow {
+  width: 10px;
+  display: inline-block;
+  color: var(--text-weak);
+}
+
+.tree-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.new-env-row {
+  display: flex;
+  gap: 4px;
+  margin-top: 6px;
+}
+
+.new-env-row input {
+  flex: 1;
+  padding: 4px 6px;
+  background: var(--bg-alt);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+
+.new-env-row button {
+  padding: 4px 8px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: var(--bg-alt);
+  color: var(--text);
+  cursor: pointer;
+}
+
+.new-env-row button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.tree-error {
+  color: var(--status-error);
+  font-size: 12px;
+}
+
+.method-tag {
+  font-family: monospace;
+  font-size: 11px;
+  color: var(--accent);
+  min-width: 34px;
+}
+
+/* --- Hover "⋯" row menu (M8) — plain CSS :hover, no egui-style
+   frame-lag hack needed. Always in the DOM so RowMenu's own open state
+   survives; just invisible until the row is hovered or its own menu is
+   open. --- */
+
+.row-menu {
+  position: relative;
+  margin-left: auto;
+}
+
+.row-menu-btn {
+  visibility: hidden;
+  background: transparent;
+  border: none;
+  color: var(--text-weak);
+  cursor: pointer;
+  padding: 0 4px;
+  font-size: 14px;
+}
+
+.tree-row:hover .row-menu-btn,
+.row-menu-btn.menu-open {
+  visibility: visible;
+}
+
+.row-menu-popup {
+  position: absolute;
+  right: 0;
+  top: 100%;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+  z-index: 20;
+  min-width: 150px;
+  display: flex;
+  flex-direction: column;
+  padding: 4px 0;
+}
+
+.row-menu-popup button {
+  text-align: left;
+  padding: 6px 12px;
+  background: transparent;
+  border: none;
+  color: var(--text);
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.row-menu-popup button:hover {
+  background: var(--bg-hover);
+}
+
+/* --- Main / tabs --- */
+
+.main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  padding: 8px 12px;
+  overflow-y: auto;
+}
+
+.tab-strip-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 6px;
+}
+
+.tab-strip {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  overflow-x: auto;
+  flex: 1;
+  min-width: 0;
+}
+
+.active-env-selector {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+  font-size: 12px;
+}
+
+.active-env-selector select {
+  background: var(--bg-alt);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 3px 6px;
+}
+
+.tab {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.tab:hover {
+  background: var(--bg-hover);
+}
+
+.tab.active {
+  background: var(--bg-hover);
+  font-weight: 600;
+}
+
+.tab-close {
+  background: transparent;
+  border: none;
+  color: var(--text-weak);
+  cursor: pointer;
+  padding: 0 2px;
+}
+
+.tab-new {
+  background: transparent;
+  border: 1px dashed var(--border);
+  color: var(--text);
+  cursor: pointer;
+  border-radius: 4px;
+  padding: 2px 8px;
+}
+
+.notice {
+  background: var(--notice-bg);
+  color: var(--notice-fg);
+  padding: 6px 10px;
+  border-radius: 4px;
+  margin: 8px 0;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+/* --- Request editor --- */
+
+.request-editor {
+  margin-top: 8px;
+}
+
+.breadcrumb {
+  margin-bottom: 6px;
+  font-size: 13px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.breadcrumb-name {
+  font-family: monospace;
+  font-size: 13px;
+  padding: 2px 4px;
+  background: var(--bg-alt);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  width: 160px;
+}
+
+.method-url-row {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+
+.method-url-row select {
+  background: var(--bg-alt);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 6px;
+}
+
+.url-field {
+  flex: 1;
+  padding: 6px 8px;
+  background: var(--bg-alt);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-family: monospace;
+}
+
+.btn-send {
+  background: var(--send-bg);
+  color: white;
+  border: none;
+  border-radius: 4px;
+  padding: 6px 16px;
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.btn-send:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.save-row {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.btn-save {
+  background: var(--save-bg);
+  color: white;
+  border: none;
+  border-radius: 4px;
+  padding: 5px 14px;
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.subtabs {
+  display: flex;
+  gap: 4px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 8px;
+}
+
+.subtab {
+  background: transparent;
+  border: none;
+  color: var(--text-weak);
+  padding: 6px 10px;
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+}
+
+.subtab.active {
+  color: var(--text);
+  border-bottom-color: var(--accent);
+  font-weight: 600;
+}
+
+.headers-table {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.header-row {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.header-row input[type="text"],
+.header-row input:not([type]) {
+  flex: 1;
+  padding: 4px 6px;
+  background: var(--bg-alt);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+
+.btn-icon {
+  background: transparent;
+  border: none;
+  color: var(--text-weak);
+  cursor: pointer;
+}
+
+.btn-add {
+  align-self: flex-start;
+  background: transparent;
+  border: 1px dashed var(--border);
+  color: var(--text);
+  border-radius: 4px;
+  padding: 4px 10px;
+  cursor: pointer;
+  margin-top: 4px;
+}
+
+.body-editor {
+  width: 100%;
+  min-height: 140px;
+  background: var(--bg-alt);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-family: monospace;
+  padding: 8px;
+  resize: vertical;
+}
+
+.auth-kind-row {
+  display: flex;
+  gap: 16px;
+  margin-bottom: 8px;
+}
+
+.auth-fields {
+  display: flex;
+  gap: 6px;
+}
+
+.auth-fields input {
+  padding: 5px 8px;
+  background: var(--bg-alt);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+
+/* --- Collection/Folder/Environment main tab views --- */
+
+.extra-tab-view {
+  margin-top: 8px;
+}
+
+.extra-tab-actions {
+  display: flex;
+  gap: 6px;
+  margin: 8px 0;
+}
+
+.extra-tab-actions button {
+  padding: 5px 12px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: var(--bg-alt);
+  color: var(--text);
+  cursor: pointer;
+}
+
+.extra-tab-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.env-vars {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 8px;
+}
+
+.secret-label {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  white-space: nowrap;
+  font-size: 12px;
+  color: var(--text-weak);
+}
+
+/* --- Response pane --- */
+
+.response-pane {
+  margin-top: 16px;
+  border-top: 1px solid var(--border);
+  padding-top: 8px;
+}
+
+.response-header-row h3 {
+  margin: 4px 0;
+}
+
+.response-meta {
+  display: flex;
+  gap: 12px;
+  margin-bottom: 6px;
+  font-family: monospace;
+}
+
+.status-ok {
+  color: var(--status-ok);
+  font-weight: 600;
+}
+
+.status-redirect {
+  color: var(--status-redirect);
+  font-weight: 600;
+}
+
+.status-error {
+  color: var(--status-error);
+  font-weight: 600;
+}
+
+.response-body {
+  background: var(--bg-alt);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 8px;
+  overflow: auto;
+  max-height: 50vh;
+  font-family: monospace;
+  white-space: pre-wrap;
+  word-break: break-word;
+  margin: 0;
+}
+
+.json-string {
+  color: var(--json-string);
+}
+
+.json-number {
+  color: var(--json-number);
+}
+
+.json-keyword {
+  color: var(--json-keyword);
+  font-weight: 600;
+}
+
+.json-punct,
+.json-other {
+  color: var(--text);
+}
+
+mark.match-other {
+  background: var(--match-bg);
+  color: var(--match-fg);
+}
+
+mark.match-current {
+  background: var(--match-current-bg);
+  color: var(--match-current-fg);
+}
+
+.search-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+
+.search-row input {
+  padding: 4px 8px;
+  background: var(--bg-alt);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  width: 200px;
+}
+
+.response-error {
+  background: var(--error-bg);
+  color: var(--status-error);
+  padding: 6px 10px;
+  border-radius: 4px;
+}
+
+/* --- Dialogs --- */
+
+.dialog-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 10;
+}
+
+.dialog {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 16px;
+  width: 340px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.dialog label {
+  display: flex;
+  flex-direction: column;
+  font-size: 12px;
+  color: var(--text-weak);
+  gap: 2px;
+}
+
+.dialog input {
+  padding: 6px 8px;
+  background: var(--bg-alt);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-size: 14px;
+}
+
+.dialog-error {
+  color: var(--status-error);
+  font-size: 12px;
+}
+
+.dialog-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  margin-top: 8px;
+}
+
+.dialog-actions button {
+  padding: 6px 14px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: var(--bg-alt);
+  color: var(--text);
+  cursor: pointer;
+}

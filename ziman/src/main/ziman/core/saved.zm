@@ -578,6 +578,26 @@ fn sendable_body(b: SavedBody) -> Result<model.Body, string> {
     }
 }
 
+// What `curly run` takes: a collection and a request within it.
+pub struct RunTarget {
+    collection: string
+    request: string
+}
+
+// Splits `collection/request` on the **first** slash, so the request half may itself be a nested
+// path -- `api/Auth/OAuth/login` is the request `Auth/OAuth/login` in the collection `api`. Both
+// halves must be non-empty, since `/login` names no collection and `api/` names no request.
+pub fn parse_run_target(target: string) -> Result<RunTarget, string> {
+    val at = index_of(target, "/", 0)
+    if at <= 0 || at == len(target) - 1 {
+        return err(concat("invalid run target (expected \"collection/request-name\"): ", target))
+    }
+    return ok(RunTarget {
+        collection: substring(target, 0, at),
+        request: substring(target, at + 1, len(target))
+    })
+}
+
 // ---------------------------------------------------------------- resolving
 
 // Substitutes `{{variable}}` throughout a saved request -- the URL, enabled header and query

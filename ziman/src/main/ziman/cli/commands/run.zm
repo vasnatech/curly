@@ -1,0 +1,136 @@
+// `curly run <collection>/<request-name>` -- execute a saved request.
+//
+// **The variable scope, low to high**: a `global` environment, always merged in when it exists and
+// skipped in silence when it does not; then `--env`'s environment; then that environment's
+// **session**, which this request's own `extract` rules wrote on a previous run (or another
+// request's did); then `--var key=value`.
+//
+// The session sitting above the environment files is the point of the feature: a token extracted a
+// moment ago is more current than whatever the committed file said.
+use cli/args.Parsed
+use cli/args.all_of
+use cli/args.parse_assignment
+use cli/args.value_of
+use cli/connection
+use cli/execute
+use cli/output
+use cli/output.OutputArgs
+use core/collection.find_request
+use core/exec.ResponseSummary
+use core/extraction.Extraction
+use core/extraction.apply
+use core/saved.environment_set
+use core/saved.into_request
+use core/saved.parse_run_target
+use core/saved.resolve as resolve_request
+use core/storage.Storage
+use core/storage.load_collection
+use core/storage.load_environment
+use core/storage.load_environment_opt
+use core/storage.load_session
+use core/storage.save_session
+use os
+
+pub fn value_flags() -> [string] {
+    return concat(
+        ["--env", "--var"],
+        concat(connection.value_flags(), output.value_flags())
+    )
+}
+
+pub fn switch_flags() -> [string] {
+    return concat(connection.switch_flags(), output.switch_flags())
+}
+
+// `--env`'s value, or `global`. **Distinct from the `global` environment**, which is merged in
+// whatever this says -- so a run with no `--env` reads and writes the `global` session while also
+// merging the `global` environment, and those are two different files.
+fn session_scope(p: Parsed) -> string {
+    return switch value_of(p, "env") {
+        Some(name) { name }
+        None { "global" }
+    }
+}
+
+fn merged_variables(store: Storage, p: Parsed) -> Result<Map<string, string>, string> {
+    val out = mutable_map_new<string, string>()
+    switch load_environment_opt(store, "global") {
+        Ok(found) {
+            if Some(global) = found {
+                for v in global.variables {
+                    set(out, v.key, v.value)
+                }
+            }
+        }
+        Err(why) { return err(why) }
+    }
+    if Some(name) = value_of(p, "env") {
+        // Named explicitly, so its absence is an error -- unlike `global`.
+        val env = try load_environment(store, name)
+        for v in env.variables {
+            set(out, v.key, v.value)
+        }
+    }
+    val session = try load_session(store, session_scope(p))
+    for v in session.variables {
+        set(out, v.key, v.value)
+    }
+    for raw in all_of(p, "var") {
+        val pair = try parse_assignment(raw, "--var")
+        set(out, pair.key, pair.value)
+    }
+    return ok(snapshot(out))
+}
+
+pub fn run(p: Parsed, store: Storage) -> Result<unit, string> {
+    if len(p.positionals) == 0 {
+        return err("usage: curly run <collection>/<request-name>")
+    }
+    val target = try parse_run_target(p.positionals[0])
+    val collection = try load_collection(store, target.collection)
+    val saved = switch find_request(collection, target.request) {
+        Some(r) { r }
+        None {
+            return err(prelude.format(
+                "collection \"{}\" has no request named \"{}\"",
+                target.collection,
+                target.request
+            ))
+        }
+    }
+    val variables = try merged_variables(store, p)
+    val resolved = try resolve_request(saved, variables)
+    val request = try into_request(resolved)
+    val out = output.from_args(p)
+    val scope = session_scope(p)
+    val rules = saved.extract
+
+    // The extraction runs **after** the response has been printed, which `cli/execute.zm` arranges:
+    // a rule that cannot be satisfied must not swallow the response somebody is debugging it
+    // against.
+    return execute.run(
+        request,
+        try connection.from_args(p),
+        out,
+        store,
+        fn(response: ResponseSummary) -> Result<unit, string> {
+            // **Only a 2xx is extracted from.** A failed login has no token to pull out, and that is an
+            // expected absence rather than a bug -- so the rules are skipped, not failed.
+            if response.status < 200 || response.status >= 300 || len(rules) == 0 {
+                return ok(unit)
+            }
+            val extracted = try apply(rules, response, variables)
+            var session = try load_session(store, scope)
+            for one in extracted {
+                session = environment_set(session, one.name, one.value, one.secret)
+            }
+            try save_session(store, session)
+            if out.verbose {
+                for one in extracted {
+                    os.write_stderr(prelude.format("~ extracted {} into session \"{}\"\n", one.name, scope))
+                }
+            }
+            return ok(unit)
+        }
+    )
+}

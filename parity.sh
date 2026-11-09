@@ -347,6 +347,8 @@ class H(BaseHTTPRequestHandler):
         raw = self.rfile.read(n) if n else b""
         if p.path == "/plain":
             body, ct, code = b"hello world", "text/plain", 200
+        elif p.path == "/token":
+            body, ct, code = b'{"token":"abc123"}', "application/json", 200
         elif p.path == "/boom":
             body, ct, code = b'{"error":"nope"}', "application/json", 500
         else:
@@ -377,10 +379,17 @@ for _ in $(seq 1 40); do
 done
 
 OSB="http://127.0.0.1:$OS_PORT"
+# `elapsed_ms` is a measurement, a multipart boundary is random by design, and the server's `Date`
+# header is the wall clock -- two invocations a second apart legitimately disagree. **The `Date`
+# normalisation was added after noticing the `-i` and `--json` checks only passed when both
+# invocations landed inside the same second**, which is a flake waiting for a slow machine rather
+# than a check. Nothing else is normalised.
 os_normalise() {
   sed -E -e 's/"elapsed_ms": [0-9]+/"elapsed_ms": <ms>/' \
          -e 's/boundary=[A-Za-z0-9-]+/boundary=<b>/g' \
-         -e 's/--[A-Za-z0-9-]{20,}/--<b>/g'
+         -e 's/--[A-Za-z0-9-]{20,}/--<b>/g' \
+         -e 's/^date: .*/date: <when>/' \
+         -e 's/"date": "[^"]*"/"date": "<when>"/'
 }
 
 one_shot_both() {
@@ -414,6 +423,93 @@ if [ -x "$ZCLI" ]; then
   one_shot_both "a malformed -u" "$OSB/echo" -u nocolon
   one_shot_both "a malformed -H" "$OSB/echo" -H nocolon
   one_shot_both "a malformed -Q" "$OSB/echo" -Q nokey
+fi
+
+# ---- curly run ----------------------------------------------------------------------------------
+#
+# A saved request executed by both binaries against the same stub, with the same storage layout
+# built by each in its own root -- so the comparison covers the variable precedence, the response
+# rendering, and what the extraction rules leave behind in the session.
+
+# **The fixture is built once with the Rust binary and copied**, rather than built by each side
+# with its own CLI: `collections add-request` is not ported yet, and a check that depends on an
+# unported command tests nothing about the one under test. Both `run` invocations then see byte-
+# identical storage.
+if [ -x "$ZCLI" ]; then
+  tmpl="$work/run-template"
+  mkdir -p "$tmpl"
+  "$RUST" collections add-request api echo "$OSB/echo?who={{WHO}}" --data-dir "$tmpl" >/dev/null 2>&1
+  "$RUST" collections add-request api token "$OSB/token" --data-dir "$tmpl" >/dev/null 2>&1
+  "$RUST" env set staging WHO=world --data-dir "$tmpl" >/dev/null 2>&1
+  "$RUST" env set staging GREETING=hello --data-dir "$tmpl" >/dev/null 2>&1
+  # No CLI subcommand writes an extraction rule (the GUI's editor does), so it goes in by hand.
+  python3 -I - "$tmpl/collections/api.json" <<'PYJSON'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+for r in d["requests"]:
+    if r["name"] == "token":
+        r["extract"] = [{"source": "body", "name": "TOKEN", "path": "token", "secret": False}]
+json.dump(d, open(p, "w"), indent=2)
+PYJSON
+
+  r_root="$work/run-rust"
+  z_root="$work/run-ziman"
+  cp -r "$tmpl" "$r_root"
+  cp -r "$tmpl" "$z_root"
+
+  run_both() {
+    local label="$1"; shift
+    local a b
+    a="$("$RUST" run "$@" --data-dir "$r_root" 2>&1 | os_normalise)" || true
+    b="$(ZIMAN="$ZIMAN" "$ZCLI" run "$@" --data-dir "$z_root" 2>&1 | os_normalise)" || true
+    if [ "$a" = "$b" ]; then
+      ok "run: $label"
+    else
+      bad "run: $label" "$(diff <(echo "$a") <(echo "$b") | head -12 | tr '\n' '|')"
+    fi
+  }
+
+  run_both "a saved request with --env substitution" api/echo --env staging
+  run_both "--var overrides the environment" api/echo --env staging --var WHO=overridden
+  run_both "without --env an unresolved variable is refused" api/echo
+  # A refusal, first line only -- same reason as `cli_refusal_both`: the message is the contract
+  # and `anyhow`'s `Caused by:` paragraph is its library's presentation.
+  # Each side runs against its own copy of the fixture, because `run` writes the session -- so the
+  # storage root appears in the message and is normalised away. It is the only substitution here,
+  # and it is the harness's own doing rather than a difference between the implementations.
+  run_refusal_both() {
+    local label="$1"; shift
+    local a b
+    a="$("$RUST" run "$@" --data-dir "$r_root" 2>&1 | head -1 | sed "s|$r_root|<root>|g")" || true
+    b="$(ZIMAN="$ZIMAN" "$ZCLI" run "$@" --data-dir "$z_root" 2>&1 | head -1 | sed "s|$z_root|<root>|g")" || true
+    if [ "$a" = "$b" ]; then
+      ok "run: $label"
+    else
+      bad "run: $label" "rust=[$a] ziman=[$b]"
+    fi
+  }
+  run_refusal_both "a malformed target" not-a-target
+  run_refusal_both "a target naming no collection" nope/echo
+  run_refusal_both "a target naming no request" api/nope
+  run_both "--json rendering of a saved request" api/echo --env staging --json
+
+  # **Extraction into the session, through the CLI** -- the behaviour `run` exists for: a request's
+  # own rules write the session, and a later run substitutes what they wrote.
+  "$RUST" run api/token --data-dir "$r_root" >/dev/null 2>&1
+  ZIMAN="$ZIMAN" "$ZCLI" run api/token --data-dir "$z_root" >/dev/null 2>&1
+  rust_session="$("$RUST" session show --data-dir "$r_root" 2>&1)"
+  zim_session="$(ZIMAN="$ZIMAN" "$ZCLI" session show --data-dir "$z_root" 2>&1)"
+  if [ "$rust_session" = "$zim_session" ] && echo "$zim_session" | grep -q 'TOKEN=abc123'; then
+    ok "run: an extraction rule writes the same session on both"
+  else
+    bad "run: extracted session differs" "rust=[$rust_session] ziman=[$zim_session]"
+  fi
+
+  # And the next run sees it: {{TOKEN}} resolves from the session alone.
+  "$RUST" collections add-request api uses-token "$OSB/echo?t={{TOKEN}}" --data-dir "$r_root" >/dev/null 2>&1
+  cp "$r_root/collections/api.json" "$z_root/collections/api.json"
+  run_both "a later run substitutes what an earlier one extracted" api/uses-token
 fi
 
 # ---- the slug -----------------------------------------------------------------------------------

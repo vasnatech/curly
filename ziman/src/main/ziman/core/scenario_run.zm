@@ -1,0 +1,429 @@
+// Executing a scenario: walking its node tree, sending each request, routing at each `choice`, and
+// writing what was extracted into the session.
+//
+// **Separate from `core/scenario.zm` because the dependencies point opposite ways.** `core/storage`
+// names `Scenario` so it can load and save one; executing a scenario calls `core/storage` to read
+// the imported collections, the environments and the session. Rust keeps both halves in one file,
+// which a crate allows and a module graph does not -- so the model and its codec stay low in the
+// graph and this sits above them. Rust marks the same line with its `// --- Pure logic ---`
+// comment; this is the other side of it.
+//
+// **Nothing here produces a pass or fail verdict.** A scenario halts or completes, and a `choice`
+// routes -- `StepOutcome.HttpFailure` means "this request answered outside 2xx and something
+// downstream may want to know", not "the test failed". Scenarios are orchestration; assertions are
+// a non-goal this project wrote down deliberately.
+use core/collection.find_request as collection_find_request
+use core/exec.ResponseSummary
+use core/exec as exec
+use core/extraction as extraction
+use core/model.Pair
+use core/saved.Collection
+use core/saved.environment_set
+use core/saved.into_request
+use core/saved.resolve as saved_resolve
+use core/scenario.ChoiceNode
+use core/scenario.RequestsNode
+use core/scenario.Scenario
+use core/scenario.ScenarioNode
+use core/scenario.evaluate_condition
+use core/scenario.resolve_request_ref
+use core/storage as storage
+use http
+
+// Why a run stopped, or that it did not.
+//
+// **Only a plain `request` node ever produces `HttpFailure`**; every composite either propagates a
+// child's `Halted` or resolves to `Ok`.
+pub enum StepOutcome {
+    Ok
+    HttpFailure
+    Halted(string)
+}
+
+// One request node's outcome, in the order it completed. The flat back-to-back log is a first pass
+// simple enough to build on rather than a settled output format.
+pub struct StepLog {
+    reference: string
+    method: string
+    url: string
+    // Absent only when the request never got a response at all -- see `error`.
+    status: Option<int>
+    error: Option<string>
+    extracted: [string]
+}
+
+pub struct ScenarioRun {
+    outcome: StepOutcome
+    steps: [StepLog]
+}
+
+// What every node needs. **Collections are loaded once, keyed by alias** rather than by their real
+// name, so `resolve_request_ref`'s alias is a direct lookup and a scenario's collections are not
+// re-read from disk for every request node.
+pub struct ExecDeps {
+    storage: storage.Storage
+    collections: Map<string, Collection>
+    env_name: Option<string>
+    var_overrides: [Pair]
+}
+
+struct NodeResult {
+    outcome: StepOutcome
+    // The response this node hands to whatever comes next, typically a `choice`. **Carried forward
+    // even on `HttpFailure`**, since inspecting exactly that is what a following choice is for.
+    response: Option<ResponseSummary>
+    steps: [StepLog]
+}
+
+// Runs a scenario to completion.
+//
+// **Every imported collection is loaded up front**, so a scenario naming a collection that does not
+// exist fails immediately rather than part-way through, after some requests have already been sent.
+pub fn run(
+    scenario: Scenario,
+    store: storage.Storage,
+    env_name: Option<string>,
+    var_overrides: [Pair]
+) -> Result<ScenarioRun, string> {
+    val loaded = mutable_map_new<string, Collection>()
+    for alias in keys(scenario.imports) {
+        val name = get_or(scenario.imports, alias, "")
+        val collection = switch storage.load_collection(store, name) {
+            Ok(c) { c }
+            Err(why) {
+                return err(prelude.format(
+                    "scenario \"{}\": import \"{}\" -> collection \"{}\": {}",
+                    scenario.name,
+                    alias,
+                    name,
+                    why
+                ))
+            }
+        }
+        set(loaded, alias, collection)
+    }
+    val deps = ExecDeps {
+        storage: store,
+        collections: snapshot(loaded),
+        env_name: env_name,
+        var_overrides: var_overrides
+    }
+    val result = try execute_container(scenario.requests, deps, None)
+    return ok(ScenarioRun { outcome: result.outcome, steps: result.steps })
+}
+
+fn execute_container(
+    container: RequestsNode,
+    deps: ExecDeps,
+    incoming: Option<ResponseSummary>
+) -> Result<NodeResult, string> {
+    return switch container.kind {
+        Sequence { execute_sequence(container.items, deps, incoming) }
+        Parallel { execute_parallel(container.items, deps, incoming) }
+    }
+}
+
+fn execute_node(node: ScenarioNode, deps: ExecDeps, incoming: Option<ResponseSummary>) -> Result<NodeResult, string> {
+    return switch node {
+        Request(reference) { execute_request(reference, deps) }
+        Requests(container) { execute_container(container, deps, incoming) }
+        Choice(choice) { execute_choice(choice, deps, incoming) }
+    }
+}
+
+// ---------------------------------------------------------------- one request
+
+fn execute_request(reference: string, deps: ExecDeps) -> Result<NodeResult, string> {
+    val aliases = mutable_array_new<string>()
+    for alias in keys(deps.collections) {
+        push(aliases, alias)
+    }
+    val target = try resolve_request_ref(reference, snapshot(aliases))
+    val collection = switch get(deps.collections, target.alias) {
+        Some(c) { c }
+        None { return err(concat("no collection imported as ", target.alias)) }
+    }
+    val saved = switch collection_find_request(collection, target.path) {
+        Some(r) { r }
+        None {
+            return err(prelude.format(
+                "request \"{}\": no request named \"{}\" in collection \"{}\" (imported as \"{}\")",
+                reference,
+                target.path,
+                collection.name,
+                target.alias
+            ))
+        }
+    }
+
+    // **Re-derived before every request, not once per scenario**: an earlier step's extraction
+    // writes into the session, and a later step's `{{substitution}}` has to see that.
+    val variables = try merged_variables(deps.storage, deps.env_name, deps.var_overrides)
+    val resolved = switch saved_resolve(saved, variables) {
+        Ok(r) { r }
+        Err(why) { return err(prelude.format("request \"{}\": {}", reference, why)) }
+    }
+    val request = switch into_request(resolved) {
+        Ok(r) { r }
+        Err(why) { return err(prelude.format("request \"{}\": {}", reference, why)) }
+    }
+    val method = http.method_name(request.method)
+    val url = request.url
+
+    val answered = exec.send(request)
+    if Err(why) = answered {
+        // **A send that never got a response is a halt, not an `Err` out of `run`**: the step log
+        // has to record the attempt, so the caller sees which request died and why.
+        return ok(NodeResult {
+            outcome: StepOutcome.Halted(prelude.format("request \"{}\" failed to send: {}", reference, why)),
+            response: None,
+            steps: [StepLog {
+                reference: reference,
+                method: method,
+                url: url,
+                status: None,
+                error: Some(why),
+                extracted: []
+            }]
+        })
+    }
+    val response = unwrap(answered)
+    val two_hundreds = response.status >= 200 && response.status < 300
+
+    // **Extraction runs only on a 2xx**, because a rule that cannot be satisfied is an error and a
+    // non-2xx body is not the shape the rules were written against.
+    val extracted_names = mutable_array_new<string>()
+    if two_hundreds && len(saved.extract) != 0 {
+        val extracted = switch extraction.apply(saved.extract, response, variables) {
+            Ok(found) { found }
+            Err(why) { return err(prelude.format("request \"{}\": extraction: {}", reference, why)) }
+        }
+        if len(extracted) != 0 {
+            // **Written to the session, never to the environment file.** An extracted token is a
+            // fact about this run, not a setting somebody chose and committed.
+            val scope = switch deps.env_name {
+                Some(name) { name }
+                None { "global" }
+            }
+            var session = switch storage.load_session(deps.storage, scope) {
+                Ok(s) { s }
+                Err(why) { return err(why) }
+            }
+            for one in extracted {
+                session = environment_set(session, one.name, one.value, one.secret)
+                push(extracted_names, one.name)
+            }
+            if Err(why) = storage.save_session(deps.storage, session) {
+                return err(why)
+            }
+        }
+    }
+
+    return ok(NodeResult {
+        outcome: if two_hundreds { StepOutcome.Ok } else { StepOutcome.HttpFailure },
+        response: Some(response),
+        steps: [StepLog {
+            reference: reference,
+            method: method,
+            url: url,
+            status: Some(response.status),
+            error: None,
+            extracted: snapshot(extracted_names)
+        }]
+    })
+}
+
+// ---------------------------------------------------------------- containers
+
+fn execute_sequence(
+    items: [ScenarioNode],
+    deps: ExecDeps,
+    incoming: Option<ResponseSummary>
+) -> Result<NodeResult, string> {
+    var current = incoming
+    val all_steps = mutable_array_new<StepLog>()
+    for i in 0..len(items) {
+        val result = try execute_node(items[i], deps, current)
+        for step in result.steps {
+            push(all_steps, step)
+        }
+        switch result.outcome {
+            Ok { current = result.response }
+            Halted(reason) {
+                return ok(NodeResult {
+                    outcome: StepOutcome.Halted(reason),
+                    response: result.response,
+                    steps: snapshot(all_steps)
+                })
+            }
+            HttpFailure {
+                current = result.response
+                // **A non-2xx is allowed to pass only into a `choice` that comes next.** Anywhere
+                // else it halts the run, so a scenario cannot carry on silently past a failed
+                // request -- handling one has to be written down, as a choice.
+                if i + 1 < len(items) && ScenarioNode.is_Choice(items[i + 1]) {
+                    continue
+                }
+                val status = switch current {
+                    Some(r) { r.status }
+                    None { 0 }
+                }
+                val reason = switch items[i] {
+                    Request(reference) {
+                        prelude.format(
+                            "request \"{}\" returned {} and was not explicitly handled by a following choice",
+                            reference,
+                            str(status)
+                        )
+                    }
+                    Requests(_) {
+                        prelude.format(
+                            "a step returned {} and was not explicitly handled by a following choice",
+                            str(status)
+                        )
+                    }
+                    Choice(_) {
+                        prelude.format(
+                            "a step returned {} and was not explicitly handled by a following choice",
+                            str(status)
+                        )
+                    }
+                }
+                return ok(NodeResult {
+                    outcome: StepOutcome.Halted(reason),
+                    response: current,
+                    steps: snapshot(all_steps)
+                })
+            }
+        }
+    }
+    return ok(NodeResult { outcome: StepOutcome.Ok, response: current, steps: snapshot(all_steps) })
+}
+
+// **The branches run one after another, where Rust runs them through `join_all` -- and the answer
+// is the same.** Rust picks the failure to report "by declared (array) order ... not completion-time
+// order (nondeterministic)" and collects the steps in declared order too, so nothing observable
+// here depends on the branches overlapping in time; only wall-clock duration does. Sequential
+// execution is in fact the less surprising of the two, because branches that extract into the
+// shared session race each other under `join_all`.
+//
+// Running them concurrently would mean threads, and an extraction writing the session from two of
+// them at once is a corruption this does not have to reason about. If the wall-clock cost ever
+// matters, that is the trade to weigh -- deliberately, and with a session that can take it.
+fn execute_parallel(
+    items: [ScenarioNode],
+    deps: ExecDeps,
+    incoming: Option<ResponseSummary>
+) -> Result<NodeResult, string> {
+    if len(items) == 0 {
+        return ok(NodeResult { outcome: StepOutcome.Ok, response: incoming, steps: [] })
+    }
+    val branches = mutable_array_new<NodeResult>()
+    for item in items {
+        // Each branch sees the same incoming response, not the previous branch's: they are siblings.
+        push(branches, try execute_node(item, deps, incoming))
+    }
+    val results = snapshot(branches)
+    val all_steps = mutable_array_new<StepLog>()
+    for branch in results {
+        for step in branch.steps {
+            push(all_steps, step)
+        }
+    }
+    // The first failure by declared order; branch 0 when every branch succeeded.
+    var winner = 0
+    for i in 0..len(results) {
+        if !StepOutcome.is_Ok(results[i].outcome) {
+            winner = i
+            break
+        }
+    }
+    return ok(NodeResult {
+        outcome: results[winner].outcome,
+        response: results[winner].response,
+        steps: snapshot(all_steps)
+    })
+}
+
+fn execute_choice(choice: ChoiceNode, deps: ExecDeps, incoming: Option<ResponseSummary>) -> Result<NodeResult, string> {
+    val response = switch incoming {
+        Some(r) { r }
+        None {
+            return ok(NodeResult {
+                outcome: StepOutcome.Halted("choice: no response available to evaluate (no preceding request)"),
+                response: None,
+                steps: []
+            })
+        }
+    }
+    for one in choice.cases {
+        if evaluate_condition(one.when, response.status, response.headers, response.body) {
+            return execute_node(one.then, deps, incoming)
+        }
+    }
+    if Some(fallback) = choice.default {
+        return execute_node(fallback, deps, incoming)
+    }
+    // **An unmatched response with no `default` halts**, rather than carrying on as though a branch
+    // had been taken. Silently continuing is the behaviour this design rejected.
+    return ok(NodeResult {
+        outcome: StepOutcome.Halted(prelude.format(
+            "choice: response status {} matched no case and no default was given",
+            str(response.status)
+        )),
+        response: Some(response),
+        steps: []
+    })
+}
+
+// ---------------------------------------------------------------- the variable scope
+
+// The scope a request is resolved against, in precedence order: the `global` environment, then the
+// selected one, then **that environment's session**, then the `--var` overrides.
+//
+// The session sits above the environment files on purpose: a token extracted a moment ago is more
+// current than whatever the file said when it was committed.
+pub fn merged_variables(
+    store: storage.Storage,
+    env_name: Option<string>,
+    overrides: [Pair]
+) -> Result<Map<string, string>, string> {
+    val out = mutable_map_new<string, string>()
+    switch storage.load_environment_opt(store, "global") {
+        Ok(found) {
+            if Some(global) = found {
+                for v in global.variables {
+                    set(out, v.key, v.value)
+                }
+            }
+        }
+        Err(why) { return err(why) }
+    }
+    if Some(name) = env_name {
+        // Named explicitly, so its absence is an error -- unlike `global`, which is optional.
+        switch storage.load_environment(store, name) {
+            Ok(env) {
+                for v in env.variables {
+                    set(out, v.key, v.value)
+                }
+            }
+            Err(why) { return err(why) }
+        }
+    }
+    val scope = switch env_name {
+        Some(name) { name }
+        None { "global" }
+    }
+    switch storage.load_session(store, scope) {
+        Ok(session) {
+            for v in session.variables {
+                set(out, v.key, v.value)
+            }
+        }
+        Err(why) { return err(why) }
+    }
+    for one in overrides {
+        set(out, one.name, one.value)
+    }
+    return ok(snapshot(out))
+}

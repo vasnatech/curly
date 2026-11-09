@@ -8,8 +8,12 @@
 // here that looks arbitrary probably has a documented reason.
 //
 // This file is the **declarative half**: the model, its codecs, condition evaluation and reference
-// resolution, all pure. Running a scenario needs storage, a collection set and the network, and
-// lands separately.
+// resolution, all pure. `core/scenario_run.zm` executes one, and the split is not a stylistic
+// choice -- `core/storage.zm` has to name `Scenario` to load and save it, while executing a
+// scenario has to call `storage` to read collections and the session. Rust holds both in one file
+// because a crate's modules may be mutually referential; a module graph may not, so the type and
+// its codec stay low in the graph and the behaviour that needs storage sits above it. Rust marks
+// the same boundary with a `// --- Pure logic ---` comment.
 //
 // **Three enums here are serde-`untagged`**, keyed by which field is present rather than by a
 // `"type"` discriminator -- `{"request": ".."}` against `{"requests": {..}}` against

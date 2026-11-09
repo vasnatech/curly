@@ -1,0 +1,270 @@
+// Drives `core/scenario_run.run` for `scenario_run_test.py`, which supplies a stub server and a
+// fresh storage root. One case per `CURLY_CASE`, each printing the run as a single JSON line.
+//
+// Mirrors `crates/curly-core/tests/scenario_test.rs`, which does the same against wiremock and a
+// tempdir: these are the parts of the engine that need a real socket and real files, as against
+// `scenario.zm`'s pure logic, which `src/test/unit/scenario_test.zm` covers.
+use core/extraction.BodyRule
+use core/extraction.Extraction
+use core/model.Pair
+use core/saved.Collection
+use core/saved.Environment
+use core/saved.SavedRequest
+use core/saved.Variable
+use core/saved.kv_pair_of
+use core/scenario.ChoiceCase
+use core/scenario.ChoiceNode
+use core/scenario.Comparison
+use core/scenario.Condition
+use core/scenario.RequestsNode
+use core/scenario.Scenario
+use core/scenario.ScenarioNode
+use core/scenario.SequenceKind
+use core/scenario.scenario_of
+use core/scenario_run.ScenarioRun
+use core/scenario_run.StepOutcome
+use core/scenario_run.run
+use core/storage.Storage
+use core/storage.save_collection
+use core/storage.save_environment
+use core/storage.storage_of
+use json
+use json.Json
+use os
+use uuid.uuid_new
+
+fn env_or(name: string, fallback: string) -> string {
+    return switch os.get_env(name) {
+        Some(v) { v }
+        None { fallback }
+    }
+}
+
+fn base() -> string {
+    return env_or("CURLY_BASE", "http://127.0.0.1:1")
+}
+
+fn a_request(name: string, path: string) -> SavedRequest {
+    return SavedRequest {
+        id: uuid_new(),
+        name: name,
+        method: "GET",
+        url: concat(base(), path),
+        query_params: [],
+        headers: [],
+        body: None,
+        auth: None,
+        extract: []
+    }
+}
+
+fn step(reference: string) -> ScenarioNode {
+    return ScenarioNode.Request(reference)
+}
+
+fn sequence(items: [ScenarioNode]) -> RequestsNode {
+    return RequestsNode { kind: SequenceKind.Sequence, items: items }
+}
+
+fn parallel(items: [ScenarioNode]) -> RequestsNode {
+    return RequestsNode { kind: SequenceKind.Parallel, items: items }
+}
+
+fn status_is(code: int) -> Condition {
+    return Condition.Status(Comparison.Eq(json.int_to_json(code)))
+}
+
+fn choice_on(code: int, then: ScenarioNode, fallback: Option<ScenarioNode>) -> ScenarioNode {
+    return ScenarioNode.Choice(ChoiceNode {
+        cases: [ChoiceCase { when: status_is(code), then: then }],
+        default: fallback
+    })
+}
+
+fn with_imports(s: Scenario, pairs: Map<string, string>) -> Scenario {
+    return with s { imports: pairs }
+}
+
+fn main() {
+    val case = env_or("CURLY_CASE", "sequence")
+    val store = storage_of(env_or("CURLY_ROOT", "."))
+
+    // Two collections, so `imports` has something to route between, and the requests every case
+    // draws on. Written fresh for each run by the Python side's temp directory.
+    val main_collection = Collection {
+        id: uuid_new(),
+        name: "main",
+        folders: [],
+        requests: [
+            a_request("ok", "/ok"),
+            a_request("ok2", "/ok2"),
+            a_request("bad", "/bad"),
+            a_request("bad2", "/bad2"),
+            a_request("missing", "/no-such-path"),
+            a_request("created", "/created"),
+            a_request("token", "/token"),
+            with a_request("echo-token", "/echo") {
+                headers: [kv_pair_of("X-Token", "{{TOKEN}}")]
+            },
+            with a_request("extracts", "/token") {
+                extract: [Extraction.Body(BodyRule { name: "TOKEN", path: "token", secret: false })]
+            },
+            with a_request("unreachable", "/nothing") { url: "http://127.0.0.1:9/nothing" }
+        ]
+    }
+    val other_collection = Collection {
+        id: uuid_new(),
+        name: "other",
+        folders: [],
+        requests: [a_request("ok", "/other-ok")]
+    }
+    if Err(why) = save_collection(store, main_collection) {
+        os.fatal(concat("cannot save the main collection: ", why))
+    }
+    if Err(why) = save_collection(store, other_collection) {
+        os.fatal(concat("cannot save the other collection: ", why))
+    }
+    if Err(why) = save_environment(store, Environment {
+        name: "global",
+        variables: [Variable { key: "GREETING", value: "hello", secret: false }]
+    }) {
+        os.fatal(concat("cannot save the environment: ", why))
+    }
+
+    val imports = Map<string, string> { "default": "main", "other": "other" }
+    val scenario = with_imports(scenario_of("test", plan(case)), imports)
+    val none: [Pair] = []
+    switch run(scenario, store, None, none) {
+        Ok(outcome) { print(json.format(run_to_json(outcome))) }
+        Err(why) {
+            print(json.format(Json.JObject(Map<string, Json> {
+                "error": Json.JString(why)
+            })))
+        }
+    }
+}
+
+fn plan(case: string) -> RequestsNode {
+    if case == "sequence" {
+        return sequence([step("ok"), step("ok2"), step("created")])
+    }
+    if case == "failure-halts" {
+        return sequence([step("ok"), step("bad"), step("ok2")])
+    }
+    if case == "failure-handled-by-choice" {
+        return sequence([step("bad"), choice_on(500, step("ok"), None), step("ok2")])
+    }
+    if case == "choice-no-match-no-default" {
+        return sequence([step("ok"), choice_on(404, step("ok2"), None)])
+    }
+    if case == "choice-no-match-with-default" {
+        return sequence([step("ok"), choice_on(404, step("ok2"), Some(step("created")))])
+    }
+    if case == "choice-without-a-preceding-request" {
+        return sequence([choice_on(200, step("ok"), None)])
+    }
+    if case == "parallel-all-ok" {
+        return sequence([ScenarioNode.Requests(parallel([step("ok"), step("ok2")]))])
+    }
+    if case == "parallel-first-failure-wins" {
+        // **Both branches fail with different statuses, and a choice on 500 follows.** The choice
+        // only matches if the block propagated the FIRST failure by declared order (500) rather
+        // than the other one (404) -- which is what makes declared-order selection observable
+        // instead of merely asserted.
+        return sequence([
+            ScenarioNode.Requests(parallel([step("bad"), step("missing")])),
+            choice_on(500, step("ok"), None)
+        ])
+    }
+    if case == "parallel-first-failure-wins-reversed" {
+        // The same two branches the other way round: now the first failure is the 404, so a choice
+        // on 500 must NOT match and the run halts.
+        return sequence([
+            ScenarioNode.Requests(parallel([step("missing"), step("bad")])),
+            choice_on(500, step("ok"), None)
+        ])
+    }
+    if case == "parallel-later-failure-is-reported" {
+        // Branch 0 succeeds, so the first FAILURE is branch 1 and its 500 is what the choice sees.
+        return sequence([
+            ScenarioNode.Requests(parallel([step("ok"), step("bad")])),
+            choice_on(500, step("ok2"), None)
+        ])
+    }
+    if case == "parallel-failure-handled-by-choice" {
+        return sequence([
+            ScenarioNode.Requests(parallel([step("ok"), step("bad")])),
+            choice_on(500, step("ok2"), None)
+        ])
+    }
+    if case == "parallel-runs-every-branch" {
+        // A failing branch must not stop its siblings from running at all.
+        return sequence([ScenarioNode.Requests(parallel([step("bad"), step("ok"), step("ok2")]))])
+    }
+    if case == "parallel-empty" {
+        return sequence([ScenarioNode.Requests(parallel([]))])
+    }
+    if case == "network-error-halts-despite-a-choice" {
+        // A send that never got a response has nothing for a choice to inspect, so it halts even
+        // with one following.
+        return sequence([step("unreachable"), choice_on(500, step("ok"), None)])
+    }
+    if case == "imports-route-by-alias" {
+        return sequence([step("ok"), step("other->ok")])
+    }
+    if case == "unknown-alias" {
+        return sequence([step("nope->ok")])
+    }
+    if case == "missing-request" {
+        return sequence([step("not-a-request")])
+    }
+    if case == "extraction-flows-into-the-next-step" {
+        return sequence([step("extracts"), step("echo-token")])
+    }
+    return sequence([step("ok")])
+}
+
+fn outcome_name(o: StepOutcome) -> string {
+    return switch o {
+        Ok { "ok" }
+        HttpFailure { "http-failure" }
+        Halted(_) { "halted" }
+    }
+}
+
+fn halt_reason(o: StepOutcome) -> Json {
+    return switch o {
+        Halted(reason) { Json.JString(reason) }
+        Ok { Json.JNull }
+        HttpFailure { Json.JNull }
+    }
+}
+
+fn run_to_json(r: ScenarioRun) -> Json {
+    val steps = mutable_array_new<Json>()
+    for s in r.steps {
+        val names = mutable_array_new<Json>()
+        for n in s.extracted {
+            push(names, Json.JString(n))
+        }
+        push(steps, Json.JObject(Map<string, Json> {
+            "reference": Json.JString(s.reference),
+            "method": Json.JString(s.method),
+            "url": Json.JString(s.url),
+            "status": switch s.status {
+                Some(code) { json.int_to_json(code) }
+                None { Json.JNull }
+            },
+            "error": switch s.error {
+                Some(why) { Json.JString(why) }
+                None { Json.JNull }
+            },
+            "extracted": Json.JArray(snapshot(names))
+        }))
+    }
+    return Json.JObject(Map<string, Json> {
+        "outcome": Json.JString(outcome_name(r.outcome)),
+        "halt_reason": halt_reason(r.outcome),
+        "steps": Json.JArray(snapshot(steps))
+    })
+}

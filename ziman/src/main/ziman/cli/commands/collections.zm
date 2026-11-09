@@ -1,17 +1,52 @@
-// `curly collections` -- the read-only half for now: list, show and delete. The subcommands that
-// build a request (`add-request`, `rename-request`, `import`, ...) follow.
+// `curly collections` -- collections and the requests saved in them.
 //
-// Every line is compared against the Rust CLI's output character for character by `parity.sh`.
+// **`add-request` mirrors one-shot mode's flags on purpose**, as Rust's module says: saving a
+// request you just tested with `curly <url> ...` should be the same flags under
+// `collections add-request`, not a second vocabulary to learn. The only additions are the
+// `--extract-*` family, which a one-shot request has no use for.
+//
+// Every line of output is compared against the Rust CLI's character for character by `parity.sh`.
 use cli/args.Parsed
+use cli/args.all_of
+use cli/args.has_switch
 use cli/args.pad_right
+use cli/args.parse_assignment
+use cli/args.value_of
+use cli/connection
+use cli/output
+use core/collection.add_folder
+use core/collection.add_request
+use core/collection.duplicate_request
+use core/collection.remove_folder
+use core/collection.remove_request
+use core/collection.rename_or_move_request
+use core/extraction.BodyRule
+use core/extraction.Extraction
+use core/extraction.HeaderRule
+use core/extraction.TemplateRule
 use core/extraction.rule_name
+use core/extraction.rule_with_secret
+use core/import/curl.import_curl
+use core/import/postman.import_collection
+use core/model.BasicAuth
+use core/model.Pair
 use core/saved.Collection
 use core/saved.Folder
+use core/saved.KvPair
+use core/saved.NamedPath
+use core/saved.SavedAuth
+use core/saved.SavedBody
+use core/saved.SavedMultipartField
 use core/saved.SavedRequest
+use core/saved.kv_pair_of
 use core/storage.Storage
 use core/storage.delete_collection
 use core/storage.list_collections
 use core/storage.load_collection
+use core/storage.load_collection_opt
+use core/storage.save_collection
+use fs
+use uuid.uuid_new
 
 pub fn run(action: string, rest: Parsed, store: Storage) -> Result<unit, string> {
     if action == "list" {
@@ -47,7 +82,413 @@ pub fn run(action: string, rest: Parsed, store: Storage) -> Result<unit, string>
         print(prelude.format("deleted collection \"{}\"", name))
         return ok(unit)
     }
+    if action == "create" {
+        val name = try one_positional(rest, "collections create <name>")
+        if is_Some(try load_collection_opt(store, name)) {
+            return err(prelude.format("collection \"{}\" already exists", name))
+        }
+        try save_collection(store, Collection { id: uuid_new(), name: name, folders: [], requests: [] })
+        print(prelude.format("created collection \"{}\"", name))
+        return ok(unit)
+    }
+    if action == "add-request" {
+        if len(rest.positionals) < 3 {
+            return err("usage: curly collections add-request <collection> <request-path> <url>")
+        }
+        val name = rest.positionals[0]
+        val path = rest.positionals[1]
+        val saved = try build_saved_request(path, rest.positionals[2], rest)
+        // **Created on first use**, so saving a request need not be preceded by `create`.
+        val existing = switch try load_collection_opt(store, name) {
+            Some(found) { found }
+            None { Collection { id: uuid_new(), name: name, folders: [], requests: [] } }
+        }
+        val grown = switch add_request(existing, path, saved) {
+            Ok(c) { c }
+            Err(why) {
+                return err(prelude.format(
+                    "{}: in collection \"{}\" (remove it first with collections remove-request)",
+                    why,
+                    name
+                ))
+            }
+        }
+        try save_collection(store, grown)
+        print(prelude.format("saved \"{}\" in collection \"{}\"", path, name))
+        return ok(unit)
+    }
+    if action == "remove-request" {
+        if len(rest.positionals) < 2 {
+            return err("usage: curly collections remove-request <collection> <request-path>")
+        }
+        val name = rest.positionals[0]
+        val path = rest.positionals[1]
+        val outcome = remove_request(try load_collection(store, name), path)
+        if !outcome.removed {
+            return err(prelude.format("collection \"{}\" has no request named \"{}\"", name, path))
+        }
+        try save_collection(store, outcome.collection)
+        print(prelude.format("removed \"{}\" from collection \"{}\"", path, name))
+        return ok(unit)
+    }
+    if action == "rename-request" {
+        if len(rest.positionals) < 3 {
+            return err("usage: curly collections rename-request <collection> <old-path> <new-path>")
+        }
+        val name = rest.positionals[0]
+        val from = rest.positionals[1]
+        val to = rest.positionals[2]
+        val moved = try rename_or_move_request(try load_collection(store, name), from, to)
+        try save_collection(store, moved)
+        print(prelude.format("renamed \"{}\" to \"{}\" in collection \"{}\"", from, to, name))
+        return ok(unit)
+    }
+    if action == "duplicate-request" {
+        if len(rest.positionals) < 3 {
+            return err("usage: curly collections duplicate-request <collection> <path> <new-path>")
+        }
+        val name = rest.positionals[0]
+        val from = rest.positionals[1]
+        val to = rest.positionals[2]
+        val copied = try duplicate_request(try load_collection(store, name), from, to)
+        try save_collection(store, copied)
+        print(prelude.format("duplicated \"{}\" to \"{}\" in collection \"{}\"", from, to, name))
+        return ok(unit)
+    }
+    if action == "add-folder" {
+        if len(rest.positionals) < 2 {
+            return err("usage: curly collections add-folder <collection> <folder-path>")
+        }
+        val name = rest.positionals[0]
+        val path = rest.positionals[1]
+        val existing = switch try load_collection_opt(store, name) {
+            Some(found) { found }
+            None { Collection { id: uuid_new(), name: name, folders: [], requests: [] } }
+        }
+        try save_collection(store, add_folder(existing, path))
+        print(prelude.format("created folder \"{}\" in collection \"{}\"", path, name))
+        return ok(unit)
+    }
+    if action == "remove-folder" {
+        if len(rest.positionals) < 2 {
+            return err("usage: curly collections remove-folder <collection> <folder-path>")
+        }
+        val name = rest.positionals[0]
+        val path = rest.positionals[1]
+        val outcome = try remove_folder(
+            try load_collection(store, name),
+            path,
+            has_switch(rest, "force")
+        )
+        if !outcome.removed {
+            return err(prelude.format("collection \"{}\" has no folder named \"{}\"", name, path))
+        }
+        try save_collection(store, outcome.collection)
+        print(prelude.format("removed folder \"{}\" from collection \"{}\"", path, name))
+        return ok(unit)
+    }
+    if action == "import" {
+        return import_from(rest, store)
+    }
     return err(concat("unknown collections command: ", action))
+}
+
+fn one_positional(rest: Parsed, usage: string) -> Result<string, string> {
+    if len(rest.positionals) == 0 {
+        return err(concat("usage: curly ", usage))
+    }
+    return ok(rest.positionals[0])
+}
+
+// ---------------------------------------------------------------- importing
+
+fn import_from(rest: Parsed, store: Storage) -> Result<unit, string> {
+    if len(rest.positionals) == 0 {
+        return err("usage: curly collections import <postman|curl> ...")
+    }
+    val source = rest.positionals[0]
+    if source == "postman" {
+        if len(rest.positionals) < 3 {
+            return err("usage: curly collections import postman <collection> <path>")
+        }
+        val name = rest.positionals[1]
+        val path = rest.positionals[2]
+        // **Refused rather than merged**, so an import cannot quietly overwrite a collection
+        // somebody has been editing.
+        if is_Some(try load_collection_opt(store, name)) {
+            return err(prelude.format(
+                "collection \"{}\" already exists (delete it first to re-import)",
+                name
+            ))
+        }
+        val document = switch fs.read_text(path) {
+            Ok(t) { t }
+            Err(e) { return err(concat("failed to read ", path, ": ", fs.fs_error_message(e))) }
+        }
+        val decoded = try import_collection(document)
+        // The collection argument overrides the file's own `info.name`, which is what the flag is
+        // for -- two Postman exports often both call themselves "My API".
+        val imported = with decoded { name: name }
+        try save_collection(store, imported)
+        print(prelude.format(
+            "imported {} request(s) into collection \"{}\"",
+            str(count_requests(imported)),
+            name
+        ))
+        return ok(unit)
+    }
+    if source == "curl" {
+        if len(rest.positionals) < 3 {
+            return err("usage: curly collections import curl <collection> <request-path> [command]")
+        }
+        val name = rest.positionals[1]
+        val path = rest.positionals[2]
+        // **The command may come from stdin**, which is how a multi-line "Copy as cURL" paste gets
+        // in without shell quoting fighting it.
+        //
+        // **Read through `/dev/stdin`, because Ziman has no stdin API** -- nothing in `io` or `os`
+        // exposes it. That file exists on Linux and macOS and handles a multi-line pipe correctly,
+        // so the behaviour matches; on a platform without it the read fails and says so, which is
+        // better than the command silently becoming empty and importing a request with no URL.
+        val command = if len(rest.positionals) >= 4 {
+            rest.positionals[3]
+        } else {
+            switch fs.read_text("/dev/stdin") {
+                Ok(text) { text }
+                Err(_) { return err("failed to read curl command from stdin") }
+            }
+        }
+        val saved = try import_curl(leaf_of(path), command)
+        val existing = switch try load_collection_opt(store, name) {
+            Some(found) { found }
+            None { Collection { id: uuid_new(), name: name, folders: [], requests: [] } }
+        }
+        val grown = switch add_request(existing, path, saved) {
+            Ok(c) { c }
+            Err(why) {
+                return err(prelude.format(
+                    "{}: in collection \"{}\" (remove it first with collections remove-request)",
+                    why,
+                    name
+                ))
+            }
+        }
+        try save_collection(store, grown)
+        print(prelude.format("imported \"{}\" into collection \"{}\"", path, name))
+        return ok(unit)
+    }
+    return err(concat("unknown import source: ", source))
+}
+
+// The last path segment, which is the name the imported request carries before `add_request`
+// overwrites it with the same thing.
+fn leaf_of(path: string) -> string {
+    var at = len(path) - 1
+    while at >= 0 {
+        if substring(path, at, at + 1) == "/" {
+            return substring(path, at + 1, len(path))
+        }
+        at = at - 1
+    }
+    return path
+}
+
+fn count_requests(c: Collection) -> int {
+    return len(c.requests) + count_in_folders(c.folders)
+}
+
+fn count_in_folders(folders: [Folder]) -> int {
+    var total = 0
+    for f in folders {
+        total = total + len(f.requests) + count_in_folders(f.folders)
+    }
+    return total
+}
+
+// ---------------------------------------------------------------- building a saved request
+
+pub fn value_flags() -> [string] {
+    return concat(
+        ["-X", "--request", "-H", "--header", "-Q", "--query", "-d", "--data",
+            "--data-urlencode", "--data-binary", "-F", "--form", "-u", "--user", "--bearer",
+            "--extract-body", "--extract-header", "--extract-template", "--extract-secret"],
+        concat(connection.value_flags(), output.value_flags())
+    )
+}
+
+pub fn switch_flags() -> [string] {
+    return concat(["--force"], concat(connection.switch_flags(), output.switch_flags()))
+}
+
+fn repeated(p: Parsed, short: string, long: string) -> [string] {
+    return concat(all_of(p, short), all_of(p, long))
+}
+
+fn single(p: Parsed, short: string, long: string) -> Option<string> {
+    return switch value_of(p, short) {
+        Some(v) { Some(v) }
+        None { value_of(p, long) }
+    }
+}
+
+fn parse_saved_form_field(raw: string) -> Result<SavedMultipartField, string> {
+    val pair = try parse_assignment(raw, "-F/--form")
+    if starts_with(pair.value, "@") {
+        return ok(SavedMultipartField.File(NamedPath {
+            name: pair.key,
+            path: substring(pair.value, 1, len(pair.value))
+        }))
+    }
+    return ok(SavedMultipartField.Text(Pair { name: pair.key, value: pair.value }))
+}
+
+// **A `--data-binary` path is stored, not read.** The file is read when the request is sent, so a
+// collection holding a path does not pin that file's bytes -- which is also why this takes the
+// path exactly as given, `@` and all, where one-shot mode strips it before reading.
+fn build_saved_body(p: Parsed) -> Result<Option<SavedBody>, string> {
+    val data = single(p, "d", "data")
+    val urlencoded = all_of(p, "data-urlencode")
+    val binary = value_of(p, "data-binary")
+    val form = repeated(p, "F", "form")
+
+    var given = 0
+    if is_Some(data) {
+        given = given + 1
+    }
+    if len(urlencoded) != 0 {
+        given = given + 1
+    }
+    if is_Some(binary) {
+        given = given + 1
+    }
+    if len(form) != 0 {
+        given = given + 1
+    }
+    if given > 1 {
+        return err("only one of -d/--data-urlencode/--data-binary/-F may be used per request")
+    }
+
+    if Some(raw) = data {
+        return ok(Some(SavedBody.Raw(raw)))
+    }
+    if len(urlencoded) != 0 {
+        val fields = mutable_array_new<Pair>()
+        for raw in urlencoded {
+            val pair = try parse_assignment(raw, "--data-urlencode")
+            push(fields, Pair { name: pair.key, value: pair.value })
+        }
+        return ok(Some(SavedBody.Form(snapshot(fields))))
+    }
+    if Some(path) = binary {
+        return ok(Some(SavedBody.Binary(path)))
+    }
+    if len(form) != 0 {
+        val fields = mutable_array_new<SavedMultipartField>()
+        for raw in form {
+            push(fields, try parse_saved_form_field(raw))
+        }
+        return ok(Some(SavedBody.Multipart(snapshot(fields))))
+    }
+    return ok(None)
+}
+
+fn build_saved_auth(p: Parsed) -> Result<Option<SavedAuth>, string> {
+    val user = single(p, "u", "user")
+    val bearer = value_of(p, "bearer")
+    if is_Some(user) && is_Some(bearer) {
+        return err("only one of -u/--user or --bearer may be used per request")
+    }
+    if Some(pair) = user {
+        val at = index_of(pair, ":", 0)
+        if at < 0 {
+            return err(concat("invalid -u/--user value (expected \"user:password\"): ", pair))
+        }
+        return ok(Some(SavedAuth.Basic(BasicAuth {
+            username: substring(pair, 0, at),
+            password: substring(pair, at + 1, len(pair))
+        })))
+    }
+    if Some(token) = bearer {
+        return ok(Some(SavedAuth.Bearer(token)))
+    }
+    return ok(None)
+}
+
+// **`--extract-secret` names a rule the other flags defined**, and naming one they did not is an
+// error rather than a no-op: a secret flag that silently misses leaves the value unmasked, which
+// is the opposite of what was asked for.
+fn build_extractions(p: Parsed) -> Result<[Extraction], string> {
+    val rules = mutable_array_new<Extraction>()
+    for raw in all_of(p, "extract-body") {
+        val pair = try parse_assignment(raw, "--extract-body")
+        push(rules, Extraction.Body(BodyRule { name: pair.key, path: pair.value, secret: false }))
+    }
+    for raw in all_of(p, "extract-header") {
+        val pair = try parse_assignment(raw, "--extract-header")
+        push(rules, Extraction.Header(HeaderRule { name: pair.key, header: pair.value, secret: false }))
+    }
+    for raw in all_of(p, "extract-template") {
+        val pair = try parse_assignment(raw, "--extract-template")
+        push(rules, Extraction.Template(TemplateRule { name: pair.key, template: pair.value, secret: false }))
+    }
+    var current = snapshot(rules)
+    for wanted in all_of(p, "extract-secret") {
+        val marked = mutable_array_new<Extraction>()
+        var found = false
+        for rule in current {
+            if rule_name(rule) == wanted {
+                push(marked, rule_with_secret(rule, true))
+                found = true
+            } else {
+                push(marked, rule)
+            }
+        }
+        if !found {
+            return err(prelude.format(
+                "--extract-secret {}: no --extract-body/--extract-header/--extract-template above defines a variable named \"{}\"",
+                wanted,
+                wanted
+            ))
+        }
+        current = snapshot(marked)
+    }
+    return ok(current)
+}
+
+fn build_saved_request(path: string, url: string, p: Parsed) -> Result<SavedRequest, string> {
+    val body = try build_saved_body(p)
+    val auth = try build_saved_auth(p)
+    val extract = try build_extractions(p)
+    // A body with no `-X` means POST, as in one-shot mode and in curl.
+    val method = switch single(p, "X", "request") {
+        Some(m) { to_upper(m) }
+        None { if is_Some(body) { "POST" } else { "GET" } }
+    }
+    val headers = mutable_array_new<KvPair>()
+    for raw in repeated(p, "H", "header") {
+        val at = index_of(raw, ":", 0)
+        if at < 0 {
+            return err(concat("invalid header (expected \"Name: value\"): ", raw))
+        }
+        push(headers, kv_pair_of(trim(substring(raw, 0, at)), trim(substring(raw, at + 1, len(raw)))))
+    }
+    val params = mutable_array_new<KvPair>()
+    for raw in repeated(p, "Q", "query") {
+        val pair = try parse_assignment(raw, "-Q/--query")
+        push(params, kv_pair_of(pair.key, pair.value))
+    }
+    return ok(SavedRequest {
+        id: uuid_new(),
+        // `add_request` overwrites this with the path's leaf; passing the path is what Rust does.
+        name: path,
+        method: method,
+        url: url,
+        query_params: snapshot(params),
+        headers: snapshot(headers),
+        body: body,
+        auth: auth,
+        extract: extract
+    })
 }
 
 // **Folders first, then requests, two spaces per level** -- and a request that carries extraction

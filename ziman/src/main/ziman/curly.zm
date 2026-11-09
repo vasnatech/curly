@@ -44,6 +44,9 @@ fn flags_for(command: string, action: string) -> [string] {
     if command == "run" {
         return concat(global_values, run_command.value_flags())
     }
+    if command == "collections" {
+        return concat(global_values, collections_command.value_flags())
+    }
     if command == "env" && action == "import-postman" {
         return concat(global_values, ["--as"])
     }
@@ -62,6 +65,9 @@ fn flags_for(command: string, action: string) -> [string] {
 fn switches_for(command: string, action: string) -> [string] {
     if command == "run" {
         return run_command.switch_flags()
+    }
+    if command == "collections" {
+        return collections_command.switch_flags()
     }
     if command == "env" && action == "set" {
         return ["--secret"]

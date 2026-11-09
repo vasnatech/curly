@@ -62,6 +62,16 @@ pub fn rule_secret(e: Extraction) -> bool {
     }
 }
 
+// The same rule with its `secret` flag set, which is what `--extract-secret` does after the rules
+// are built. Rust mutates in place through `set_secret`; a Ziman value is rebuilt instead.
+pub fn rule_with_secret(e: Extraction, secret: bool) -> Extraction {
+    return switch e {
+        Body(r) { Extraction.Body(with r { secret: secret }) }
+        Header(r) { Extraction.Header(with r { secret: secret }) }
+        Template(r) { Extraction.Template(with r { secret: secret }) }
+    }
+}
+
 // ---------------------------------------------------------------- the wire format
 //
 // **Hand-written, because `#[derive(Json)]` cannot produce this shape.** Serde writes an internally

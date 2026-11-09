@@ -638,6 +638,115 @@ JSON
   fi
 fi
 
+# ---- the request-building collections subcommands ------------------------------------------------
+#
+# **Each side builds its own storage with its OWN CLI, then the other reads it back.** Every check
+# before this had to build fixtures with the Rust binary, because these subcommands were not ported;
+# now the same script of nine commands runs through both and the resulting collection file is
+# diffed with ids normalised. That is a stronger statement than comparing output: it says the two
+# write the same storage from the same instructions.
+
+if [ -x "$ZCLI" ]; then
+  build_collection() {
+    # $1 = root, $2.. = the command prefix (binary, possibly env-prefixed via a function)
+    local root="$1"; shift
+    mkdir -p "$root"
+    "$@" collections create Empty --data-dir "$root" >/dev/null 2>&1
+    "$@" collections add-request api login "$OSB/echo" \
+      -X POST -H 'Content-Type: application/json' -H 'Accept: */*' \
+      -Q 'a=1' -Q 'b=two words' -d '{"user":"ann"}' \
+      --extract-body 'TOKEN=token' --extract-header 'REQ=X-Request-Id' \
+      --extract-template 'AUTH=Bearer {{TOKEN}}' --extract-secret TOKEN \
+      --data-dir "$root" >/dev/null 2>&1
+    "$@" collections add-request api 'Auth/OAuth/refresh' "$OSB/plain" -u ann:s3cret --data-dir "$root" >/dev/null 2>&1
+    "$@" collections add-request api upload "$OSB/echo" -F caption=hi -F 'file=@/tmp/x.png' --data-dir "$root" >/dev/null 2>&1
+    "$@" collections add-request api raw "$OSB/plain" --bearer tok --data-dir "$root" >/dev/null 2>&1
+    "$@" collections add-folder api Archive/Old --data-dir "$root" >/dev/null 2>&1
+    "$@" collections rename-request api raw 'Archive/Old/raw' --data-dir "$root" >/dev/null 2>&1
+    "$@" collections duplicate-request api login 'Archive/login-copy' --data-dir "$root" >/dev/null 2>&1
+    "$@" collections remove-request api upload --data-dir "$root" >/dev/null 2>&1
+    "$@" collections import postman Imported "$work/postman.json" --data-dir "$root" >/dev/null 2>&1
+    "$@" collections import curl Curled 'Auth/login' "$CURL_COMMAND" --data-dir "$root" >/dev/null 2>&1
+  }
+  zcli_wrapper() { ZIMAN="$ZIMAN" "$ZCLI" "$@"; }
+
+  cb_rust="$work/build-rust"
+  cb_zim="$work/build-ziman"
+  build_collection "$cb_rust" "$RUST"
+  build_collection "$cb_zim" zcli_wrapper
+
+  for f in api imported curled empty; do
+    if [ -f "$cb_rust/collections/$f.json" ] && [ -f "$cb_zim/collections/$f.json" ]; then
+      if diff -q <(normalise "$cb_rust/collections/$f.json") <(normalise "$cb_zim/collections/$f.json") >/dev/null; then
+        ok "collections: both CLIs write an identical \"$f\""
+      else
+        bad "collections: \"$f\" differs" \
+            "$(diff <(normalise "$cb_rust/collections/$f.json") <(normalise "$cb_zim/collections/$f.json") | head -10 | tr '\n' '|')"
+      fi
+    else
+      bad "collections: \"$f\" was not written by both" \
+          "rust=$([ -f "$cb_rust/collections/$f.json" ] && echo yes || echo no) ziman=$([ -f "$cb_zim/collections/$f.json" ] && echo yes || echo no)"
+    fi
+  done
+
+  # Each binary reading the other's tree, as a tree -- the `show` output carries the extraction
+  # names, so this also checks `--extract-secret` landed on the right rule.
+  rust_sees_zim="$("$RUST" collections show api --data-dir "$cb_zim" 2>&1)"
+  zim_sees_rust="$(ZIMAN="$ZIMAN" "$ZCLI" collections show api --data-dir "$cb_rust" 2>&1)"
+  if [ "$rust_sees_zim" = "$zim_sees_rust" ]; then
+    ok "collections: each CLI shows the other's tree identically"
+  else
+    bad "collections: cross-read tree differs" "$(diff <(echo "$rust_sees_zim") <(echo "$zim_sees_rust") | head -6 | tr '\n' '|')"
+  fi
+
+  # The refusals, which are where a port most easily drifts.
+  coll_refusal_both() {
+    local label="$1"; shift
+    local a b
+    a="$("$RUST" collections "$@" --data-dir "$cb_rust" 2>&1 | head -1 | sed "s|$cb_rust|<root>|g")" || true
+    b="$(ZIMAN="$ZIMAN" "$ZCLI" collections "$@" --data-dir "$cb_zim" 2>&1 | head -1 | sed "s|$cb_zim|<root>|g")" || true
+    if [ "$a" = "$b" ]; then
+      ok "collections: $label"
+    else
+      bad "collections: $label" "rust=[$a] ziman=[$b]"
+    fi
+  }
+  coll_refusal_both "create an existing collection" create api
+  coll_refusal_both "remove a request that is not there" remove-request api nope
+  coll_refusal_both "rename onto a taken path" rename-request api login 'Archive/login-copy'
+  coll_refusal_both "duplicate a request that is not there" duplicate-request api nope copy
+  coll_refusal_both "remove a non-empty folder without --force" remove-folder api Archive
+  coll_refusal_both "remove a folder that is not there" remove-folder api Nope
+  # **The one refusal whose first line deliberately differs.** Rust builds this with
+  # `anyhow::with_context`, which makes the *context* the headline and puts the actual reason in the
+  # `Caused by:` chain below -- so its first line is "in collection ... (remove it first ...)" and
+  # "a request already exists at ..." is underneath. Since the chain is not reproduced, matching
+  # that first line would mean printing the advice and dropping the reason, which is the wrong half
+  # to keep in a one-line report. Both facts are compared instead of the exact string.
+  a_out="$("$RUST" collections add-request api login "$OSB/plain" --data-dir "$cb_rust" 2>&1)" || true
+  b_out="$(ZIMAN="$ZIMAN" "$ZCLI" collections add-request api login "$OSB/plain" --data-dir "$cb_zim" 2>&1)" || true
+  if echo "$a_out" | grep -q 'a request already exists at "login"' \
+     && echo "$a_out" | grep -q 'in collection "api"' \
+     && echo "$b_out" | grep -q 'a request already exists at "login"' \
+     && echo "$b_out" | grep -q 'in collection "api"'; then
+    ok "collections: add a request at a taken path (same facts, see the comment)"
+  else
+    bad "collections: add at a taken path" "rust=[$(echo "$a_out" | tr '\n' ' ')] ziman=[$(echo "$b_out" | tr '\n' ' ')]"
+  fi
+  coll_refusal_both "import postman over an existing collection" import postman Imported "$work/postman.json"
+  coll_refusal_both "--extract-secret naming no rule" add-request api fresh "$OSB/plain" --extract-secret NOPE
+  coll_refusal_both "two body sources" add-request api fresh2 "$OSB/plain" -d a -F b=c
+
+  # --force really does remove it, on both.
+  "$RUST" collections remove-folder api Archive --force --data-dir "$cb_rust" >/dev/null 2>&1
+  ZIMAN="$ZIMAN" "$ZCLI" collections remove-folder api Archive --force --data-dir "$cb_zim" >/dev/null 2>&1
+  if diff -q <(normalise "$cb_rust/collections/api.json") <(normalise "$cb_zim/collections/api.json") >/dev/null; then
+    ok "collections: --force removes a non-empty folder identically"
+  else
+    bad "collections: --force differs" "$(diff <(normalise "$cb_rust/collections/api.json") <(normalise "$cb_zim/collections/api.json") | head -6 | tr '\n' '|')"
+  fi
+fi
+
 # ---- the slug -----------------------------------------------------------------------------------
 #
 # Both sides turn a display name into the same filename, or `load` misses what `save` wrote.

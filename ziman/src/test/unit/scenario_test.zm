@@ -1,0 +1,358 @@
+// `core/scenario`'s declarative half: the model, its untagged codecs, condition evaluation and
+// reference resolution. Ported from `crates/curly-core/src/scenario.rs`'s own `mod tests`, the
+// worked example included verbatim -- Rust's copy says it is "kept in sync deliberately, not just
+// 'close enough'", and the same applies here.
+use core/scenario.ChoiceNode
+use core/scenario.Comparison
+use core/scenario.Condition
+use core/scenario.NamedComparison
+use core/scenario.PathComparison
+use core/scenario.RequestsNode
+use core/scenario.Scenario
+use core/scenario.ScenarioNode
+use core/scenario.SequenceKind
+use core/scenario.evaluate_condition
+use core/scenario.resolve_request_ref
+use core/scenario.scenario_from_json
+use core/scenario.scenario_to_json
+use http.Header
+use json
+use json.Json
+use test
+
+fn parsed(text: string) -> Json {
+    return switch json.parse(text) {
+        Ok(j) { j }
+        Err(_) { Json.JNull }
+    }
+}
+
+fn number(n: int) -> Json {
+    return json.int_to_json(n)
+}
+
+fn text(s: string) -> Json {
+    return Json.JString(s)
+}
+
+fn status_is(op: Comparison) -> Condition {
+    return Condition.Status(op)
+}
+
+fn header_is(name: string, op: Comparison) -> Condition {
+    return Condition.Header(NamedComparison { name: name, op: op })
+}
+
+fn body_is(path: string, op: Comparison) -> Condition {
+    return Condition.Body(PathComparison { path: path, op: op })
+}
+
+fn holds(c: Condition, status: int, headers: [Header], body: string) -> bool {
+    return evaluate_condition(c, status, headers, body)
+}
+
+fn on_status(c: Condition, status: int) -> bool {
+    return holds(c, status, [], "")
+}
+
+fn on_body(c: Condition, body: string) -> bool {
+    return holds(c, 200, [], body)
+}
+
+// ---------------------------------------------------------------- status
+
+#[test]
+fn a_status_equality_matches() {
+    test.assert_eq(true, on_status(status_is(Comparison.Eq(number(200))), 200))
+    test.assert_eq(false, on_status(status_is(Comparison.Eq(number(200))), 404))
+}
+
+#[test]
+fn status_ne_gt_and_lt() {
+    test.assert_eq(true, on_status(status_is(Comparison.Ne(number(200))), 404))
+    test.assert_eq(true, on_status(status_is(Comparison.Gt(number(399))), 404))
+    test.assert_eq(true, on_status(status_is(Comparison.Lt(number(300))), 201))
+    test.assert_eq(false, on_status(status_is(Comparison.Gt(number(404))), 404))
+    test.assert_eq(false, on_status(status_is(Comparison.Lt(number(200))), 200))
+}
+
+#[test]
+fn gt_and_lt_against_a_non_number_are_false_not_an_error() {
+    // Rust's `as_f64().zip(..)` answers None, and the comparison is false.
+    test.assert_eq(false, on_status(status_is(Comparison.Gt(text("many"))), 404))
+    test.assert_eq(false, on_body(body_is("name", Comparison.Gt(number(1))), "{\"name\":\"ann\"}"))
+}
+
+// ---------------------------------------------------------------- headers
+
+#[test]
+fn a_header_name_is_matched_case_insensitively() {
+    val headers = [Header { name: "Content-Type", value: "application/json" }]
+    test.assert_eq(true, holds(header_is("content-type", Comparison.Eq(text("application/json"))), 200, headers, ""))
+    test.assert_eq(true, holds(header_is("CONTENT-TYPE", Comparison.Eq(text("application/json"))), 200, headers, ""))
+}
+
+#[test]
+fn header_exists_is_satisfied_by_presence_or_by_absence() {
+    val headers = [Header { name: "X-Request-Id", value: "req-1" }]
+    test.assert_eq(true, holds(header_is("X-Request-Id", Comparison.Exists(true)), 200, headers, ""))
+    test.assert_eq(false, holds(header_is("X-Request-Id", Comparison.Exists(false)), 200, headers, ""))
+    test.assert_eq(true, holds(header_is("Nope", Comparison.Exists(false)), 200, headers, ""))
+    test.assert_eq(false, holds(header_is("Nope", Comparison.Exists(true)), 200, headers, ""))
+}
+
+#[test]
+fn any_operator_but_exists_is_false_when_the_header_is_absent() {
+    test.assert_eq(false, holds(header_is("Nope", Comparison.Eq(text("x"))), 200, [], ""))
+    test.assert_eq(false, holds(header_is("Nope", Comparison.Ne(text("x"))), 200, [], ""))
+    test.assert_eq(false, holds(header_is("Nope", Comparison.Contains(text("x"))), 200, [], ""))
+}
+
+#[test]
+fn a_header_is_compared_as_a_string_even_when_it_looks_numeric() {
+    // Rust wraps the value in `Value::String`, so `eq: 42` never matches a header.
+    val headers = [Header { name: "X-Count", value: "42" }]
+    test.assert_eq(true, holds(header_is("X-Count", Comparison.Eq(text("42"))), 200, headers, ""))
+    test.assert_eq(false, holds(header_is("X-Count", Comparison.Eq(number(42))), 200, headers, ""))
+}
+
+// ---------------------------------------------------------------- bodies
+
+#[test]
+fn a_body_path_equality_matches() {
+    test.assert_eq(true, on_body(body_is("data.id", Comparison.Eq(number(42))), "{\"data\":{\"id\":42}}"))
+    test.assert_eq(true, on_body(body_is("token", Comparison.Eq(text("abc"))), "{\"token\":\"abc\"}"))
+}
+
+#[test]
+fn a_missing_body_path_is_false_for_eq_and_satisfies_exists_false() {
+    test.assert_eq(false, on_body(body_is("nope", Comparison.Eq(number(1))), "{\"token\":\"abc\"}"))
+    test.assert_eq(true, on_body(body_is("nope", Comparison.Exists(false)), "{\"token\":\"abc\"}"))
+    test.assert_eq(true, on_body(body_is("token", Comparison.Exists(true)), "{\"token\":\"abc\"}"))
+}
+
+#[test]
+fn a_body_that_is_not_json_matches_nothing_but_exists_false() {
+    test.assert_eq(false, on_body(body_is("token", Comparison.Eq(text("abc"))), "not json"))
+    test.assert_eq(false, on_body(body_is("token", Comparison.Exists(true)), "not json"))
+    test.assert_eq(true, on_body(body_is("token", Comparison.Exists(false)), "not json"))
+}
+
+#[test]
+fn contains_works_on_a_string_and_on_an_array() {
+    test.assert_eq(true, on_body(body_is("msg", Comparison.Contains(text("ell"))), "{\"msg\":\"hello\"}"))
+    test.assert_eq(false, on_body(body_is("msg", Comparison.Contains(text("zzz"))), "{\"msg\":\"hello\"}"))
+    test.assert_eq(true, on_body(body_is("tags", Comparison.Contains(text("b"))), "{\"tags\":[\"a\",\"b\"]}"))
+    test.assert_eq(false, on_body(body_is("tags", Comparison.Contains(text("z"))), "{\"tags\":[\"a\",\"b\"]}"))
+    test.assert_eq(true, on_body(body_is("ns", Comparison.Contains(number(2))), "{\"ns\":[1,2,3]}"))
+    // Anything that is not a string or an array never contains anything.
+    test.assert_eq(false, on_body(body_is("n", Comparison.Contains(number(1))), "{\"n\":1}"))
+}
+
+#[test]
+fn two_numbers_of_different_kinds_still_compare_equal() {
+    // `2` and `2.0` are the same number, which is what comparing two serde_json numbers does.
+    test.assert_eq(true, on_body(body_is("n", Comparison.Eq(number(2))), "{\"n\":2.0}"))
+}
+
+// ---------------------------------------------------------------- composition
+
+#[test]
+fn all_any_and_not_compose() {
+    val both = Condition.All([status_is(Comparison.Eq(number(200))), body_is("ok", Comparison.Eq(Json.JBool(true)))])
+    test.assert_eq(true, holds(both, 200, [], "{\"ok\":true}"))
+    test.assert_eq(false, holds(both, 404, [], "{\"ok\":true}"))
+
+    val either = Condition.Any([status_is(Comparison.Eq(number(200))), status_is(Comparison.Eq(number(201)))])
+    test.assert_eq(true, on_status(either, 201))
+    test.assert_eq(false, on_status(either, 500))
+
+    test.assert_eq(true, on_status(Condition.Not(status_is(Comparison.Eq(number(500)))), 200))
+
+    // An empty `all` is true and an empty `any` is false, as `.all()`/`.any()` are on an empty
+    // iterator -- worth pinning, since a condition list that got filtered to nothing should not
+    // silently flip a branch.
+    test.assert_eq(true, on_status(Condition.All([]), 200))
+    test.assert_eq(false, on_status(Condition.Any([]), 200))
+}
+
+// ---------------------------------------------------------------- references
+
+fn ref_of(reference: string, aliases: [string]) -> string {
+    return switch resolve_request_ref(reference, aliases) {
+        Ok(found) { concat(found.alias, " | ", found.path) }
+        Err(why) { concat("ERR: ", why) }
+    }
+}
+
+#[test]
+fn a_bare_path_resolves_against_the_default_import() {
+    test.assert_eq("default | Auth/login", ref_of("Auth/login", ["default"]))
+}
+
+#[test]
+fn an_explicit_alias_splits_on_the_first_arrow_only() {
+    test.assert_eq("api | Auth/login", ref_of("api->Auth/login", ["default", "api"]))
+    // A path may itself contain an arrow; only the first one separates.
+    test.assert_eq("api | a->b", ref_of("api->a->b", ["api"]))
+}
+
+#[test]
+fn a_bare_path_with_no_default_import_is_refused() {
+    val why = ref_of("Auth/login", ["api"])
+    test.assert_contains(why, "default")
+    test.assert_contains(why, "Auth/login")
+}
+
+#[test]
+fn an_alias_the_scenario_does_not_import_is_refused_and_named() {
+    val why = ref_of("nope->Auth/login", ["default"])
+    test.assert_contains(why, "nope")
+}
+
+// ---------------------------------------------------------------- the wire format
+
+#[test]
+fn the_worked_onboarding_example_decodes() {
+    // The exact JSON from `docs/ROADMAP.md`'s worked example, as Rust's own test carries it.
+    val document = """
+    {
+      "name": "onboarding",
+      "imports": { "default": "health-record-api" },
+      "requests": {
+        "type": "sequence",
+        "items": [
+          { "request": "auth/register" },
+          {
+            "choice": {
+              "cases": [
+                {
+                  "when": { "status": { "eq": 200 } },
+                  "then": {
+                    "requests": {
+                      "type": "sequence",
+                      "items": [
+                        { "request": "me/update-preferences" },
+                        { "request": "body-measurements/update-preferences" },
+                        { "request": "me/update-preferences" },
+                        { "request": "notifications/update-preference" }
+                      ]
+                    }
+                  }
+                },
+                {
+                  "when": { "status": { "eq": 400 } },
+                  "then": { "request": "auth/login" }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    }
+    """
+    val decoded = scenario_from_json(parsed(document))
+    if Err(why) = decoded {
+        test.fail(concat("the worked example did not decode: ", why))
+    }
+    val s = unwrap(decoded)
+    test.assert_eq("onboarding", s.name)
+    test.assert_eq("health-record-api", get_or(s.imports, "default", "(missing)"))
+    test.assert_eq(true, SequenceKind.is_Sequence(s.requests.kind))
+    test.assert_len(2, s.requests.items)
+    test.assert_eq("auth/register", switch s.requests.items[0] {
+        Request(reference) { reference }
+        Requests(_) { "(not a request)" }
+        Choice(_) { "(not a request)" }
+    })
+    val choice = switch s.requests.items[1] {
+        Choice(c) { c }
+        Request(_) { no_choice() }
+        Requests(_) { no_choice() }
+    }
+    test.assert_len(2, choice.cases)
+    // **No `default`, which is the interesting part**: an unmatched response then halts rather than
+    // carrying on.
+    test.assert_eq(true, is_None(choice.default))
+    test.assert_eq(true, on_status(choice.cases[0].when, 200))
+    test.assert_eq(false, on_status(choice.cases[0].when, 400))
+}
+
+// A stand-in for the arms that cannot happen, so the switch has a value of the right type.
+fn no_choice() -> ChoiceNode {
+    return ChoiceNode { cases: [], default: None }
+}
+
+#[test]
+fn a_parallel_container_decodes() {
+    val s = unwrap(scenario_from_json(parsed(
+        "{\"name\":\"p\",\"requests\":{\"type\":\"parallel\",\"items\":[{\"request\":\"a\"},{\"request\":\"b\"}]}}"
+    )))
+    test.assert_eq(true, SequenceKind.is_Parallel(s.requests.kind))
+    test.assert_len(2, s.requests.items)
+}
+
+#[test]
+fn a_container_whose_type_is_neither_is_refused_by_name() {
+    val why = switch scenario_from_json(parsed(
+        "{\"name\":\"p\",\"requests\":{\"type\":\"maybe\",\"items\":[]}}"
+    )) {
+        Ok(_) { "no refusal" }
+        Err(message) { message }
+    }
+    test.assert_contains(why, "maybe")
+}
+
+#[test]
+fn a_node_naming_none_of_the_three_keys_is_refused() {
+    val why = switch scenario_from_json(parsed(
+        "{\"name\":\"p\",\"requests\":{\"type\":\"sequence\",\"items\":[{\"nonsense\":1}]}}"
+    )) {
+        Ok(_) { "no refusal" }
+        Err(message) { message }
+    }
+    test.assert_contains(why, "request")
+}
+
+#[test]
+fn a_scenario_round_trips_through_its_codec() {
+    val document = """
+    {
+      "name": "round-trip",
+      "imports": { "api": "other-api", "default": "main-api" },
+      "requests": {
+        "type": "sequence",
+        "items": [
+          { "request": "login" },
+          {
+            "choice": {
+              "cases": [
+                {
+                  "when": {
+                    "all": [
+                      { "status": { "lt": 300 } },
+                      { "header": { "name": "Content-Type", "op": { "contains": "json" } } },
+                      { "not": { "body": { "path": "error", "op": { "exists": true } } } }
+                    ]
+                  },
+                  "then": { "requests": { "type": "parallel", "items": [{ "request": "api->sync" }] } }
+                }
+              ],
+              "default": { "request": "logout" }
+            }
+          }
+        ]
+      }
+    }
+    """
+    val once = unwrap(scenario_from_json(parsed(document)))
+    val written = json.format(scenario_to_json(once), 2)
+    val twice = unwrap(scenario_from_json(parsed(written)))
+    // Encode both and compare: the second pass must produce the same bytes as the first.
+    test.assert_eq(written, json.format(scenario_to_json(twice), 2))
+    // And the nested condition survived intact.
+    test.assert_contains(written, "\"contains\": \"json\"")
+    test.assert_contains(written, "\"exists\": true")
+    // `imports` is written in key order, because Rust holds it in a BTreeMap.
+    test.assert_eq(true, index_of(written, "\"api\"", 0) < index_of(written, "\"default\"", 0))
+}

@@ -1,0 +1,584 @@
+// Scenarios: a named, nested composition of saved requests, possibly spanning more than one
+// collection, with conditional branching on a response.
+//
+// **Orchestration, not assertions.** A `choice` never produces a pass or fail verdict; it only
+// decides which node runs next. Rust's module says the same, and points at `docs/ROADMAP.md` for the
+// design -- node format, `choice` semantics, cross-collection `imports`, and what happens when more
+// than one `parallel` branch fails were all settled there before any of it was written, so anything
+// here that looks arbitrary probably has a documented reason.
+//
+// This file is the **declarative half**: the model, its codecs, condition evaluation and reference
+// resolution, all pure. Running a scenario needs storage, a collection set and the network, and
+// lands separately.
+//
+// **Three enums here are serde-`untagged`**, keyed by which field is present rather than by a
+// `"type"` discriminator -- `{"request": ".."}` against `{"requests": {..}}` against
+// `{"choice": {..}}`. So the codecs are hand-written like the rest (see `core/saved.zm`), and they
+// test for keys in a fixed order rather than reading a tag.
+use core/extraction.json_at_path
+use http.Header
+use json
+use json.Json
+use uuid
+use uuid.Uuid
+use uuid.uuid_new
+
+// Whether a container's children run one after another or together.
+pub enum SequenceKind {
+    Sequence
+    Parallel
+}
+
+// A comparison operator and its operand. The operand is arbitrary JSON, because a body path can
+// hold anything.
+//
+// **`exists` is the only operator that means something against an absent value.** The others simply
+// do not match when the header or path is missing -- false rather than an error, the same spirit as
+// `find_request` answering nothing rather than failing.
+pub enum Comparison {
+    Eq(Json)
+    Ne(Json)
+    Gt(Json)
+    Lt(Json)
+    Contains(Json)
+    Exists(bool)
+}
+
+pub struct NamedComparison {
+    name: string
+    op: Comparison
+}
+
+pub struct PathComparison {
+    path: string
+    op: Comparison
+}
+
+// A condition on a response's status, one of its headers, or a JSON path into its body, composable
+// through `all`, `any` and `not`.
+pub enum Condition {
+    All([Condition])
+    Any([Condition])
+    Not(Condition)
+    Status(Comparison)
+    Header(NamedComparison)
+    Body(PathComparison)
+}
+
+pub struct ChoiceCase {
+    when: Condition
+    then: ScenarioNode
+}
+
+// **`default` is optional, and its absence is load-bearing**: an unmatched response with no default
+// halts the scenario with a clear message rather than silently carrying on as though the branch had
+// been taken.
+pub struct ChoiceNode {
+    cases: [ChoiceCase]
+    default: Option<ScenarioNode>
+}
+
+pub struct RequestsNode {
+    kind: SequenceKind
+    items: [ScenarioNode]
+}
+
+// One node of the tree: a leaf naming a saved request, a container, or a branch.
+pub enum ScenarioNode {
+    Request(string)
+    Requests(RequestsNode)
+    Choice(ChoiceNode)
+}
+
+// A scenario, loaded from its own file rather than nested inside a collection -- **because its
+// `imports` can name more than one collection**, so it cannot live inside any single one of them.
+//
+// `requests` is a container directly, not a node: a scenario's top level is always a sequence or a
+// parallel block of steps, never a bare request and never a bare choice.
+pub struct Scenario {
+    id: Uuid
+    name: string
+    // Alias to real collection name. A reference either names an alias (`alias->path`) or, with no
+    // arrow, resolves against the import called `default`.
+    imports: Map<string, string>
+    requests: RequestsNode
+}
+
+pub fn scenario_of(name: string, requests: RequestsNode) -> Scenario {
+    return Scenario {
+        id: uuid_new(),
+        name: name,
+        imports: Map<string, string> {},
+        requests: requests
+    }
+}
+
+// ---------------------------------------------------------------- evaluating a condition
+
+// Evaluates `condition` against a response. **Never fails**: an absent header or body path makes
+// that leaf false, except `exists: false`, which is exactly the condition absence satisfies.
+pub fn evaluate_condition(condition: Condition, status: int, headers: [Header], body: string) -> bool {
+    return switch condition {
+        All(parts) {
+            for part in parts {
+                if !evaluate_condition(part, status, headers, body) {
+                    return false
+                }
+            }
+            true
+        }
+        Any(parts) {
+            for part in parts {
+                if evaluate_condition(part, status, headers, body) {
+                    return true
+                }
+            }
+            false
+        }
+        Not(inner) { !evaluate_condition(inner, status, headers, body) }
+        Status(op) { compare(json.int_to_json(status), op) }
+        Header(target) {
+            val found = header_value(headers, target.name)
+            switch target.op {
+                Exists(wanted) { is_Some(found) == wanted }
+                Eq(_) { compare_optional(found, target.op) }
+                Ne(_) { compare_optional(found, target.op) }
+                Gt(_) { compare_optional(found, target.op) }
+                Lt(_) { compare_optional(found, target.op) }
+                Contains(_) { compare_optional(found, target.op) }
+            }
+        }
+        Body(target) {
+            // A body that is not JSON finds no path, so every operator but `exists: false` is false.
+            val found = switch json.parse(body) {
+                Ok(parsed) { json_at_path(parsed, target.path) }
+                Err(_) { Option<Json>.None }
+            }
+            switch target.op {
+                Exists(wanted) { is_Some(found) == wanted }
+                Eq(_) { compare_found(found, target.op) }
+                Ne(_) { compare_found(found, target.op) }
+                Gt(_) { compare_found(found, target.op) }
+                Lt(_) { compare_found(found, target.op) }
+                Contains(_) { compare_found(found, target.op) }
+            }
+        }
+    }
+}
+
+// **A header's value is compared as a JSON string**, which is what Rust does
+// (`Value::String(value)`) -- so `eq` against a number never matches a header, however numeric the
+// header's text looks.
+fn compare_optional(found: Option<string>, op: Comparison) -> bool {
+    return switch found {
+        Some(value) { compare(Json.JString(value), op) }
+        None { false }
+    }
+}
+
+fn compare_found(found: Option<Json>, op: Comparison) -> bool {
+    return switch found {
+        Some(value) { compare(value, op) }
+        None { false }
+    }
+}
+
+fn header_value(headers: [Header], wanted: string) -> Option<string> {
+    val target = to_lower(wanted)
+    for h in headers {
+        if to_lower(h.name) == target {
+            return Some(h.value)
+        }
+    }
+    return None
+}
+
+fn compare(actual: Json, op: Comparison) -> bool {
+    return switch op {
+        Eq(expected) { json_equal(actual, expected) }
+        Ne(expected) { !json_equal(actual, expected) }
+        // **`gt` and `lt` are numeric only**: either side that is not a number makes the comparison
+        // false rather than an error, matching Rust's `as_f64().zip(..)`.
+        Gt(bound) { numeric_compare(actual, bound, true) }
+        Lt(bound) { numeric_compare(actual, bound, false) }
+        Contains(needle) { contains_value(actual, needle) }
+        // `exists` is decided by the caller, which knows whether the value was there at all.
+        Exists(_) { true }
+    }
+}
+
+fn numeric_compare(actual: Json, bound: Json, greater: bool) -> bool {
+    val a = switch json.float_from_json(actual) {
+        Ok(n) { n }
+        Err(_) { return false }
+    }
+    val b = switch json.float_from_json(bound) {
+        Ok(n) { n }
+        Err(_) { return false }
+    }
+    return if greater { a > b } else { a < b }
+}
+
+// `contains` on a string is a substring test; on an array it is membership. Anything else is false.
+fn contains_value(actual: Json, needle: Json) -> bool {
+    if Json.is_JString(actual) {
+        return switch json.string_from_json(needle) {
+            Ok(text) { contains(Json.unwrap_JString(actual), text) }
+            // A non-string needle against a string haystack: Rust's `as_str()` answers None and the
+            // comparison is false.
+            Err(_) { false }
+        }
+    }
+    if Json.is_JArray(actual) {
+        for cell in Json.unwrap_JArray(actual) {
+            if json_equal(cell, needle) {
+                return true
+            }
+        }
+        return false
+    }
+    return false
+}
+
+// Structural equality, as `serde_json::Value`'s `PartialEq` is. Compared through the formatted text
+// for objects and arrays, since that is already canonical here: `Map` keeps insertion order and both
+// sides of any comparison came through the same parser.
+fn json_equal(a: Json, b: Json) -> bool {
+    if Json.is_JString(a) && Json.is_JString(b) {
+        return Json.unwrap_JString(a) == Json.unwrap_JString(b)
+    }
+    if Json.is_JBool(a) && Json.is_JBool(b) {
+        return Json.unwrap_JBool(a) == Json.unwrap_JBool(b)
+    }
+    if Json.is_JNull(a) && Json.is_JNull(b) {
+        return true
+    }
+    if Json.is_JNumber(a) && Json.is_JNumber(b) {
+        // Numerically, so `2` equals `2.0` -- which is what comparing two `serde_json` numbers of
+        // different kinds does.
+        return switch json.float_from_json(a) {
+            Ok(x) {
+                switch json.float_from_json(b) {
+                    Ok(y) { x == y }
+                    Err(_) { false }
+                }
+            }
+            Err(_) { false }
+        }
+    }
+    if Json.is_JNumber(a) != Json.is_JNumber(b) {
+        return false
+    }
+    return json.format(a) == json.format(b)
+}
+
+// ---------------------------------------------------------------- resolving a reference
+
+// An alias and a request path, out of a reference.
+pub struct RequestRef {
+    alias: string
+    path: string
+}
+
+// Splits `alias->Auth/login` into its two halves, or resolves a bare `Auth/login` against the import
+// named `default`.
+//
+// **Split on the first arrow only**, so a path may itself contain one. A bare reference with no
+// `default` import is an error naming what is missing, rather than a silent pick of whichever
+// import happened to be first.
+pub fn resolve_request_ref(reference: string, known_aliases: [string]) -> Result<RequestRef, string> {
+    val arrow = index_of(reference, "->", 0)
+    if arrow < 0 {
+        if !contains(known_aliases, "default") {
+            return err(prelude.format(
+                "request \"{}\" names no collection alias and the scenario has no \"default\" import",
+                reference
+            ))
+        }
+        return ok(RequestRef { alias: "default", path: reference })
+    }
+    val alias = substring(reference, 0, arrow)
+    val path = substring(reference, arrow + 2, len(reference))
+    if !contains(known_aliases, alias) {
+        return err(prelude.format(
+            "request \"{}\" names the alias \"{}\", which the scenario does not import",
+            reference,
+            alias
+        ))
+    }
+    return ok(RequestRef { alias: alias, path: path })
+}
+
+// ---------------------------------------------------------------- the wire format
+//
+// **Untagged, so each codec tests for the key that identifies the variant** rather than reading a
+// `"type"` discriminator -- `{"request": ".."}`, `{"requests": {..}}`, `{"choice": {..}}`, and the
+// same for conditions and comparisons. Serde resolves these by trying each variant in declaration
+// order and taking the first that deserializes; these read the keys directly, which gives the same
+// answer for every well-formed document and a better message for a malformed one.
+//
+// The one shape that is *not* untagged is `RequestsNode`, whose `type` really is a field:
+// `{"type": "sequence", "items": [..]}`.
+
+fn sequence_kind_from_json(j: Json) -> Result<SequenceKind, string> {
+    val name = try json.string_from_json(j)
+    if name == "sequence" {
+        return ok(SequenceKind.Sequence)
+    }
+    if name == "parallel" {
+        return ok(SequenceKind.Parallel)
+    }
+    return err(concat("a container's type must be \"sequence\" or \"parallel\", not: ", name))
+}
+
+fn sequence_kind_to_json(k: SequenceKind) -> Json {
+    return switch k {
+        Sequence { Json.JString("sequence") }
+        Parallel { Json.JString("parallel") }
+    }
+}
+
+pub fn comparison_from_json(j: Json) -> Result<Comparison, string> {
+    if Some(found) = json.get(j, "eq") {
+        return ok(Comparison.Eq(found))
+    }
+    if Some(found) = json.get(j, "ne") {
+        return ok(Comparison.Ne(found))
+    }
+    if Some(found) = json.get(j, "gt") {
+        return ok(Comparison.Gt(found))
+    }
+    if Some(found) = json.get(j, "lt") {
+        return ok(Comparison.Lt(found))
+    }
+    if Some(found) = json.get(j, "contains") {
+        return ok(Comparison.Contains(found))
+    }
+    if Some(found) = json.get(j, "exists") {
+        return ok(Comparison.Exists(try json.bool_from_json(found)))
+    }
+    return err("a comparison needs one of eq, ne, gt, lt, contains or exists")
+}
+
+pub fn comparison_to_json(c: Comparison) -> Json {
+    return switch c {
+        Eq(v) { Json.JObject(Map<string, Json> { "eq": v }) }
+        Ne(v) { Json.JObject(Map<string, Json> { "ne": v }) }
+        Gt(v) { Json.JObject(Map<string, Json> { "gt": v }) }
+        Lt(v) { Json.JObject(Map<string, Json> { "lt": v }) }
+        Contains(v) { Json.JObject(Map<string, Json> { "contains": v }) }
+        Exists(b) { Json.JObject(Map<string, Json> { "exists": Json.JBool(b) }) }
+    }
+}
+
+pub fn condition_from_json(j: Json) -> Result<Condition, string> {
+    if Some(found) = json.get(j, "all") {
+        return ok(Condition.All(try condition_list(found, "all")))
+    }
+    if Some(found) = json.get(j, "any") {
+        return ok(Condition.Any(try condition_list(found, "any")))
+    }
+    if Some(found) = json.get(j, "not") {
+        return ok(Condition.Not(try condition_from_json(found)))
+    }
+    if Some(found) = json.get(j, "status") {
+        return ok(Condition.Status(try comparison_from_json(found)))
+    }
+    if Some(found) = json.get(j, "header") {
+        return ok(Condition.Header(NamedComparison {
+            name: try json.require_string(found, "name"),
+            op: try comparison_from_json(try json.require(found, "op"))
+        }))
+    }
+    if Some(found) = json.get(j, "body") {
+        return ok(Condition.Body(PathComparison {
+            path: try json.require_string(found, "path"),
+            op: try comparison_from_json(try json.require(found, "op"))
+        }))
+    }
+    return err("a condition needs one of all, any, not, status, header or body")
+}
+
+fn condition_list(j: Json, key: string) -> Result<[Condition], string> {
+    if !Json.is_JArray(j) {
+        return err(concat("\"", key, "\" needs an array of conditions"))
+    }
+    val out = mutable_array_new<Condition>()
+    for cell in Json.unwrap_JArray(j) {
+        push(out, try condition_from_json(cell))
+    }
+    return ok(snapshot(out))
+}
+
+pub fn condition_to_json(c: Condition) -> Json {
+    return switch c {
+        All(parts) { Json.JObject(Map<string, Json> { "all": conditions_to_json(parts) }) }
+        Any(parts) { Json.JObject(Map<string, Json> { "any": conditions_to_json(parts) }) }
+        Not(inner) { Json.JObject(Map<string, Json> { "not": condition_to_json(inner) }) }
+        Status(op) { Json.JObject(Map<string, Json> { "status": comparison_to_json(op) }) }
+        Header(target) {
+            Json.JObject(Map<string, Json> {
+                "header": Json.JObject(Map<string, Json> {
+                    "name": Json.JString(target.name),
+                    "op": comparison_to_json(target.op)
+                })
+            })
+        }
+        Body(target) {
+            Json.JObject(Map<string, Json> {
+                "body": Json.JObject(Map<string, Json> {
+                    "path": Json.JString(target.path),
+                    "op": comparison_to_json(target.op)
+                })
+            })
+        }
+    }
+}
+
+fn conditions_to_json(parts: [Condition]) -> Json {
+    val out = mutable_array_new<Json>()
+    for part in parts {
+        push(out, condition_to_json(part))
+    }
+    return Json.JArray(snapshot(out))
+}
+
+pub fn scenario_node_from_json(j: Json) -> Result<ScenarioNode, string> {
+    if Some(found) = json.get(j, "request") {
+        return ok(ScenarioNode.Request(try json.string_from_json(found)))
+    }
+    if Some(found) = json.get(j, "requests") {
+        return ok(ScenarioNode.Requests(try requests_node_from_json(found)))
+    }
+    if Some(found) = json.get(j, "choice") {
+        return ok(ScenarioNode.Choice(try choice_node_from_json(found)))
+    }
+    return err("a scenario node needs one of request, requests or choice")
+}
+
+pub fn scenario_node_to_json(n: ScenarioNode) -> Json {
+    return switch n {
+        Request(reference) { Json.JObject(Map<string, Json> { "request": Json.JString(reference) }) }
+        Requests(container) { Json.JObject(Map<string, Json> { "requests": requests_node_to_json(container) }) }
+        Choice(choice) { Json.JObject(Map<string, Json> { "choice": choice_node_to_json(choice) }) }
+    }
+}
+
+pub fn requests_node_from_json(j: Json) -> Result<RequestsNode, string> {
+    val items = try json.require(j, "items")
+    if !Json.is_JArray(items) {
+        return err("a container's \"items\" needs an array")
+    }
+    val out = mutable_array_new<ScenarioNode>()
+    for cell in Json.unwrap_JArray(items) {
+        push(out, try scenario_node_from_json(cell))
+    }
+    return ok(RequestsNode {
+        kind: try sequence_kind_from_json(try json.require(j, "type")),
+        items: snapshot(out)
+    })
+}
+
+pub fn requests_node_to_json(n: RequestsNode) -> Json {
+    val items = mutable_array_new<Json>()
+    for item in n.items {
+        push(items, scenario_node_to_json(item))
+    }
+    return Json.JObject(Map<string, Json> {
+        "type": sequence_kind_to_json(n.kind),
+        "items": Json.JArray(snapshot(items))
+    })
+}
+
+pub fn choice_node_from_json(j: Json) -> Result<ChoiceNode, string> {
+    val cases = try json.require(j, "cases")
+    if !Json.is_JArray(cases) {
+        return err("a choice's \"cases\" needs an array")
+    }
+    val out = mutable_array_new<ChoiceCase>()
+    for cell in Json.unwrap_JArray(cases) {
+        push(out, ChoiceCase {
+            when: try condition_from_json(try json.require(cell, "when")),
+            then: try scenario_node_from_json(try json.require(cell, "then"))
+        })
+    }
+    val fallback = switch json.get(j, "default") {
+        Some(found) {
+            if Json.is_JNull(found) {
+                Option<ScenarioNode>.None
+            } else {
+                Option<ScenarioNode>.Some(try scenario_node_from_json(found))
+            }
+        }
+        None { Option<ScenarioNode>.None }
+    }
+    return ok(ChoiceNode { cases: snapshot(out), default: fallback })
+}
+
+pub fn choice_node_to_json(c: ChoiceNode) -> Json {
+    val cases = mutable_array_new<Json>()
+    for one in c.cases {
+        push(cases, Json.JObject(Map<string, Json> {
+            "when": condition_to_json(one.when),
+            "then": scenario_node_to_json(one.then)
+        }))
+    }
+    // `default` is `#[serde(default)]` with no `skip_serializing_if`, so `None` goes on the wire as
+    // `null` rather than being left out -- the same rule `SavedRequest`'s `body` and `auth` follow.
+    return Json.JObject(Map<string, Json> {
+        "cases": Json.JArray(snapshot(cases)),
+        "default": switch c.default {
+            Some(node) { scenario_node_to_json(node) }
+            None { Json.JNull }
+        }
+    })
+}
+
+pub fn scenario_from_json(j: Json) -> Result<Scenario, string> {
+    val id = switch json.get(j, "id") {
+        Some(found) {
+            val text = try json.string_from_json(found)
+            switch uuid.parse(text) {
+                Ok(u) { u }
+                Err(_) { return err(concat("not a UUID: ", text)) }
+            }
+        }
+        // `#[serde(default = "Uuid::new_v4")]`: a scenario written by hand need not carry an id.
+        None { uuid_new() }
+    }
+    val imports = switch json.get(j, "imports") {
+        Some(found) { try json.to_string_map(found) }
+        None { Map<string, string> {} }
+    }
+    return ok(Scenario {
+        id: id,
+        name: try json.require_string(j, "name"),
+        imports: imports,
+        requests: try requests_node_from_json(try json.require(j, "requests"))
+    })
+}
+
+pub fn scenario_to_json(s: Scenario) -> Json {
+    return Json.JObject(Map<string, Json> {
+        "id": Json.JString(uuid.format(s.id)),
+        "name": Json.JString(s.name),
+        "imports": imports_to_json(s.imports),
+        "requests": requests_node_to_json(s.requests)
+    })
+}
+
+// **The keys are sorted**, because Rust holds `imports` in a `BTreeMap` and so writes them in key
+// order whatever order they were read in. Ziman's `Map` keeps insertion order, which for a parsed
+// document is the order the file happened to list them -- so a scenario whose imports were not
+// already alphabetical would round-trip to different bytes without this.
+fn imports_to_json(imports: Map<string, string>) -> Json {
+    val names = mutable_array_new<string>()
+    for name in keys(imports) {
+        push(names, name)
+    }
+    val out = mutable_map_new<string, Json>()
+    for name in sort(snapshot(names)) {
+        set(out, name, Json.JString(get_or(imports, name, "")))
+    }
+    return Json.JObject(snapshot(out))
+}

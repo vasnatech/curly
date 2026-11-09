@@ -21,11 +21,16 @@ use core/saved.Variable
 use core/saved.environment_set
 use core/saved.environment_unset
 use core/saved.kv_pair_of
+use core/scenario.RequestsNode
+use core/scenario.ScenarioNode
+use core/scenario.SequenceKind
+use core/scenario.scenario_of
 use core/storage.Storage
 use core/storage.append_history
 use core/storage.clear_all_sessions
 use core/storage.clear_session
 use core/storage.delete_collection
+use core/storage.delete_scenario
 use core/storage.find_project_local_root
 use core/storage.history_entry_of
 use core/storage.history_entry_to_json
@@ -33,13 +38,17 @@ use core/storage.init_project_local
 use core/storage.list_collections
 use core/storage.list_environments
 use core/storage.list_history
+use core/storage.list_scenarios
 use core/storage.load_collection
 use core/storage.load_collection_opt
 use core/storage.load_environment_opt
+use core/storage.load_scenario
+use core/storage.load_scenario_opt
 use core/storage.load_session
 use core/storage.resolve
 use core/storage.save_collection
 use core/storage.save_environment
+use core/storage.save_scenario
 use core/storage.save_session
 use core/storage.slugify
 use core/storage.storage_of
@@ -535,4 +544,61 @@ fn a_history_entry_written_before_the_newer_fields_still_reads() {
     test.assert_eq(true, is_None(listed[0].request_body))
     test.assert_eq(false, listed[0].request_body_truncated)
     test.assert_eq(true, is_None(listed[0].request_auth_kind))
+}
+
+// ---------------------------------------------------------------- scenarios
+//
+// Stored the way a collection is but in their own directory, because a scenario's `imports` can
+// name more than one collection and so it cannot live inside any single one.
+
+#[test]
+fn a_scenario_round_trips_through_disk_and_is_listed() {
+    val s = storage_of(scratch("scenario"))
+    val scenario = scenario_of("Smoke Test", RequestsNode {
+        kind: SequenceKind.Sequence,
+        items: [ScenarioNode.Request("login"), ScenarioNode.Request("logout")]
+    })
+    test.assert_eq(true, is_ok(save_scenario(s, scenario)))
+    // Slugified like everything else, so the file is `smoke-test.json`.
+    test.assert_eq(["smoke-test"], unwrap(list_scenarios(s)))
+    val back = unwrap(load_scenario(s, "Smoke Test"))
+    test.assert_eq("Smoke Test", back.name)
+    test.assert_len(2, back.requests.items)
+    // And found by any name with the same slug.
+    test.assert_eq(true, is_ok(load_scenario(s, "smoke test")))
+}
+
+#[test]
+fn a_scenario_lives_in_its_own_directory_not_among_the_collections() {
+    val s = storage_of(scratch("scenario-dir"))
+    val _ = save_scenario(s, scenario_of("Shared Name", RequestsNode {
+        kind: SequenceKind.Sequence,
+        items: []
+    }))
+    val _ = save_collection(s, a_collection("Shared Name"))
+    // The same name in both is two different files, not one overwriting the other.
+    test.assert_eq(["shared-name"], unwrap(list_scenarios(s)))
+    test.assert_eq(["shared-name"], unwrap(list_collections(s)))
+    test.assert_eq(true, is_ok(load_scenario(s, "Shared Name")))
+    test.assert_eq(true, is_ok(load_collection(s, "Shared Name")))
+}
+
+#[test]
+fn a_missing_scenario_is_refused_by_name_but_the_opt_form_answers_nothing() {
+    val s = storage_of(scratch("scenario-missing"))
+    val why: string = switch load_scenario(s, "Nope") {
+        Ok(_) { "no refusal" }
+        Err(message) { message }
+    }
+    test.assert_contains(why, "Nope")
+    test.assert_eq(true, is_None(unwrap(load_scenario_opt(s, "Nope"))))
+    test.assert_eq(false, is_ok(delete_scenario(s, "Nope")))
+}
+
+#[test]
+fn deleting_a_scenario_removes_it() {
+    val s = storage_of(scratch("scenario-delete"))
+    val _ = save_scenario(s, scenario_of("Gone", RequestsNode { kind: SequenceKind.Sequence, items: [] }))
+    test.assert_eq(true, is_ok(delete_scenario(s, "Gone")))
+    test.assert_len(0, unwrap(list_scenarios(s)))
 }

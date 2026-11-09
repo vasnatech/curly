@@ -15,6 +15,7 @@ use core/saved.Collection
 use core/saved.SavedRequest
 use core/saved.collection_from_json
 use core/saved.collection_to_json
+use core/scenario.scenario_from_json
 use core/storage.list_collections
 use core/storage.list_environments
 use core/storage.slugify
@@ -82,6 +83,10 @@ fn main() {
         }
         return
     }
+    if case == "show-scenario" {
+        show_scenario(env_or("CURLY_FILE", ""))
+        return
+    }
     if case == "tree-ops" {
         tree_ops()
         return
@@ -146,4 +151,43 @@ fn tree_ops() {
         }
     }
     print(json.format(collection_to_json(c), 2))
+}
+
+// **`curly scenario show`, reproduced exactly** (`commands/scenario.rs:63-66`): the name, then one
+// indented `alias -> collection` per import, then the top-level step count. Rust iterates a
+// `BTreeMap`, so the imports come out in alias order and this sorts to match.
+//
+// A small output, but it exercises the whole scenario codec -- a file that decoded to the wrong
+// shape would show the wrong step count or lose an import.
+fn show_scenario(path: string) {
+    val text = switch fs.read_text(path) {
+        Ok(t) { t }
+        Err(_) {
+            os.fatal(concat("cannot read ", path))
+            return
+        }
+    }
+    val parsed = switch json.parse(text) {
+        Ok(j) { j }
+        Err(why) {
+            os.fatal(concat("not JSON: ", why))
+            return
+        }
+    }
+    val s = switch scenario_from_json(parsed) {
+        Ok(found) { found }
+        Err(why) {
+            os.fatal(concat("decode failed: ", why))
+            return
+        }
+    }
+    print(s.name)
+    val aliases = mutable_array_new<string>()
+    for alias in keys(s.imports) {
+        push(aliases, alias)
+    }
+    for alias in sort(snapshot(aliases)) {
+        print(prelude.format("  {} -> {}", alias, get_or(s.imports, alias, "")))
+    }
+    print(prelude.format("  {} top-level step(s)", str(len(s.requests.items))))
 }

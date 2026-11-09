@@ -28,7 +28,11 @@ use core/extraction.extraction_to_json
 use core/extraction.optional_bool
 use core/model.BasicAuth
 use core/model.Pair
+use core/model as model
 use core/substitution.substitute
+use fs
+use http
+use http.HttpMethod
 use json
 use json.Json
 use uuid
@@ -487,6 +491,91 @@ pub fn environment_to_json(e: Environment) -> Json {
         "name": Json.JString(e.name),
         "variables": array_of<Variable>(e.variables, variable_to_json)
     })
+}
+
+// ---------------------------------------------------------------- becoming a request
+
+// A saved request as a sendable one. **Only enabled headers and parameters travel**, which is what
+// `enabled` is for -- a disabled pair stays in the file and off the wire.
+//
+// This is the point a `Binary` body's file is finally read, deliberately late: a collection holding
+// a path should not pin that file's bytes in memory from the moment it is loaded.
+pub fn into_request(saved: SavedRequest) -> Result<model.Request, string> {
+    val method = try parsed_method(saved.method)
+    val headers = mutable_array_new<http.Header>()
+    for h in saved.headers {
+        if h.enabled {
+            push(headers, http.Header { name: h.name, value: h.value })
+        }
+    }
+    val params = mutable_array_new<Pair>()
+    for p in saved.query_params {
+        if p.enabled {
+            push(params, Pair { name: p.name, value: p.value })
+        }
+    }
+    val body = switch saved.body {
+        Some(b) { Option<model.Body>.Some(try sendable_body(b)) }
+        None { Option<model.Body>.None }
+    }
+    val auth = switch saved.auth {
+        Some(a) {
+            Option<model.Auth>.Some(switch a {
+                Basic(creds) { model.Auth.Basic(creds) }
+                Bearer(token) { model.Auth.Bearer(token) }
+            })
+        }
+        None { Option<model.Auth>.None }
+    }
+    return ok(model.Request {
+        method: method,
+        url: saved.url,
+        query_params: snapshot(params),
+        headers: snapshot(headers),
+        body: body,
+        auth: auth
+    })
+}
+
+// **The method is validated, not just parsed.** `http.method_parse` answers `Other(..)` for anything
+// it does not recognise and so cannot fail, where Rust's `Method::from_bytes` refuses a string that
+// is not a valid HTTP token -- and a saved request whose method is `GET POST` should be an error
+// naming the file, not a request sent with a nonsense verb.
+fn parsed_method(name: string) -> Result<HttpMethod, string> {
+    val upper = to_upper(trim(name))
+    if len(upper) == 0 {
+        return err(concat("invalid HTTP method in saved request: ", name))
+    }
+    for i in 0..len(upper) {
+        val ch = substring(upper, i, i + 1)
+        if !is_alpha(ch) && ch != "-" && ch != "_" {
+            return err(concat("invalid HTTP method in saved request: ", name))
+        }
+    }
+    return ok(http.method_parse(upper))
+}
+
+fn sendable_body(b: SavedBody) -> Result<model.Body, string> {
+    return switch b {
+        Raw(content) { ok(model.Body.Raw(content)) }
+        Binary(path) {
+            switch fs.read_bytes(path) {
+                Ok(bytes) { ok(model.Body.Binary(bytes)) }
+                Err(_) { err(concat("failed to read body file: ", path)) }
+            }
+        }
+        Form(fields) { ok(model.Body.Form(fields)) }
+        Multipart(fields) {
+            val out = mutable_array_new<model.MultipartField>()
+            for f in fields {
+                push(out, switch f {
+                    Text(p) { model.MultipartField.Text(model.MultipartText { name: p.name, value: p.value }) }
+                    File(np) { model.MultipartField.File(model.MultipartFile { name: np.name, path: np.path }) }
+                })
+            }
+            ok(model.Body.Multipart(snapshot(out)))
+        }
+    }
 }
 
 // ---------------------------------------------------------------- resolving

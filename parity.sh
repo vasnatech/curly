@@ -127,6 +127,34 @@ else
   bad "the rust side wrote no parity collection" "check the collections subcommand names"
 fi
 
+# ---- scenarios --------------------------------------------------------------------------------
+#
+# `curly scenario show` against the Ziman side's reproduction of the same output, for every scenario
+# in the tree. Small output, whole codec: a file decoded into the wrong shape reports the wrong step
+# count or loses an import.
+
+scen_total=0
+scen_bad=0
+for file in "$CURLY"/scenarios/*.json; do
+  [ -f "$file" ] || continue
+  name="$(basename "$file" .json)"
+  scen_total=$((scen_total + 1))
+  rust_out="$("$RUST" scenario show "$name" --data-dir "$CURLY" 2>&1)"
+  zim_out="$(CURLY_CASE=show-scenario CURLY_FILE="$file" zim env 2>&1)"
+  if [ "$rust_out" != "$zim_out" ]; then
+    scen_bad=$((scen_bad + 1))
+    [ "$scen_bad" -le 2 ] && bad "scenario \"$name\" differs" \
+      "$(diff <(echo "$rust_out") <(echo "$zim_out") | head -4 | tr '\n' ' ')"
+  fi
+done
+if [ "$scen_total" -eq 0 ]; then
+  echo "  SKIP scenarios: none in the sample tree"
+elif [ "$scen_bad" -eq 0 ]; then
+  ok "all $scen_total scenarios decode to the same shape"
+else
+  [ "$scen_bad" -gt 2 ] && bad "$scen_bad of $scen_total scenarios differ (first two shown)"
+fi
+
 # ---- the slug -----------------------------------------------------------------------------------
 #
 # Both sides turn a display name into the same filename, or `load` misses what `save` wrote.

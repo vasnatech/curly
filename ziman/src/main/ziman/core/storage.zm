@@ -17,9 +17,9 @@
 // Rust does and for the same reason -- the precedence is then testable without mutating the
 // environment. `resolve_default` is the wiring to the real process.
 //
-// **Scenarios are not here yet.** Rust's `load_scenario`/`save_scenario` are a copy of the
-// collection pair with `Scenario` in place of `Collection`, and `core/scenario.zm` is not written;
-// they land with it rather than as a stub that cannot be called.
+// **A scenario is stored the way a collection is but not inside one**, because its `imports` can
+// name more than one collection -- so it gets its own directory and its own load/save/list/delete,
+// which are otherwise a copy of the collection pair.
 use clock
 use core/exec.ResponseSummary
 use core/model.Auth
@@ -31,6 +31,9 @@ use core/saved.collection_from_json
 use core/saved.collection_to_json
 use core/saved.environment_from_json
 use core/saved.environment_to_json
+use core/scenario.Scenario
+use core/scenario.scenario_from_json
+use core/scenario.scenario_to_json
 use fs
 use http
 use json
@@ -219,6 +222,10 @@ fn session_dir(s: Storage) -> string {
     return fs.path_join(s.root, "session")
 }
 
+fn scenarios_dir(s: Storage) -> string {
+    return fs.path_join(s.root, "scenarios")
+}
+
 fn history_dir(s: Storage) -> string {
     return fs.path_join(s.root, "history")
 }
@@ -302,6 +309,35 @@ pub fn delete_collection(s: Storage, name: string) -> Result<unit, string> {
     val path = json_path(collections_dir(s), name)
     if Err(_) = fs.remove(path) {
         return err(prelude.format("no collection named \"{}\" (looked in {})", name, path))
+    }
+    return ok(unit)
+}
+
+pub fn list_scenarios(s: Storage) -> Result<[string], string> {
+    return list_json_names(scenarios_dir(s))
+}
+
+pub fn load_scenario(s: Storage, name: string) -> Result<Scenario, string> {
+    val j = try read_json(json_path(scenarios_dir(s), name), "scenario", name)
+    return scenario_from_json(j)
+}
+
+pub fn load_scenario_opt(s: Storage, name: string) -> Result<Option<Scenario>, string> {
+    if !fs.exists(json_path(scenarios_dir(s), name)) {
+        return ok(None)
+    }
+    return ok(Some(try load_scenario(s, name)))
+}
+
+pub fn save_scenario(s: Storage, scenario: Scenario) -> Result<unit, string> {
+    val dir = scenarios_dir(s)
+    return write_json(dir, json_path(dir, scenario.name), scenario_to_json(scenario))
+}
+
+pub fn delete_scenario(s: Storage, name: string) -> Result<unit, string> {
+    val path = json_path(scenarios_dir(s), name)
+    if Err(_) = fs.remove(path) {
+        return err(prelude.format("no scenario named \"{}\" (looked in {})", name, path))
     }
     return ok(unit)
 }

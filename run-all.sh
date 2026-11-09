@@ -35,7 +35,7 @@ phase "ziman formatting"
 # `--fmt --check` reports an unformatted file by PRINTING ITS NAME and still exiting 0, so the
 # output is what has to be checked, not the status.
 unformatted="$(cd "$ROOT/ziman" && ZIMAN_MODULE_PATH=src/main/ziman "$ZIMAN" --fmt --check \
-  src/main/ziman/core/*.zm src/test/unit/*.zm src/test/other/*.zm 2>&1)"
+  src/main/ziman/core/*.zm src/main/ziman/core/import/*.zm src/test/unit/*.zm src/test/other/*.zm 2>&1)"
 if [ -n "$unformatted" ]; then
   fail "unformatted: $unformatted"
 else

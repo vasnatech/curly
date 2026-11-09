@@ -1,0 +1,319 @@
+// `core/import/postman`, held to the cases in `crates/curly-core/tests/import_postman_test.rs`.
+//
+// The interesting ones are the shape ambiguities Postman's format leaves: a folder is told from a
+// request only by which key it carries, a URL is either a string or an object, and `disabled`
+// means "drop it" for an environment variable but "import it switched off" for a header -- because
+// curly's `KvPair` can express that and its `Variable` cannot.
+use core/import/postman.import_collection
+use core/import/postman.import_environment
+use core/saved.Collection
+use core/saved.Environment
+use core/saved.SavedBody
+use core/saved.SavedRequest
+use test
+
+fn collection_of(document: string) -> Collection {
+    val out = import_collection(document)
+    if Err(why) = out {
+        test.fail(concat("import refused: ", why))
+    }
+    return unwrap(out)
+}
+
+fn refusal_of_collection(document: string) -> string {
+    return switch import_collection(document) {
+        Ok(_) { "no refusal" }
+        Err(why) { why }
+    }
+}
+
+fn environment_of(document: string, name: Option<string>) -> Environment {
+    val out = import_environment(document, name)
+    if Err(why) = out {
+        test.fail(concat("import refused: ", why))
+    }
+    return unwrap(out)
+}
+
+fn body_kind(r: SavedRequest) -> string {
+    return switch r.body {
+        Some(b) {
+            switch b {
+                Raw(content) { concat("raw:", content) }
+                Binary(path) { concat("binary:", path) }
+                Form(fields) { concat("form:", str(len(fields))) }
+                Multipart(fields) { concat("multipart:", str(len(fields))) }
+            }
+        }
+        None { "(none)" }
+    }
+}
+
+fn auth_of(r: SavedRequest) -> string {
+    return switch r.auth {
+        Some(a) {
+            switch a {
+                Basic(b) { concat("basic ", b.username, ":", b.password) }
+                Bearer(t) { concat("bearer ", t) }
+            }
+        }
+        None { "(none)" }
+    }
+}
+
+fn one_request(document: string) -> SavedRequest {
+    val c = collection_of(document)
+    if len(c.requests) == 0 {
+        test.fail("the collection has no top-level request")
+    }
+    return c.requests[0]
+}
+
+fn wrap(items: string) -> string {
+    return concat("{\"info\":{\"name\":\"My API\"},\"item\":[", items, "]}")
+}
+
+// ---------------------------------------------------------------- collections
+
+#[test]
+fn the_collection_takes_its_name_from_info() {
+    test.assert_eq("My API", collection_of(wrap("")).name)
+}
+
+#[test]
+fn a_top_level_request_imports_with_its_method_url_and_headers() {
+    val r = one_request(wrap(concat(
+        "{\"name\":\"login\",\"request\":{\"method\":\"POST\",",
+        "\"header\":[{\"key\":\"Accept\",\"value\":\"application/json\"}],",
+        "\"url\":{\"raw\":\"{{BASE}}/login\"}}}"
+    )))
+    test.assert_eq("login", r.name)
+    test.assert_eq("POST", r.method)
+    // Postman's `{{variable}}` is curly's, so the URL imports verbatim.
+    test.assert_eq("{{BASE}}/login", r.url)
+    test.assert_len(1, r.headers)
+    test.assert_eq("Accept", r.headers[0].name)
+    test.assert_eq(true, r.headers[0].enabled)
+}
+
+#[test]
+fn a_url_that_is_a_plain_string_imports_as_well_as_the_detailed_form() {
+    // The same collection can hold both: Postman writes the object once a request has been opened
+    // in its editor.
+    val r = one_request(wrap("{\"name\":\"a\",\"request\":{\"url\":\"https://example.com/a\"}}"))
+    test.assert_eq("https://example.com/a", r.url)
+}
+
+#[test]
+fn a_request_with_no_method_defaults_to_get() {
+    test.assert_eq("GET", one_request(wrap("{\"name\":\"a\",\"request\":{\"url\":\"https://x\"}}")).method)
+}
+
+#[test]
+fn a_method_is_upper_cased() {
+    test.assert_eq("DELETE", one_request(wrap(
+        "{\"name\":\"a\",\"request\":{\"method\":\"delete\",\"url\":\"https://x\"}}"
+    )).method)
+}
+
+#[test]
+fn a_disabled_header_is_imported_switched_off_rather_than_dropped() {
+    // **`KvPair` can express disabled, so nothing is lost** -- unlike an environment variable,
+    // where curly's `Variable` has no such flag and the entry is dropped instead.
+    val r = one_request(wrap(concat(
+        "{\"name\":\"a\",\"request\":{\"url\":\"https://x\",\"header\":[",
+        "{\"key\":\"On\",\"value\":\"1\"},",
+        "{\"key\":\"Off\",\"value\":\"2\",\"disabled\":true}]}}"
+    )))
+    test.assert_len(1, r.headers)
+    test.assert_eq("On", r.headers[0].name)
+}
+
+#[test]
+fn nested_folders_import_as_folders() {
+    val c = collection_of(wrap(concat(
+        "{\"name\":\"Auth\",\"item\":[",
+        "{\"name\":\"login\",\"request\":{\"url\":\"https://x/login\"}},",
+        "{\"name\":\"OAuth\",\"item\":[{\"name\":\"refresh\",\"request\":{\"url\":\"https://x/r\"}}]}",
+        "]}"
+    )))
+    test.assert_len(1, c.folders)
+    test.assert_eq("Auth", c.folders[0].name)
+    test.assert_len(1, c.folders[0].requests)
+    test.assert_len(1, c.folders[0].folders)
+    test.assert_eq("OAuth", c.folders[0].folders[0].name)
+    test.assert_eq("refresh", c.folders[0].folders[0].requests[0].name)
+}
+
+#[test]
+fn an_empty_folder_is_still_a_folder_not_a_request() {
+    // **The only thing distinguishing them is which key is present**, and a folder's `item` is
+    // there even when empty -- which is what makes the test reliable.
+    val c = collection_of(wrap("{\"name\":\"Empty\",\"item\":[]}"))
+    test.assert_len(1, c.folders)
+    test.assert_len(0, c.requests)
+}
+
+#[test]
+fn an_item_that_is_neither_folder_nor_request_is_skipped() {
+    val c = collection_of(wrap("{\"name\":\"odd\"},{\"name\":\"a\",\"request\":{\"url\":\"https://x\"}}"))
+    test.assert_len(0, c.folders)
+    test.assert_len(1, c.requests)
+}
+
+// ---------------------------------------------------------------- bodies
+
+#[test]
+fn a_raw_body_imports() {
+    test.assert_eq("raw:{\"a\":1}", body_kind(one_request(wrap(concat(
+        "{\"name\":\"a\",\"request\":{\"url\":\"https://x\",",
+        "\"body\":{\"mode\":\"raw\",\"raw\":\"{\\\"a\\\":1}\"}}}"
+    )))))
+}
+
+#[test]
+fn a_urlencoded_body_imports_and_drops_disabled_fields() {
+    val r = one_request(wrap(concat(
+        "{\"name\":\"a\",\"request\":{\"url\":\"https://x\",\"body\":{\"mode\":\"urlencoded\",",
+        "\"urlencoded\":[{\"key\":\"on\",\"value\":\"1\"},{\"key\":\"off\",\"value\":\"2\",\"disabled\":true}]}}}"
+    )))
+    test.assert_eq("form:1", body_kind(r))
+}
+
+#[test]
+fn a_formdata_body_imports_text_and_file_fields() {
+    val r = one_request(wrap(concat(
+        "{\"name\":\"a\",\"request\":{\"url\":\"https://x\",\"body\":{\"mode\":\"formdata\",",
+        "\"formdata\":[{\"key\":\"caption\",\"value\":\"hi\"},",
+        "{\"key\":\"file\",\"type\":\"file\",\"src\":\"/exporters/machine/x.png\"},",
+        "{\"key\":\"skip\",\"value\":\"x\",\"disabled\":true}]}}}"
+    )))
+    // The file's `src` is a path on whoever exported the collection -- kept as given, because
+    // that is a limit of Postman's format rather than something an importer can fix.
+    test.assert_eq("multipart:2", body_kind(r))
+}
+
+#[test]
+fn a_file_body_imports_as_a_binary_reference() {
+    test.assert_eq("binary:/tmp/x.bin", body_kind(one_request(wrap(concat(
+        "{\"name\":\"a\",\"request\":{\"url\":\"https://x\",",
+        "\"body\":{\"mode\":\"file\",\"file\":{\"src\":\"/tmp/x.bin\"}}}}"
+    )))))
+}
+
+#[test]
+fn a_graphql_body_is_dropped_rather_than_half_imported() {
+    // curly has no GraphQL concept, and a half-imported body would send something wrong.
+    test.assert_eq("(none)", body_kind(one_request(wrap(concat(
+        "{\"name\":\"a\",\"request\":{\"url\":\"https://x\",",
+        "\"body\":{\"mode\":\"graphql\",\"graphql\":{\"query\":\"{ x }\"}}}}"
+    )))))
+}
+
+// ---------------------------------------------------------------- auth
+
+#[test]
+fn bearer_and_basic_auth_import() {
+    test.assert_eq("bearer abc", auth_of(one_request(wrap(concat(
+        "{\"name\":\"a\",\"request\":{\"url\":\"https://x\",",
+        "\"auth\":{\"type\":\"bearer\",\"bearer\":[{\"key\":\"token\",\"value\":\"abc\"}]}}}"
+    )))))
+    test.assert_eq("basic ann:s3cret", auth_of(one_request(wrap(concat(
+        "{\"name\":\"a\",\"request\":{\"url\":\"https://x\",\"auth\":{\"type\":\"basic\",\"basic\":[",
+        "{\"key\":\"username\",\"value\":\"ann\"},{\"key\":\"password\",\"value\":\"s3cret\"}]}}}"
+    )))))
+}
+
+#[test]
+fn basic_auth_missing_half_its_credentials_is_dropped() {
+    // Half a credential is not something to guess at.
+    test.assert_eq("(none)", auth_of(one_request(wrap(concat(
+        "{\"name\":\"a\",\"request\":{\"url\":\"https://x\",\"auth\":{\"type\":\"basic\",",
+        "\"basic\":[{\"key\":\"username\",\"value\":\"ann\"}]}}}"
+    )))))
+}
+
+#[test]
+fn an_auth_type_curly_does_not_support_is_dropped() {
+    test.assert_eq("(none)", auth_of(one_request(wrap(concat(
+        "{\"name\":\"a\",\"request\":{\"url\":\"https://x\",",
+        "\"auth\":{\"type\":\"oauth2\",\"oauth2\":[{\"key\":\"accessToken\",\"value\":\"t\"}]}}}"
+    )))))
+}
+
+// ---------------------------------------------------------------- refusals
+
+#[test]
+fn invalid_json_is_refused_by_name() {
+    test.assert_contains(refusal_of_collection("not json at all"), "failed to parse")
+}
+
+#[test]
+fn a_document_with_no_info_name_is_refused() {
+    test.assert_contains(refusal_of_collection("{\"item\":[]}"), "info")
+}
+
+// ---------------------------------------------------------------- environments and globals
+
+#[test]
+fn an_environment_imports_its_name_values_and_secret_flag() {
+    val env = environment_of(concat(
+        "{\"name\":\"Staging\",\"values\":[",
+        "{\"key\":\"BASE\",\"value\":\"https://staging\"},",
+        "{\"key\":\"TOKEN\",\"value\":\"t\",\"type\":\"secret\"}]}"
+    ), None)
+    test.assert_eq("Staging", env.name)
+    test.assert_len(2, env.variables)
+    test.assert_eq("BASE", env.variables[0].key)
+    test.assert_eq(false, env.variables[0].secret)
+    test.assert_eq(true, env.variables[1].secret)
+}
+
+#[test]
+fn a_disabled_environment_variable_is_dropped() {
+    // **Dropped, not imported disabled** -- curly's `Variable` has no enabled flag, unlike the
+    // `KvPair` a header uses. The asymmetry is the format's, and it is written down rather than
+    // papered over.
+    val env = environment_of(concat(
+        "{\"name\":\"e\",\"values\":[{\"key\":\"ON\",\"value\":\"1\"},",
+        "{\"key\":\"OFF\",\"value\":\"2\",\"enabled\":false}]}"
+    ), None)
+    test.assert_len(1, env.variables)
+    test.assert_eq("ON", env.variables[0].key)
+}
+
+#[test]
+fn an_absent_enabled_flag_means_enabled() {
+    val env = environment_of("{\"name\":\"e\",\"values\":[{\"key\":\"K\",\"value\":\"v\"}]}", None)
+    test.assert_len(1, env.variables)
+}
+
+#[test]
+fn a_name_override_wins_over_the_files_own_name() {
+    test.assert_eq("chosen", environment_of("{\"name\":\"Staging\",\"values\":[]}", Some("chosen")).name)
+}
+
+#[test]
+fn a_globals_export_becomes_curlys_global_environment() {
+    // A natural fit: `global` is already the scope curly merges into every request.
+    val env = environment_of(
+        "{\"_postman_variable_scope\":\"globals\",\"values\":[{\"key\":\"K\",\"value\":\"v\"}]}",
+        None
+    )
+    test.assert_eq("global", env.name)
+    test.assert_len(1, env.variables)
+}
+
+#[test]
+fn an_environment_with_no_name_at_all_becomes_imported() {
+    test.assert_eq("imported", environment_of("{\"values\":[]}", None).name)
+}
+
+#[test]
+fn invalid_environment_json_is_refused_by_name() {
+    val why = switch import_environment("{nope", None) {
+        Ok(_) { "no refusal" }
+        Err(message) { message }
+    }
+    test.assert_contains(why, "failed to parse")
+}

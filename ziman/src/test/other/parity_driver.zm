@@ -11,6 +11,8 @@ use core/collection.duplicate_request
 use core/collection.remove_folder
 use core/collection.remove_request
 use core/collection.rename_or_move_request
+use core/import/curl.import_curl
+use core/import/postman.import_collection
 use core/saved.Collection
 use core/saved.SavedRequest
 use core/saved.collection_from_json
@@ -81,6 +83,14 @@ fn main() {
             Ok(c) { print(json.format(collection_to_json(c), 2)) }
             Err(why) { os.fatal(concat("decode failed: ", why)) }
         }
+        return
+    }
+    if case == "import-postman" {
+        import_postman_file(env_or("CURLY_FILE", ""), env_or("CURLY_NAME", "imported"))
+        return
+    }
+    if case == "import-curl" {
+        import_curl_command(env_or("CURLY_COMMAND", ""), env_or("CURLY_NAME", "imported"), env_or("CURLY_PATH", "req"))
         return
     }
     if case == "show-scenario" {
@@ -190,4 +200,39 @@ fn show_scenario(path: string) {
         print(prelude.format("  {} -> {}", alias, get_or(s.imports, alias, "")))
     }
     print(prelude.format("  {} top-level step(s)", str(len(s.requests.items))))
+}
+
+// **The name is overridden, because `curly collections import postman <COLLECTION> <PATH>` does**:
+// its first argument wins over the file's own `info.name`, so comparing the two outputs means doing
+// the same here.
+fn import_postman_file(path: string, name: string) {
+    val text = switch fs.read_text(path) {
+        Ok(t) { t }
+        Err(_) {
+            os.fatal(concat("cannot read ", path))
+            return
+        }
+    }
+    switch import_collection(text) {
+        Ok(c) { print(json.format(collection_to_json(with c { name: name }), 2)) }
+        Err(why) { os.fatal(concat("import failed: ", why)) }
+    }
+}
+
+// The Rust CLI stores an imported curl command into a collection at a request path, so this builds
+// the same one-request collection rather than printing a bare request -- otherwise there would be
+// nothing comparable on the other side.
+fn import_curl_command(command: string, collection_name: string, request_path: string) {
+    val request = switch import_curl(request_path, command) {
+        Ok(r) { r }
+        Err(why) {
+            os.fatal(concat("import failed: ", why))
+            return
+        }
+    }
+    val empty = Collection { id: uuid_new(), name: collection_name, folders: [], requests: [] }
+    switch add_request(empty, request_path, request) {
+        Ok(c) { print(json.format(collection_to_json(c), 2)) }
+        Err(why) { os.fatal(concat("add failed: ", why)) }
+    }
 }

@@ -155,6 +155,94 @@ else
   [ "$scen_bad" -gt 2 ] && bad "$scen_bad of $scen_total scenarios differ (first two shown)"
 fi
 
+# ---- the importers ------------------------------------------------------------------------------
+#
+# The same Postman export and the same curl command through both implementations, then a diff with
+# ids normalised. These are the two places where an input nobody controls meets a parser written
+# twice, so agreeing on a real-shaped fixture is worth more than either side's own unit tests.
+
+imp_dir="$work/import"
+mkdir -p "$imp_dir"
+cat > "$work/postman.json" <<'JSON'
+{
+  "info": { "name": "Exported" },
+  "item": [
+    { "name": "ping", "request": { "method": "GET", "url": "https://example.com/ping" } },
+    {
+      "name": "Auth",
+      "item": [
+        {
+          "name": "login",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Off", "value": "no", "disabled": true }
+            ],
+            "body": { "mode": "raw", "raw": "{\"email\":\"a@b.c\"}" },
+            "auth": { "type": "bearer", "bearer": [{ "key": "token", "value": "{{TOKEN}}" }] },
+            "url": { "raw": "{{BASE}}/login" }
+          }
+        },
+        {
+          "name": "upload",
+          "request": {
+            "method": "POST",
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                { "key": "caption", "value": "hi" },
+                { "key": "file", "type": "file", "src": "/tmp/x.png" }
+              ]
+            },
+            "url": "https://example.com/upload"
+          }
+        }
+      ]
+    }
+  ]
+}
+JSON
+
+normalise() { sed -E 's/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/<id>/g' "$1"; }
+
+if "$RUST" collections import postman Imported "$work/postman.json" --data-dir "$imp_dir" >/dev/null 2>&1 \
+   && [ -f "$imp_dir/collections/imported.json" ]; then
+  CURLY_CASE=import-postman CURLY_FILE="$work/postman.json" CURLY_NAME=Imported zim env \
+    > "$work/pm.ziman.raw" 2>"$work/pm.err"
+  printf '%s' "$(cat "$work/pm.ziman.raw")" > "$work/pm.ziman"
+  normalise "$imp_dir/collections/imported.json" > "$work/pm.rust.norm"
+  normalise "$work/pm.ziman" > "$work/pm.ziman.norm"
+  if diff -q "$work/pm.rust.norm" "$work/pm.ziman.norm" >/dev/null; then
+    ok "a Postman export imports identically (folders, headers, bodies, auth)"
+  else
+    bad "Postman import differs" "$(diff "$work/pm.rust.norm" "$work/pm.ziman.norm" | head -8 | tr '\n' ' ')"
+  fi
+else
+  bad "the rust side could not import the Postman fixture" "$(head -2 "$work/pm.err" 2>/dev/null | tr '\n' ' ')"
+fi
+
+# A command in the shape a browser's "Copy as cURL" produces: single-quoted URL, repeated -H, and a
+# JSON body with quotes inside.
+CURL_COMMAND="curl 'https://example.com/api/login' -H 'Content-Type: application/json' -H 'Accept: application/json' --data-raw '{\"email\":\"a@example.com\",\"password\":\"hunter2\"}'"
+curl_dir="$work/import-curl"
+mkdir -p "$curl_dir"
+if "$RUST" collections import curl Curled Auth/login "$CURL_COMMAND" --data-dir "$curl_dir" >/dev/null 2>&1 \
+   && [ -f "$curl_dir/collections/curled.json" ]; then
+  CURLY_CASE=import-curl CURLY_COMMAND="$CURL_COMMAND" CURLY_NAME=Curled CURLY_PATH=Auth/login zim env \
+    > "$work/cl.ziman.raw" 2>"$work/cl.err"
+  printf '%s' "$(cat "$work/cl.ziman.raw")" > "$work/cl.ziman"
+  normalise "$curl_dir/collections/curled.json" > "$work/cl.rust.norm"
+  normalise "$work/cl.ziman" > "$work/cl.ziman.norm"
+  if diff -q "$work/cl.rust.norm" "$work/cl.ziman.norm" >/dev/null; then
+    ok "a \"Copy as cURL\" command imports identically"
+  else
+    bad "curl import differs" "$(diff "$work/cl.rust.norm" "$work/cl.ziman.norm" | head -8 | tr '\n' ' ')"
+  fi
+else
+  bad "the rust side could not import the curl command" "$(head -2 "$work/cl.err" 2>/dev/null | tr '\n' ' ')"
+fi
+
 # ---- the slug -----------------------------------------------------------------------------------
 #
 # Both sides turn a display name into the same filename, or `load` misses what `save` wrote.

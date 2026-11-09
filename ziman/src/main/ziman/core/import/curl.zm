@@ -1,0 +1,321 @@
+// Importing a curl command as a saved request.
+//
+// **A hand-rolled tokenizer and flag parser for the common subset**, matching the scope Rust's own
+// module sets: full curl flag coverage is explicitly out, and what is in is what a command
+// copy-pasted from documentation, a script, or a browser's "Copy as cURL" actually contains --
+// `-X`, `-H`, `-d`/`--data*`, `-u`, `-F`, `--url`.
+//
+// The tokenizer is a practical subset of POSIX shell word splitting, not a shell grammar: single
+// quotes are literal, double quotes honour four escapes, an unquoted backslash escapes one
+// character, and a trailing backslash joins lines first -- which is what a multi-line command
+// pasted in looks like.
+use core/model.BasicAuth
+use core/model.Pair
+use core/saved.KvPair
+use core/saved.NamedPath
+use core/saved.SavedAuth
+use core/saved.SavedBody
+use core/saved.SavedMultipartField
+use core/saved.SavedRequest
+use core/saved.kv_pair_of
+use uuid.uuid_new
+
+// Splits a command into shell-ish words.
+pub fn tokenize(input: string) -> [string] {
+    // Line continuations first, so a pasted multi-line command is one command.
+    val joined = replace(replace(input, "\\\r\n", " "), "\\\n", " ")
+    val tokens = mutable_array_new<string>()
+    val current = mutable_string_new()
+    var in_token = false
+    var i = 0
+    while i < len(joined) {
+        val c = substring(joined, i, i + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" {
+            if in_token {
+                push(tokens, snapshot(current))
+                clear(current)
+                in_token = false
+            }
+            i = i + 1
+            continue
+        }
+        if c == "'" {
+            // **Single quotes are literal**: no escapes at all, which is why a JSON body is usually
+            // pasted inside them.
+            in_token = true
+            i = i + 1
+            while i < len(joined) && substring(joined, i, i + 1) != "'" {
+                append(current, substring(joined, i, i + 1))
+                i = i + 1
+            }
+            // Step over the closing quote, or past the end if it was never closed.
+            i = i + 1
+            continue
+        }
+        if c == "\"" {
+            in_token = true
+            i = i + 1
+            while i < len(joined) {
+                val c2 = substring(joined, i, i + 1)
+                if c2 == "\"" {
+                    i = i + 1
+                    break
+                }
+                if c2 == "\\" && i + 1 < len(joined) {
+                    val next = substring(joined, i + 1, i + 2)
+                    // Only these four are escapes inside double quotes; a backslash before
+                    // anything else is a literal backslash, as the shell has it.
+                    if next == "\"" || next == "\\" || next == "$" || next == "`" {
+                        append(current, next)
+                        i = i + 2
+                        continue
+                    }
+                    append(current, c2)
+                    i = i + 1
+                    continue
+                }
+                append(current, c2)
+                i = i + 1
+            }
+            continue
+        }
+        if c == "\\" {
+            in_token = true
+            if i + 1 < len(joined) {
+                append(current, substring(joined, i + 1, i + 2))
+                i = i + 2
+                continue
+            }
+            i = i + 1
+            continue
+        }
+        in_token = true
+        append(current, c)
+        i = i + 1
+    }
+    if in_token {
+        push(tokens, snapshot(current))
+    }
+    return snapshot(tokens)
+}
+
+// `-d` and its relatives take an optional leading `@`, meaning "read this file".
+fn data_value_to_body(raw: string) -> SavedBody {
+    if starts_with(raw, "@") {
+        return SavedBody.Binary(substring(raw, 1, len(raw)))
+    }
+    return SavedBody.Raw(raw)
+}
+
+fn parse_form_field(raw: string) -> Result<SavedMultipartField, string> {
+    val at = index_of(raw, "=", 0)
+    if at < 0 {
+        return err(concat("invalid -F/--form value (expected \"name=value\"): ", raw))
+    }
+    val name = substring(raw, 0, at)
+    val value = substring(raw, at + 1, len(raw))
+    if starts_with(value, "@") {
+        return ok(SavedMultipartField.File(NamedPath {
+            name: name,
+            path: substring(value, 1, len(value))
+        }))
+    }
+    return ok(SavedMultipartField.Text(Pair { name: name, value: value }))
+}
+
+// Flags recognised as taking no argument, so a bare token after one is not mistaken for its value
+// or for the URL.
+fn takes_no_argument(flag: string) -> bool {
+    return contains([
+        "-s", "--silent",
+        "-v", "--verbose",
+        "-i", "--include",
+        "-k", "--insecure",
+        "-L", "--location",
+        "-G", "--get",
+        "--compressed"
+    ], flag)
+}
+
+// What the flag loop collected, before it becomes a request.
+struct Parsed {
+    method: Option<string>
+    headers: [KvPair]
+    data: Option<string>
+    form: [string]
+    user: Option<string>
+    explicit_url: Option<string>
+    candidates: [string]
+}
+
+pub fn import_curl(name: string, command: string) -> Result<SavedRequest, string> {
+    val all = tokenize(command)
+    // A command pasted with its leading `curl` is the normal case.
+    val tokens = if len(all) > 0 && all[0] == "curl" { slice(all, 1, len(all)) } else { all }
+    val parsed = try parse_tokens(tokens)
+
+    val url = try chosen_url(parsed)
+
+    // **One body source only.** `-d` and `-F` mean different content types and different encodings;
+    // taking the last one silently would send something the command did not ask for.
+    if is_Some(parsed.data) && len(parsed.form) != 0 {
+        return err("only one of -d/--data* or -F/--form may be used per curl command")
+    }
+    val body = switch parsed.data {
+        Some(raw) { Option<SavedBody>.Some(data_value_to_body(raw)) }
+        None {
+            if len(parsed.form) == 0 {
+                Option<SavedBody>.None
+            } else {
+                val fields = mutable_array_new<SavedMultipartField>()
+                for raw in parsed.form {
+                    push(fields, try parse_form_field(raw))
+                }
+                Option<SavedBody>.Some(SavedBody.Multipart(snapshot(fields)))
+            }
+        }
+    }
+
+    // **A body with no `-X` means POST**, which is curl's own behaviour and the thing people most
+    // often leave off.
+    val method = switch parsed.method {
+        Some(m) { to_upper(m) }
+        None { if is_Some(body) { "POST" } else { "GET" } }
+    }
+
+    val auth = switch parsed.user {
+        Some(pair) {
+            val at = index_of(pair, ":", 0)
+            if at < 0 {
+                return err(concat("invalid -u/--user value (expected \"user:password\"): ", pair))
+            }
+            Option<SavedAuth>.Some(SavedAuth.Basic(BasicAuth {
+                username: substring(pair, 0, at),
+                password: substring(pair, at + 1, len(pair))
+            }))
+        }
+        None { Option<SavedAuth>.None }
+    }
+
+    return ok(SavedRequest {
+        id: uuid_new(),
+        name: name,
+        method: method,
+        url: url,
+        query_params: [],
+        headers: parsed.headers,
+        body: body,
+        auth: auth,
+        extract: []
+    })
+}
+
+fn parse_tokens(tokens: [string]) -> Result<Parsed, string> {
+    var method = Option<string>.None
+    val headers = mutable_array_new<KvPair>()
+    var data = Option<string>.None
+    val form = mutable_array_new<string>()
+    var user = Option<string>.None
+    var explicit_url = Option<string>.None
+    val candidates = mutable_array_new<string>()
+
+    var i = 0
+    while i < len(tokens) {
+        val token = tokens[i]
+        if token == "-X" || token == "--request" {
+            if i + 1 < len(tokens) {
+                method = Option<string>.Some(tokens[i + 1])
+            }
+            i = i + 2
+            continue
+        }
+        if token == "-H" || token == "--header" {
+            if i + 1 < len(tokens) {
+                val raw = tokens[i + 1]
+                val at = index_of(raw, ":", 0)
+                if at < 0 {
+                    return err(concat("invalid -H/--header value (expected \"Name: value\"): ", raw))
+                }
+                push(headers, kv_pair_of(
+                    trim(substring(raw, 0, at)),
+                    trim(substring(raw, at + 1, len(raw)))
+                ))
+            }
+            i = i + 2
+            continue
+        }
+        if token == "-d" || token == "--data" || token == "--data-raw" || token == "--data-binary" || token == "--data-ascii" {
+            if i + 1 < len(tokens) {
+                data = Option<string>.Some(tokens[i + 1])
+            }
+            i = i + 2
+            continue
+        }
+        if token == "-F" || token == "--form" {
+            if i + 1 < len(tokens) {
+                push(form, tokens[i + 1])
+            }
+            i = i + 2
+            continue
+        }
+        if token == "-u" || token == "--user" {
+            if i + 1 < len(tokens) {
+                user = Option<string>.Some(tokens[i + 1])
+            }
+            i = i + 2
+            continue
+        }
+        if token == "--url" {
+            if i + 1 < len(tokens) {
+                explicit_url = Option<string>.Some(tokens[i + 1])
+            }
+            i = i + 2
+            continue
+        }
+        if takes_no_argument(token) {
+            i = i + 1
+            continue
+        }
+        if starts_with(token, "-") {
+            // **An unrecognised flag is skipped best-effort**, along with its value when the next
+            // token does not itself look like a flag -- otherwise that value would be read as the
+            // URL, which is the one thing a wrong guess here must not do.
+            if i + 1 < len(tokens) && !starts_with(tokens[i + 1], "-") {
+                i = i + 2
+            } else {
+                i = i + 1
+            }
+            continue
+        }
+        push(candidates, token)
+        i = i + 1
+    }
+    return ok(Parsed {
+        method: method,
+        headers: snapshot(headers),
+        data: data,
+        form: snapshot(form),
+        user: user,
+        explicit_url: explicit_url,
+        candidates: snapshot(candidates)
+    })
+}
+
+// `--url` wins; otherwise the first bare token that looks like a URL; otherwise the **last** bare
+// token, which is where curl commands conventionally put it.
+//
+// `{{` counts as looking like a URL, so a command whose host is a curly variable still imports.
+fn chosen_url(parsed: Parsed) -> Result<string, string> {
+    if Some(explicit) = parsed.explicit_url {
+        return ok(explicit)
+    }
+    for candidate in parsed.candidates {
+        if starts_with(candidate, "http://") || starts_with(candidate, "https://") || starts_with(candidate, "{{") {
+            return ok(candidate)
+        }
+    }
+    if len(parsed.candidates) != 0 {
+        return ok(parsed.candidates[len(parsed.candidates) - 1])
+    }
+    return err("no URL found in curl command")
+}

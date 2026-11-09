@@ -1,0 +1,255 @@
+// `core/import/curl`, held to the cases in `crates/curly-core/tests/import_curl_test.rs`.
+//
+// The ones that matter are the quoting cases and the URL hunt. A browser's "Copy as cURL" puts the
+// URL in single quotes, repeats `-H`, and passes a JSON body with escaped quotes -- and an
+// unrecognised flag's *value* must never be mistaken for the URL, which is the one wrong guess that
+// sends a request somewhere nobody asked for.
+use core/import/curl.import_curl
+use core/import/curl.tokenize
+use core/saved.SavedAuth
+use core/saved.SavedBody
+use core/saved.SavedMultipartField
+use core/saved.SavedRequest
+use test
+
+fn imported(command: string) -> SavedRequest {
+    val out = import_curl("x", command)
+    if Err(why) = out {
+        test.fail(concat("import refused: ", why))
+    }
+    return unwrap(out)
+}
+
+fn refusal(command: string) -> string {
+    return switch import_curl("x", command) {
+        Ok(_) { "no refusal" }
+        Err(why) { why }
+    }
+}
+
+fn raw_body(r: SavedRequest) -> string {
+    return switch r.body {
+        Some(b) {
+            switch b {
+                Raw(content) { content }
+                Binary(path) { concat("(binary ", path, ")") }
+                Form(_) { "(form)" }
+                Multipart(_) { "(multipart)" }
+            }
+        }
+        None { "(no body)" }
+    }
+}
+
+fn parts(r: SavedRequest) -> [SavedMultipartField] {
+    return switch r.body {
+        Some(b) {
+            switch b {
+                Multipart(fields) { fields }
+                Raw(_) { [] }
+                Binary(_) { [] }
+                Form(_) { [] }
+            }
+        }
+        None { [] }
+    }
+}
+
+fn part_name(f: SavedMultipartField) -> string {
+    return switch f {
+        Text(p) { p.name }
+        File(np) { np.name }
+    }
+}
+
+fn part_value(f: SavedMultipartField) -> string {
+    return switch f {
+        Text(p) { p.value }
+        File(np) { concat("@", np.path) }
+    }
+}
+
+fn basic_of(r: SavedRequest) -> string {
+    return switch r.auth {
+        Some(a) {
+            switch a {
+                Basic(b) { concat(b.username, ":", b.password) }
+                Bearer(t) { concat("bearer ", t) }
+            }
+        }
+        None { "(no auth)" }
+    }
+}
+
+// ---------------------------------------------------------------- the tokenizer
+
+#[test]
+fn the_tokenizer_splits_on_whitespace_and_honours_quotes() {
+    test.assert_eq(["curl", "https://x"], tokenize("curl   https://x"))
+    // Single quotes are literal, so nothing inside is an escape.
+    test.assert_eq(["a b\\c"], tokenize("'a b\\c'"))
+    // Double quotes honour exactly four escapes.
+    test.assert_eq(["a\"b"], tokenize("\"a\\\"b\""))
+    test.assert_eq(["a\\b"], tokenize("\"a\\\\b\""))
+    test.assert_eq(["a$b"], tokenize("\"a\\$b\""))
+    // A backslash before anything else inside double quotes is a literal backslash.
+    test.assert_eq(["a\\nb"], tokenize("\"a\\nb\""))
+    // An unquoted backslash escapes one character.
+    test.assert_eq(["a b"], tokenize("a\\ b"))
+}
+
+#[test]
+fn the_tokenizer_joins_a_line_continuation_first() {
+    // Which is what a multi-line command pasted from documentation looks like.
+    test.assert_eq(["curl", "-H", "A: b", "https://x"], tokenize("curl \\\n  -H 'A: b' \\\n  https://x"))
+}
+
+#[test]
+fn an_unclosed_quote_takes_the_rest_of_the_input() {
+    // Rather than looping or dropping it: a truncated paste should still import something.
+    test.assert_eq(["abc"], tokenize("'abc"))
+}
+
+// ---------------------------------------------------------------- whole commands
+
+#[test]
+fn a_simple_get_imports() {
+    val r = imported("curl https://example.com/users")
+    test.assert_eq("GET", r.method)
+    test.assert_eq("https://example.com/users", r.url)
+    test.assert_eq(true, is_None(r.body))
+}
+
+#[test]
+fn the_leading_curl_word_is_optional() {
+    test.assert_eq("https://example.com", imported("https://example.com").url)
+}
+
+#[test]
+fn an_explicit_method_is_honoured_and_upper_cased() {
+    test.assert_eq("DELETE", imported("curl -X delete https://example.com/1").method)
+    test.assert_eq("PUT", imported("curl --request PUT https://example.com/1").method)
+}
+
+#[test]
+fn a_data_flag_defaults_the_method_to_post() {
+    // curl's own behaviour, and the thing most often left off a pasted command.
+    test.assert_eq("POST", imported("curl -d 'a=1' https://example.com").method)
+    // An explicit method still wins.
+    test.assert_eq("PATCH", imported("curl -X PATCH -d 'a=1' https://example.com").method)
+}
+
+#[test]
+fn a_browser_copy_as_curl_imports_whole() {
+    val command = concat(
+        "curl 'https://example.com/api/login' \\\n",
+        "  -H 'Content-Type: application/json' \\\n",
+        "  -H 'Accept: application/json' \\\n",
+        "  --data-raw '{\"email\":\"a@example.com\",\"password\":\"hunter2\"}'"
+    )
+    val r = imported(command)
+    test.assert_eq("https://example.com/api/login", r.url)
+    test.assert_eq("POST", r.method)
+    test.assert_len(2, r.headers)
+    test.assert_eq("Content-Type", r.headers[0].name)
+    test.assert_eq("application/json", r.headers[0].value)
+    test.assert_eq("Accept", r.headers[1].name)
+    test.assert_eq("{\"email\":\"a@example.com\",\"password\":\"hunter2\"}", raw_body(r))
+}
+
+#[test]
+fn a_double_quoted_body_with_escaped_quotes_imports() {
+    val r = imported("curl https://example.com -H \"Content-Type: application/json\" -d \"{\\\"a\\\":\\\"b\\\"}\"")
+    test.assert_eq("{\"a\":\"b\"}", raw_body(r))
+}
+
+#[test]
+fn a_header_value_is_trimmed_around_the_colon() {
+    val r = imported("curl https://x -H 'Authorization:   Bearer abc'")
+    test.assert_eq("Authorization", r.headers[0].name)
+    test.assert_eq("Bearer abc", r.headers[0].value)
+}
+
+#[test]
+fn basic_auth_imports_from_the_user_flag() {
+    test.assert_eq("ann:s3cret", basic_of(imported("curl -u ann:s3cret https://x")))
+    // A password containing a colon keeps it: the split is on the first one only.
+    test.assert_eq("ann:a:b", basic_of(imported("curl --user ann:a:b https://x")))
+}
+
+#[test]
+fn a_user_flag_with_no_colon_is_refused_and_quoted() {
+    test.assert_contains(refusal("curl -u annonly https://x"), "annonly")
+}
+
+#[test]
+fn a_header_with_no_colon_is_refused_and_quoted() {
+    test.assert_contains(refusal("curl -H 'NoColonHere' https://x"), "NoColonHere")
+}
+
+#[test]
+fn multipart_form_fields_import_as_text_and_file_parts() {
+    val r = imported("curl -F 'caption=a photo' -F 'file=@/tmp/x.png' https://x")
+    val fields = parts(r)
+    test.assert_len(2, fields)
+    test.assert_eq("caption", part_name(fields[0]))
+    test.assert_eq("a photo", part_value(fields[0]))
+    test.assert_eq("file", part_name(fields[1]))
+    test.assert_eq("@/tmp/x.png", part_value(fields[1]))
+    test.assert_eq("POST", r.method)
+}
+
+#[test]
+fn a_form_field_with_no_equals_is_refused_and_quoted() {
+    test.assert_contains(refusal("curl -F 'nothing' https://x"), "nothing")
+}
+
+#[test]
+fn data_with_an_at_prefix_is_a_file_reference_not_a_body() {
+    test.assert_eq("(binary /tmp/payload.json)", raw_body(imported("curl --data-binary @/tmp/payload.json https://x")))
+}
+
+#[test]
+fn giving_both_data_and_form_is_refused() {
+    // They mean different content types and encodings; taking the last silently would send
+    // something the command did not ask for.
+    test.assert_contains(refusal("curl -d 'a=1' -F 'b=2' https://x"), "only one of")
+}
+
+// ---------------------------------------------------------------- finding the URL
+
+#[test]
+fn the_explicit_url_flag_wins_over_a_bare_token() {
+    test.assert_eq("https://chosen", imported("curl https://bare --url https://chosen").url)
+}
+
+#[test]
+fn an_unknown_flags_value_is_not_mistaken_for_the_url() {
+    // **The one wrong guess that must not happen**: reading `5` as the URL would send a request
+    // nowhere, or worse, somewhere.
+    test.assert_eq(
+        "https://example.com/real-url",
+        imported("curl --connect-timeout 5 https://example.com/real-url").url
+    )
+}
+
+#[test]
+fn a_no_argument_flag_does_not_swallow_the_url() {
+    test.assert_eq("https://example.com", imported("curl -s -v -L https://example.com").url)
+}
+
+#[test]
+fn a_url_that_is_a_curly_variable_is_recognised() {
+    // So a command pasted from curly's own docs imports.
+    test.assert_eq("{{BASE_URL}}/users", imported("curl -X GET {{BASE_URL}}/users").url)
+}
+
+#[test]
+fn with_no_url_like_token_the_last_bare_one_is_used() {
+    test.assert_eq("example.com", imported("curl example.com").url)
+}
+
+#[test]
+fn a_command_with_no_bare_token_at_all_is_refused() {
+    test.assert_contains(refusal("curl -X POST"), "no URL")
+}

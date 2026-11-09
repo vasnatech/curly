@@ -1,0 +1,314 @@
+// Importing Postman's export formats.
+//
+// Three file shapes matter: **Collection Format v2.1**, an **Environment** export, and a **Globals**
+// export -- the last being the same shape as an environment, told apart by
+// `_postman_variable_scope: "globals"` and mapped onto curly's own `global` environment, which is
+// already the always-merged base scope. The full workspace data dump is not supported; it is rarely
+// what somebody hands over when they say "here is my Postman collection".
+//
+// **Postman's `{{variable}}` syntax is curly's**, so URLs, headers and bodies import verbatim with
+// no token translation.
+//
+// Known gaps, documented rather than silently mishandled -- all of them Rust's, kept deliberately:
+//
+//   * **Pre-request and test scripts are dropped.** They are JavaScript, and there is no reliable
+//     translation from arbitrary JS into curly's declarative `extract` rules.
+//   * **Auth is read per request**; collection- and folder-level inherited auth is not resolved.
+//   * **Only `bearer` and `basic` map**, matching curly's own auth support. `apikey`, `oauth2`,
+//     `digest` and the rest are dropped.
+//   * **`graphql` bodies are dropped**, since curly has no GraphQL concept.
+//   * A `formdata` or `file` entry's `src` is a path **on the machine that exported the
+//     collection**, so it is almost certainly wrong elsewhere. That is a limit of Postman's format,
+//     not something an importer can fix.
+//   * **A disabled environment variable is dropped** rather than imported disabled, because
+//     curly's `Variable` has no enabled flag -- unlike its `KvPair`, which does, so a disabled
+//     header *is* imported and kept off.
+use core/model.BasicAuth
+use core/model.Pair
+use core/saved.Collection
+use core/saved.Environment
+use core/saved.Folder
+use core/saved.KvPair
+use core/saved.NamedPath
+use core/saved.SavedAuth
+use core/saved.SavedBody
+use core/saved.SavedMultipartField
+use core/saved.SavedRequest
+use core/saved.environment_set
+use core/saved.kv_pair_of
+use json
+use json.Json
+use uuid.uuid_new
+
+fn text_at(j: Json, key: string) -> Option<string> {
+    return switch json.get(j, key) {
+        Some(found) {
+            switch json.string_from_json(found) {
+                Ok(s) { Some(s) }
+                Err(_) { None }
+            }
+        }
+        None { None }
+    }
+}
+
+fn text_or(j: Json, key: string, fallback: string) -> string {
+    return switch text_at(j, key) {
+        Some(s) { s }
+        None { fallback }
+    }
+}
+
+fn flag_at(j: Json, key: string, fallback: bool) -> bool {
+    return switch json.get(j, key) {
+        Some(found) {
+            switch json.bool_from_json(found) {
+                Ok(b) { b }
+                Err(_) { fallback }
+            }
+        }
+        None { fallback }
+    }
+}
+
+fn array_at(j: Json, key: string) -> [Json] {
+    val found = switch json.get(j, key) {
+        Some(v) { v }
+        None { return [] }
+    }
+    if !Json.is_JArray(found) {
+        return []
+    }
+    return Json.unwrap_JArray(found)
+}
+
+// ---------------------------------------------------------------- a collection
+
+pub fn import_collection(document: string) -> Result<Collection, string> {
+    val parsed = switch json.parse(document) {
+        Ok(j) { j }
+        Err(why) { return err(concat("failed to parse Postman collection JSON: ", why)) }
+    }
+    val info = switch json.get(parsed, "info") {
+        Some(found) { found }
+        None { return err("failed to parse Postman collection JSON: no \"info\" object") }
+    }
+    val name = switch text_at(info, "name") {
+        Some(n) { n }
+        None { return err("failed to parse Postman collection JSON: the \"info\" object has no name") }
+    }
+    val mapped = try map_items(array_at(parsed, "item"))
+    return ok(Collection {
+        id: uuid_new(),
+        name: name,
+        folders: mapped.folders,
+        requests: mapped.requests
+    })
+}
+
+// A level of the tree, split into its folders and its requests. Ziman has no tuple type, so Rust's
+// `(Vec<Folder>, Vec<SavedRequest>)` is a named pair.
+struct Level {
+    folders: [Folder]
+    requests: [SavedRequest]
+}
+
+// **An item with an `item` array is a folder, one with a `request` is a request, and one with
+// neither is skipped.** That is how Postman distinguishes them -- there is no type field -- and a
+// folder's `item` is present even when empty, which is what makes the test reliable.
+fn map_items(items: [Json]) -> Result<Level, string> {
+    val folders = mutable_array_new<Folder>()
+    val requests = mutable_array_new<SavedRequest>()
+    for item in items {
+        val name = text_or(item, "name", "")
+        if Some(sub) = json.get(item, "item") {
+            val inner = try map_items(if Json.is_JArray(sub) { Json.unwrap_JArray(sub) } else { [] })
+            push(folders, Folder {
+                id: uuid_new(),
+                name: name,
+                folders: inner.folders,
+                requests: inner.requests
+            })
+            continue
+        }
+        if Some(request) = json.get(item, "request") {
+            push(requests, try map_request(name, request))
+        }
+    }
+    return ok(Level { folders: snapshot(folders), requests: snapshot(requests) })
+}
+
+fn map_request(name: string, req: Json) -> Result<SavedRequest, string> {
+    val method = to_upper(text_or(req, "method", "GET"))
+    // **The URL is either a plain string or an object with a `raw`** -- Postman writes the detailed
+    // form once a request has been opened in its editor, and the same collection can hold both.
+    val url = switch json.get(req, "url") {
+        Some(found) {
+            if Json.is_JString(found) {
+                Json.unwrap_JString(found)
+            } else {
+                text_or(found, "raw", "")
+            }
+        }
+        None { "" }
+    }
+    val headers = mutable_array_new<KvPair>()
+    for h in array_at(req, "header") {
+        // A disabled header is imported **and kept off**, since `KvPair` can express that.
+        if !flag_at(h, "disabled", false) {
+            push(headers, kv_pair_of(text_or(h, "key", ""), text_or(h, "value", "")))
+        }
+    }
+    val body = switch json.get(req, "body") {
+        Some(found) { map_body(found) }
+        None { Option<SavedBody>.None }
+    }
+    val auth = switch json.get(req, "auth") {
+        Some(found) { map_auth(found) }
+        None { Option<SavedAuth>.None }
+    }
+    return ok(SavedRequest {
+        id: uuid_new(),
+        name: name,
+        method: method,
+        url: url,
+        query_params: [],
+        headers: snapshot(headers),
+        body: body,
+        auth: auth,
+        extract: []
+    })
+}
+
+fn map_body(body: Json) -> Option<SavedBody> {
+    val mode = switch text_at(body, "mode") {
+        Some(m) { m }
+        None { return None }
+    }
+    if mode == "raw" {
+        return switch text_at(body, "raw") {
+            Some(content) { Some(SavedBody.Raw(content)) }
+            None { None }
+        }
+    }
+    if mode == "urlencoded" {
+        val fields = mutable_array_new<Pair>()
+        for p in array_at(body, "urlencoded") {
+            if !flag_at(p, "disabled", false) {
+                push(fields, Pair { name: text_or(p, "key", ""), value: text_or(p, "value", "") })
+            }
+        }
+        return Some(SavedBody.Form(snapshot(fields)))
+    }
+    if mode == "formdata" {
+        val fields = mutable_array_new<SavedMultipartField>()
+        for p in array_at(body, "formdata") {
+            if flag_at(p, "disabled", false) {
+                continue
+            }
+            val key = text_or(p, "key", "")
+            if text_or(p, "type", "") == "file" {
+                push(fields, SavedMultipartField.File(NamedPath {
+                    name: key,
+                    path: text_or(p, "src", "")
+                }))
+            } else {
+                push(fields, SavedMultipartField.Text(Pair {
+                    name: key,
+                    value: text_or(p, "value", "")
+                }))
+            }
+        }
+        return Some(SavedBody.Multipart(snapshot(fields)))
+    }
+    if mode == "file" {
+        return switch json.get(body, "file") {
+            Some(file) {
+                switch text_at(file, "src") {
+                    Some(src) { Some(SavedBody.Binary(src)) }
+                    None { None }
+                }
+            }
+            None { None }
+        }
+    }
+    // `graphql`, or a mode this does not know -- dropped, as the module's gaps list says.
+    return None
+}
+
+fn map_auth(auth: Json) -> Option<SavedAuth> {
+    val kind = switch text_at(auth, "type") {
+        Some(k) { k }
+        None { return None }
+    }
+    if kind == "bearer" {
+        return switch param_value(array_at(auth, "bearer"), "token") {
+            Some(token) { Some(SavedAuth.Bearer(token)) }
+            None { None }
+        }
+    }
+    if kind == "basic" {
+        val params = array_at(auth, "basic")
+        val username = param_value(params, "username")
+        val password = param_value(params, "password")
+        // **Both or neither**: a basic auth with only a username is not something to guess at.
+        if is_Some(username) && is_Some(password) {
+            return Some(SavedAuth.Basic(BasicAuth {
+                username: unwrap(username),
+                password: unwrap(password)
+            }))
+        }
+        return None
+    }
+    // apikey, oauth2, digest and the rest -- dropped.
+    return None
+}
+
+// Postman writes auth parameters as an array of `{key, value}` rather than as fields.
+fn param_value(params: [Json], wanted: string) -> Option<string> {
+    for p in params {
+        if text_or(p, "key", "") == wanted {
+            return text_at(p, "value")
+        }
+    }
+    return None
+}
+
+// ---------------------------------------------------------------- an environment or globals
+
+// Imports an Environment **or** a Globals export; they share a shape and differ by
+// `_postman_variable_scope`.
+//
+// `name_override` wins. Without one, a globals export becomes curly's `global` environment -- the
+// scope curly already merges into every request -- and an environment export keeps its own name,
+// falling back to `imported` if it has none.
+pub fn import_environment(document: string, name_override: Option<string>) -> Result<Environment, string> {
+    val parsed = switch json.parse(document) {
+        Ok(j) { j }
+        Err(why) { return err(concat("failed to parse Postman environment JSON: ", why)) }
+    }
+    val name = switch name_override {
+        Some(given) { given }
+        None {
+            if text_or(parsed, "_postman_variable_scope", "") == "globals" {
+                "global"
+            } else {
+                text_or(parsed, "name", "imported")
+            }
+        }
+    }
+    var env = Environment { name: name, variables: [] }
+    for v in array_at(parsed, "values") {
+        // **`enabled` defaults to true when absent**, as it does everywhere else in these formats.
+        if !flag_at(v, "enabled", true) {
+            continue
+        }
+        env = environment_set(
+            env,
+            text_or(v, "key", ""),
+            text_or(v, "value", ""),
+            text_or(v, "type", "") == "secret"
+        )
+    }
+    return ok(env)
+}

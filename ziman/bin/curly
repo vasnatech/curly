@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# `curly`, as this implementation runs it.
+#
+# The Rust implementation is a single native binary; this one is a Ziman program, so it needs the
+# interpreter and the `--` that separates the interpreter's arguments from the program's. A shebang
+# cannot do it: the kernel appends the script path *after* whatever the shebang line names, so the
+# `--` would land in the wrong place.
+#
+# Override the interpreter with ZIMAN=/path/to/ziman.
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec "${ZIMAN:-ziman}" "$here/../src/main/ziman/curly.zm" -- "$@"

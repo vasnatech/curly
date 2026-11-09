@@ -1,0 +1,47 @@
+// `curly session` -- the machine-written variable store a run's extraction rules write into.
+//
+// **Not for editing by hand**: `curly env` is for variables somebody sets, this is for what a run
+// discovered. Keeping them apart is why an extracted token never lands in a file that gets
+// committed.
+use cli/args.Parsed
+use cli/args.has_switch
+use cli/args.value_of
+use core/storage.Storage
+use core/storage.clear_all_sessions
+use core/storage.clear_session
+use core/storage.load_session
+
+pub fn run(action: string, rest: Parsed, store: Storage) -> Result<unit, string> {
+    if action == "show" {
+        val name = scope_of(rest)
+        val session = try load_session(store, name)
+        if len(session.variables) == 0 {
+            print(prelude.format("session \"{}\" is empty", name))
+            return ok(unit)
+        }
+        for v in session.variables {
+            print(prelude.format("{}={}", v.key, if v.secret { "***" } else { v.value }))
+        }
+        return ok(unit)
+    }
+    if action == "clear" {
+        if has_switch(rest, "all") {
+            try clear_all_sessions(store)
+            print("cleared all sessions")
+            return ok(unit)
+        }
+        val name = scope_of(rest)
+        try clear_session(store, name)
+        print(prelude.format("cleared session \"{}\"", name))
+        return ok(unit)
+    }
+    return err(concat("unknown session command: ", action))
+}
+
+// `--env`, defaulting to `global` -- the session a run uses when called without one.
+fn scope_of(rest: Parsed) -> string {
+    return switch value_of(rest, "env") {
+        Some(name) { name }
+        None { "global" }
+    }
+}

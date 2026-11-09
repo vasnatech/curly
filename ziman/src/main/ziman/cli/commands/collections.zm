@@ -1,0 +1,88 @@
+// `curly collections` -- the read-only half for now: list, show and delete. The subcommands that
+// build a request (`add-request`, `rename-request`, `import`, ...) follow.
+//
+// Every line is compared against the Rust CLI's output character for character by `parity.sh`.
+use cli/args.Parsed
+use cli/args.pad_right
+use core/extraction.rule_name
+use core/saved.Collection
+use core/saved.Folder
+use core/saved.SavedRequest
+use core/storage.Storage
+use core/storage.delete_collection
+use core/storage.list_collections
+use core/storage.load_collection
+
+pub fn run(action: string, rest: Parsed, store: Storage) -> Result<unit, string> {
+    if action == "list" {
+        val names = try list_collections(store)
+        if len(names) == 0 {
+            print("no collections yet — create one with: curly collections create <name>")
+            return ok(unit)
+        }
+        for name in names {
+            print(name)
+        }
+        return ok(unit)
+    }
+    if action == "show" {
+        if len(rest.positionals) == 0 {
+            return err("usage: curly collections show <name>")
+        }
+        val name = rest.positionals[0]
+        val collection = try load_collection(store, name)
+        if len(collection.folders) == 0 && len(collection.requests) == 0 {
+            print(prelude.format("collection \"{}\" has no requests yet", name))
+            return ok(unit)
+        }
+        print_tree(collection.folders, collection.requests, 0)
+        return ok(unit)
+    }
+    if action == "delete" {
+        if len(rest.positionals) == 0 {
+            return err("usage: curly collections delete <name>")
+        }
+        val name = rest.positionals[0]
+        try delete_collection(store, name)
+        print(prelude.format("deleted collection \"{}\"", name))
+        return ok(unit)
+    }
+    return err(concat("unknown collections command: ", action))
+}
+
+// **Folders first, then requests, two spaces per level** -- and a request that carries extraction
+// rules names them, because which requests feed later ones is the thing worth seeing in a tree.
+fn print_tree(folders: [Folder], requests: [SavedRequest], depth: int) {
+    val indent = indent_of(depth)
+    for folder in folders {
+        print(concat(indent, folder.name, "/"))
+        print_tree(folder.folders, folder.requests, depth + 1)
+    }
+    for r in requests {
+        if len(r.extract) == 0 {
+            print(concat(indent, pad_right(r.method, 7), " ", r.name))
+            continue
+        }
+        val names = mutable_array_new<string>()
+        for rule in r.extract {
+            push(names, rule_name(rule))
+        }
+        print(concat(
+            indent,
+            pad_right(r.method, 7),
+            " ",
+            r.name,
+            "  [extracts: ",
+            join(separator: ", ", pieces: snapshot(names)),
+            "]"
+        ))
+    }
+}
+
+fn indent_of(depth: int) -> string {
+    val out = mutable_string_new()
+    for _ in 0..depth {
+        append(out, "  ")
+    }
+    return snapshot(out)
+}

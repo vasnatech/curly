@@ -1,0 +1,48 @@
+// `curly history` -- the recorded exchanges, newest first. Recording happens where a request is
+// sent; this only reads it back.
+use cli/args.Parsed
+use cli/args.pad_right
+use cli/args.value_of
+use core/storage.Storage
+use core/storage.list_history
+
+pub fn run(rest: Parsed, store: Storage) -> Result<unit, string> {
+    val limit = switch value_of(rest, "limit") {
+        Some(text) {
+            switch parse_int(text) {
+                Ok(n) { n }
+                Err(_) { return err(concat("invalid --limit value: ", text)) }
+            }
+        }
+        None { 20 }
+    }
+    val entries = try list_history(store, limit)
+    if len(entries) == 0 {
+        print("no history yet")
+        return ok(unit)
+    }
+    for e in entries {
+        // `{} {:<6} {:<3} {} ({} ms)` in Rust, with the timestamp rendered
+        // `%Y-%m-%d %H:%M:%S UTC` -- and the stored form is RFC 3339, so this reshapes it rather
+        // than reformatting a parsed instant.
+        print(prelude.format(
+            "{}  {} {} {}  ({} ms)",
+            as_log_time(e.sent_at),
+            pad_right(e.method, 6),
+            pad_right(str(e.status), 3),
+            e.url,
+            str(e.elapsed_ms)
+        ))
+    }
+    return ok(unit)
+}
+
+// `2026-11-09T04:52:31.769Z` as `2026-11-09 04:52:31 UTC`, which is what Rust's chrono format
+// string produces. Done by reshaping the text: the stored value is RFC 3339 by construction, and
+// parsing it to an instant only to format it again would be two conversions to get back here.
+fn as_log_time(stamp: string) -> string {
+    if len(stamp) < 19 {
+        return stamp
+    }
+    return concat(substring(stamp, 0, 10), " ", substring(stamp, 11, 19), " UTC")
+}

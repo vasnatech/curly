@@ -243,6 +243,87 @@ else
   bad "the rust side could not import the curl command" "$(head -2 "$work/cl.err" 2>/dev/null | tr '\n' ' ')"
 fi
 
+# ---- the CLI's own output ------------------------------------------------------------------------
+#
+# Every read-only command, run through both binaries against the same tree, diffed line for line.
+# This is the check the whole harness was built for: once the Ziman side has a CLI, parity stops
+# being about file shapes and becomes about what a user actually sees.
+#
+# `curly` here is the Ziman wrapper (`ziman/bin/curly`); `$RUST` is the native binary.
+
+ZCLI="$ROOT/ziman/bin/curly"
+
+# Both implementations, same arguments, same tree -- output diffed line for line.
+cli_both() {
+  local label="$1"; shift
+  local rust_out zim_out
+  rust_out="$("$RUST" "$@" --data-dir "$CURLY" 2>&1)" || true
+  zim_out="$(ZIMAN="$ZIMAN" "$ZCLI" "$@" --data-dir "$CURLY" 2>&1)" || true
+  if [ "$rust_out" = "$zim_out" ]; then
+    ok "cli: $label"
+  else
+    bad "cli: $label" "$(diff <(echo "$rust_out") <(echo "$zim_out") | head -5 | tr '\n' ' ')"
+  fi
+}
+
+# A refusal, compared by its **first line only**. Both print the same `Error: <message>`; below it
+# Rust's `anyhow` appends an indented `Caused by:` paragraph carrying the underlying `io::Error`.
+# That paragraph is a presentation its error library chose and the message above it is the contract,
+# so this compares the contract and not the layout -- excluded here deliberately and visibly,
+# rather than normalised away everywhere.
+cli_refusal_both() {
+  local label="$1"; shift
+  local rust_out zim_out
+  rust_out="$("$RUST" "$@" --data-dir "$CURLY" 2>&1 | head -1)" || true
+  zim_out="$(ZIMAN="$ZIMAN" "$ZCLI" "$@" --data-dir "$CURLY" 2>&1 | head -1)" || true
+  if [ "$rust_out" = "$zim_out" ]; then
+    ok "cli: $label"
+  else
+    bad "cli: $label" "rust=[$rust_out] ziman=[$zim_out]"
+  fi
+}
+
+if [ -x "$ZCLI" ]; then
+  cli_both "collections list" collections list
+  cli_both "collections show" collections show health-record-ziman-api
+  cli_both "env list" env list
+  cli_both "env show global" env show global
+  cli_both "scenario list" scenario list
+  cli_both "session show (empty)" session show
+  cli_both "history (empty)" history
+  # The refusals matter as much as the successes: a command that fails differently is a command a
+  # script cannot rely on.
+  cli_refusal_both "collections show, missing" collections show no-such-collection
+  cli_refusal_both "env show, missing" env show no-such-env
+  cli_refusal_both "scenario show, missing" scenario show no-such-scenario
+  cli_refusal_both "env unset, no such variable" env unset global NO_SUCH_KEY
+
+  # Round-tripping through the writing commands, then reading back with the *other* binary --
+  # which is the real test of "these two share a storage root".
+  wdir="$work/cli-writes"
+  mkdir -p "$wdir"
+  "$RUST" env set shared KEY=from-rust --data-dir "$wdir" >/dev/null 2>&1
+  ZIMAN="$ZIMAN" "$ZCLI" env set shared OTHER=from-ziman --data-dir "$wdir" >/dev/null 2>&1
+  rust_sees="$("$RUST" env show shared --data-dir "$wdir" 2>&1)"
+  zim_sees="$(ZIMAN="$ZIMAN" "$ZCLI" env show shared --data-dir "$wdir" 2>&1)"
+  if [ "$rust_sees" = "$zim_sees" ] && echo "$rust_sees" | grep -q from-ziman \
+     && echo "$zim_sees" | grep -q from-rust; then
+    ok "cli: each binary reads what the other wrote"
+  else
+    bad "cli: cross-written environment differs" "rust=[$rust_sees] ziman=[$zim_sees]"
+  fi
+
+  # A secret set by one is masked by the other.
+  ZIMAN="$ZIMAN" "$ZCLI" env set shared TOKEN=s3cret --secret --data-dir "$wdir" >/dev/null 2>&1
+  if "$RUST" env show shared --data-dir "$wdir" 2>&1 | grep -q 'TOKEN=\*\*\*'; then
+    ok "cli: a secret set by ziman is masked by rust"
+  else
+    bad "cli: secret flag did not survive" "$("$RUST" env show shared --data-dir "$wdir" 2>&1 | tr '\n' ' ')"
+  fi
+else
+  echo "  SKIP cli checks: $ZCLI is not executable"
+fi
+
 # ---- the slug -----------------------------------------------------------------------------------
 #
 # Both sides turn a display name into the same filename, or `load` misses what `save` wrote.

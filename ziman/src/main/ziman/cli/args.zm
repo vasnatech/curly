@@ -1,0 +1,142 @@
+// Command-line parsing.
+//
+// **Hand-rolled, because there is no clap here.** The Rust CLI derives its parser from structs;
+// this reads the argument vector into a small shape every command then interrogates. The parts that
+// matter are the ones clap does for free and a hand-rolled parser gets wrong by default:
+//
+//   * **A long flag may be `--name value` or `--name=value`**, and which it is depends on whether
+//     the flag takes a value at all -- so the caller declares its value-taking flags rather than
+//     the parser guessing. Guessing is how `--all list` turns `list` into the value of `--all`.
+//   * **An unknown flag is an error**, not a silently ignored token. A mistyped `--secrt` that is
+//     quietly dropped writes an unmasked secret.
+//   * **`--` ends flag parsing**, so a positional that begins with a dash is still reachable.
+//
+// Short flags are matched as whole tokens (`-k`, `-v`) and not bundled (`-kv`), which is the subset
+// the Rust CLI's own flags need.
+
+// One parsed argument vector.
+pub struct Parsed {
+    // Non-flag arguments, in order.
+    positionals: [string]
+    // `--name value` and `--name=value`, by name without the dashes.
+    values: Map<string, string>
+    // Flags present with no value, by name without the dashes.
+    switches: [string]
+}
+
+pub fn has_switch(p: Parsed, name: string) -> bool {
+    return contains(p.switches, name)
+}
+
+pub fn value_of(p: Parsed, name: string) -> Option<string> {
+    return get(p.values, name)
+}
+
+pub fn value_or(p: Parsed, name: string, fallback: string) -> string {
+    return get_or(p.values, name, fallback)
+}
+
+// Parses `argv`.
+//
+// `value_flags` names every flag that takes one, with its dashes (`--data-dir`, `-X`), and
+// `known_switches` names every boolean one. A flag in neither is an error -- which is the whole
+// point: a CLI that ignores what it does not recognise obeys a command nobody wrote.
+pub fn parse(argv: [string], value_flags: [string], known_switches: [string]) -> Result<Parsed, string> {
+    val positionals = mutable_array_new<string>()
+    val values = mutable_map_new<string, string>()
+    val switches = mutable_array_new<string>()
+    var i = 0
+    var only_positionals = false
+    while i < len(argv) {
+        val token = argv[i]
+        if only_positionals {
+            push(positionals, token)
+            i = i + 1
+            continue
+        }
+        if token == "--" {
+            only_positionals = true
+            i = i + 1
+            continue
+        }
+        if !starts_with(token, "-") || token == "-" {
+            push(positionals, token)
+            i = i + 1
+            continue
+        }
+        // `--name=value`, which has to be split before the name is looked up.
+        val equals = index_of(token, "=", 0)
+        if starts_with(token, "--") && equals > 0 {
+            val name = substring(token, 0, equals)
+            if !contains(value_flags, name) {
+                return err(concat("unexpected value for ", name))
+            }
+            set(values, bare(name), substring(token, equals + 1, len(token)))
+            i = i + 1
+            continue
+        }
+        if contains(value_flags, token) {
+            if i + 1 >= len(argv) {
+                return err(concat("a value is required for ", token))
+            }
+            set(values, bare(token), argv[i + 1])
+            i = i + 2
+            continue
+        }
+        if contains(known_switches, token) {
+            push(switches, bare(token))
+            i = i + 1
+            continue
+        }
+        return err(concat("unrecognised option: ", token))
+    }
+    return ok(Parsed {
+        positionals: snapshot(positionals),
+        values: snapshot(values),
+        switches: snapshot(switches)
+    })
+}
+
+// A flag's name without its leading dashes, which is how a command asks for it.
+fn bare(flag: string) -> string {
+    if starts_with(flag, "--") {
+        return substring(flag, 2, len(flag))
+    }
+    if starts_with(flag, "-") {
+        return substring(flag, 1, len(flag))
+    }
+    return flag
+}
+
+// `KEY=VALUE`, as `env set` and `--var` take.
+pub struct Assignment {
+    key: string
+    value: string
+}
+
+pub fn parse_assignment(text: string, what: string) -> Result<Assignment, string> {
+    val at = index_of(text, "=", 0)
+    // **The key may not be empty**, since `=v` names no variable, and the value may be: setting a
+    // variable to the empty string is a legitimate thing to want.
+    if at <= 0 {
+        return err(prelude.format("invalid {} value (expected KEY=VALUE): {}", what, text))
+    }
+    return ok(Assignment {
+        key: substring(text, 0, at),
+        value: substring(text, at + 1, len(text))
+    })
+}
+
+// Left-padded to a width, as Rust's `{:<7}` and `{:<6}` do in the command output -- which the
+// parity diff compares character for character.
+pub fn pad_right(text: string, width: int) -> string {
+    if len(text) >= width {
+        return text
+    }
+    val out = mutable_string_new()
+    append(out, text)
+    for _ in len(text)..width {
+        append(out, " ")
+    }
+    return snapshot(out)
+}

@@ -1,0 +1,56 @@
+// `curly scenario` -- the read-only half: list, show and delete. Running one follows.
+//
+// **There is no `add` or `edit`**, deliberately: authoring a scenario is JSON-only, so a
+// `.curly/scenarios/<name>.json` is hand-edited. That decision is the project's, not this port's.
+use cli/args.Parsed
+use core/scenario.Scenario
+use core/storage.Storage
+use core/storage.delete_scenario
+use core/storage.list_scenarios
+use core/storage.load_scenario
+
+pub fn run(action: string, rest: Parsed, store: Storage) -> Result<unit, string> {
+    if action == "list" {
+        val names = try list_scenarios(store)
+        if len(names) == 0 {
+            print("no scenarios yet — add one as .curly/scenarios/<name>.json")
+            return ok(unit)
+        }
+        for name in names {
+            print(name)
+        }
+        return ok(unit)
+    }
+    if action == "show" {
+        if len(rest.positionals) == 0 {
+            return err("usage: curly scenario show <name>")
+        }
+        val scenario = try load_scenario(store, rest.positionals[0])
+        show(scenario)
+        return ok(unit)
+    }
+    if action == "delete" {
+        if len(rest.positionals) == 0 {
+            return err("usage: curly scenario delete <name>")
+        }
+        val name = rest.positionals[0]
+        try delete_scenario(store, name)
+        print(prelude.format("deleted scenario \"{}\"", name))
+        return ok(unit)
+    }
+    return err(concat("unknown scenario command: ", action))
+}
+
+// **The imports are listed in alias order**, because Rust holds them in a `BTreeMap` and iterates
+// it -- and Ziman's `Map` keeps insertion order, which for a parsed file is the file's own.
+fn show(s: Scenario) {
+    print(s.name)
+    val aliases = mutable_array_new<string>()
+    for alias in keys(s.imports) {
+        push(aliases, alias)
+    }
+    for alias in sort(snapshot(aliases)) {
+        print(prelude.format("  {} -> {}", alias, get_or(s.imports, alias, "")))
+    }
+    print(prelude.format("  {} top-level step(s)", str(len(s.requests.items))))
+}

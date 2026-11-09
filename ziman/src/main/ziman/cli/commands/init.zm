@@ -1,0 +1,26 @@
+// `curly init` -- a project-local `./.curly`, the same idea as `git init`.
+//
+// **Environments and sessions are gitignored alongside history, not committed with collections.**
+// They typically hold real credentials, and `--secret` only masks a value in `env show`; it does
+// not encrypt it at rest. Collections hold variable *names* and never values, so they are the part
+// that is safe to share.
+use core/storage.init_project_local
+use os
+
+pub fn run() -> Result<unit, string> {
+    val cwd = switch os.cwd() {
+        Ok(d) { d }
+        Err(why) { return err(concat("failed to determine current directory: ", why)) }
+    }
+    val made = try init_project_local(cwd)
+    if !made.created {
+        print(concat("curly project already initialized at ", made.storage.root))
+        return ok(unit)
+    }
+    print(concat("initialized curly project at ", made.storage.root))
+    print("collections created here will be committed with the project;")
+    print("environments/, session/, and history/ are gitignored by default (they can hold")
+    print("real credentials/tokens and response bodies) — each teammate sets their own via")
+    print("`curly env set`, the same way you'd fill in a project's .env from .env.example.")
+    return ok(unit)
+}

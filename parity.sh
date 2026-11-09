@@ -86,6 +86,47 @@ for file in "$CURLY"/collections/*.json; do
   fi
 done
 
+# ---- the request tree ---------------------------------------------------------------------------
+#
+# The same script of operations through both implementations, then a diff. `add-request` and
+# `duplicate-request` mint fresh ids on both sides, so ids are normalised away and what is compared
+# is the structure: folder nesting, request names, ordering, and which operations refused.
+
+tree_dir="$work/tree"
+mkdir -p "$tree_dir"
+R="$RUST collections"
+$R add-request Parity login https://example.com/login --data-dir "$tree_dir" >/dev/null 2>&1
+$R add-request Parity Auth/OAuth/refresh https://example.com/Auth/OAuth/refresh --data-dir "$tree_dir" >/dev/null 2>&1
+$R add-request Parity Auth/logout https://example.com/Auth/logout --data-dir "$tree_dir" >/dev/null 2>&1
+$R add-folder Parity Archive/Old --data-dir "$tree_dir" >/dev/null 2>&1
+$R rename-request Parity login Auth/signin --data-dir "$tree_dir" >/dev/null 2>&1
+$R duplicate-request Parity Auth/logout Archive/Old/logout-copy --data-dir "$tree_dir" >/dev/null 2>&1
+$R remove-request Parity Auth/OAuth/refresh --data-dir "$tree_dir" >/dev/null 2>&1
+$R remove-folder Parity Auth/OAuth --data-dir "$tree_dir" >/dev/null 2>&1
+
+# Every UUID to a placeholder; they are random on both sides by design.
+normalise() { sed -E 's/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/<id>/g' "$1"; }
+
+if [ -f "$tree_dir/collections/parity.json" ]; then
+  CURLY_CASE=tree-ops zim env > "$work/tree.ziman.raw" 2>"$work/tree.err"
+  if [ -s "$work/tree.ziman.raw" ]; then
+    # `print` ends with a newline and a collection file does not, so the driver's output is
+    # trimmed before comparing -- the same adjustment the storage-format check above makes.
+    printf '%s' "$(cat "$work/tree.ziman.raw")" > "$work/tree.ziman"
+    normalise "$tree_dir/collections/parity.json" > "$work/tree.rust.norm"
+    normalise "$work/tree.ziman" > "$work/tree.ziman.norm"
+    if diff -q "$work/tree.rust.norm" "$work/tree.ziman.norm" >/dev/null; then
+      ok "tree operations produce an identical collection (8 operations)"
+    else
+      bad "tree operations differ" "$(diff "$work/tree.rust.norm" "$work/tree.ziman.norm" | head -8 | tr '\n' ' ')"
+    fi
+  else
+    bad "ziman tree-ops produced nothing" "$(head -2 "$work/tree.err" | tr '\n' ' ')"
+  fi
+else
+  bad "the rust side wrote no parity collection" "check the collections subcommand names"
+fi
+
 # ---- the slug -----------------------------------------------------------------------------------
 #
 # Both sides turn a display name into the same filename, or `load` misses what `save` wrote.

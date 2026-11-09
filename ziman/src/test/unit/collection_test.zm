@@ -1,0 +1,339 @@
+// `core/collection`: the request tree inside a collection.
+//
+// Ported from the `Collection` half of `crates/curly-core/tests/storage_test.rs`. The cases that
+// earn their place are the **refusals and the near-misses**: a path collision that must leave the
+// original where it was, a non-empty folder that must not vanish on a typo, and a duplicate that
+// must not share its original's id. Each of those failing silently produces a collection that looks
+// fine and has lost something.
+use core/collection.RemoveOutcome
+use core/collection.add_folder
+use core/collection.add_request
+use core/collection.duplicate_request
+use core/collection.find_folder
+use core/collection.find_request
+use core/collection.remove_folder
+use core/collection.remove_request
+use core/collection.rename_or_move_request
+use core/saved.Collection
+use core/saved.SavedRequest
+use test
+use uuid
+use uuid.Uuid
+use uuid.uuid_new
+
+fn empty_collection() -> Collection {
+    return Collection { id: uuid_new(), name: "My API", folders: [], requests: [] }
+}
+
+fn sample_request(name: string) -> SavedRequest {
+    return SavedRequest {
+        id: uuid_new(),
+        name: name,
+        method: "GET",
+        url: "https://example.com",
+        query_params: [],
+        headers: [],
+        body: None,
+        auth: None,
+        extract: []
+    }
+}
+
+fn added(c: Collection, path: string) -> Collection {
+    val out = add_request(c, path, sample_request(path))
+    if Err(why) = out {
+        test.fail(concat("add refused: ", why))
+        return c
+    }
+    return unwrap(out)
+}
+
+fn refusal_of(r: Result<Collection, string>) -> string {
+    return switch r {
+        Ok(_) { "no refusal" }
+        Err(why) { why }
+    }
+}
+
+fn is_there(c: Collection, path: string) -> bool {
+    return is_Some(find_request(c, path))
+}
+
+// ---------------------------------------------------------------- adding and finding
+
+#[test]
+fn a_request_is_added_at_the_top_level_and_found_by_name() {
+    val c = added(empty_collection(), "login")
+    test.assert_len(1, c.requests)
+    test.assert_len(0, c.folders)
+    test.assert_eq(true, is_there(c, "login"))
+}
+
+#[test]
+fn adding_creates_the_folders_along_the_path() {
+    val c = added(empty_collection(), "Auth/OAuth/refresh")
+    test.assert_len(1, c.folders)
+    test.assert_eq("Auth", c.folders[0].name)
+    test.assert_len(1, c.folders[0].folders)
+    test.assert_eq("OAuth", c.folders[0].folders[0].name)
+    test.assert_len(1, c.folders[0].folders[0].requests)
+    test.assert_eq("refresh", c.folders[0].folders[0].requests[0].name)
+    test.assert_eq(true, is_there(c, "Auth/OAuth/refresh"))
+}
+
+#[test]
+fn adding_reuses_an_existing_folder_rather_than_duplicating_it() {
+    // The failure this guards is two folders both called `Auth`, which reads as one folder in any
+    // tree view and loses whichever request the view does not show.
+    var c = added(empty_collection(), "Auth/login")
+    c = added(c, "Auth/logout")
+    test.assert_len(1, c.folders)
+    test.assert_len(2, c.folders[0].requests)
+}
+
+#[test]
+fn the_path_leaf_names_the_request_whatever_name_it_arrived_with() {
+    val c = unwrap(add_request(empty_collection(), "Auth/login", sample_request("something-else")))
+    test.assert_eq("login", c.folders[0].requests[0].name)
+    test.assert_eq(true, is_there(c, "Auth/login"))
+}
+
+#[test]
+fn adding_at_a_path_that_is_taken_is_refused_and_quotes_the_path() {
+    val c = added(empty_collection(), "Auth/login")
+    test.assert_contains(refusal_of(add_request(c, "Auth/login", sample_request("login"))), "Auth/login")
+}
+
+#[test]
+fn the_same_name_in_two_folders_is_not_a_collision() {
+    var c = added(empty_collection(), "Auth/get")
+    c = added(c, "Users/get")
+    test.assert_eq(true, is_there(c, "Auth/get"))
+    test.assert_eq(true, is_there(c, "Users/get"))
+    test.assert_len(2, c.folders)
+}
+
+#[test]
+fn finding_answers_nothing_for_a_folder_segment_that_is_not_there() {
+    val c = added(empty_collection(), "Auth/login")
+    test.assert_eq(false, is_there(c, "Nope/login"))
+    test.assert_eq(false, is_there(c, "Auth/Deeper/login"))
+    test.assert_eq(false, is_there(c, "login"))
+}
+
+#[test]
+fn stray_slashes_in_a_path_are_ignored() {
+    // `Auth//login` is `Auth/login`, and a trailing slash changes nothing -- so a path typed with a
+    // doubled separator finds the request rather than quietly missing it.
+    val c = added(empty_collection(), "Auth/login")
+    test.assert_eq(true, is_there(c, "Auth//login"))
+    test.assert_eq(true, is_there(c, "/Auth/login"))
+    val top = added(empty_collection(), "login")
+    test.assert_eq(true, is_there(top, "login/"))
+}
+
+// ---------------------------------------------------------------- removing
+
+#[test]
+fn a_nested_request_is_removed() {
+    val c = added(empty_collection(), "Auth/OAuth/refresh")
+    val gone = remove_request(c, "Auth/OAuth/refresh")
+    test.assert_eq(true, gone.removed)
+    test.assert_eq(false, is_there(gone.collection, "Auth/OAuth/refresh"))
+    // The folders stay: removing a request is not removing the folder it was in.
+    test.assert_len(1, gone.collection.folders)
+}
+
+#[test]
+fn removing_a_request_that_is_not_there_says_so_rather_than_failing() {
+    // "Delete this" and "there was nothing there" are both fine answers for a caller tidying up.
+    val c = added(empty_collection(), "login")
+    test.assert_eq(false, remove_request(c, "nope").removed)
+    test.assert_eq(false, remove_request(c, "Nope/login").removed)
+    test.assert_eq(true, is_there(remove_request(c, "nope").collection, "login"))
+}
+
+#[test]
+fn removing_one_request_leaves_its_siblings() {
+    var c = added(empty_collection(), "Auth/login")
+    c = added(c, "Auth/logout")
+    val gone = remove_request(c, "Auth/login")
+    test.assert_eq(true, gone.removed)
+    test.assert_eq(false, is_there(gone.collection, "Auth/login"))
+    test.assert_eq(true, is_there(gone.collection, "Auth/logout"))
+}
+
+// ---------------------------------------------------------------- renaming and moving
+
+#[test]
+fn renaming_in_place_keeps_the_request_and_its_id() {
+    val c = added(empty_collection(), "login")
+    val id = unwrap(find_request(c, "login")).id
+    val moved = unwrap(rename_or_move_request(c, "login", "sign-in"))
+    test.assert_eq(false, is_there(moved, "login"))
+    test.assert_eq(true, is_there(moved, "sign-in"))
+    // **The same request, moved** -- the id, body, auth and extraction rules all travel.
+    test.assert_eq(uuid.format(id), uuid.format(unwrap(find_request(moved, "sign-in")).id))
+}
+
+#[test]
+fn moving_into_a_new_folder_creates_it() {
+    val c = added(empty_collection(), "login")
+    val moved = unwrap(rename_or_move_request(c, "login", "Auth/OAuth/login"))
+    test.assert_eq(true, is_there(moved, "Auth/OAuth/login"))
+    test.assert_eq(false, is_there(moved, "login"))
+    test.assert_len(0, moved.requests)
+}
+
+#[test]
+fn moving_to_the_same_path_is_a_no_op() {
+    val c = added(empty_collection(), "Auth/login")
+    val same = unwrap(rename_or_move_request(c, "Auth/login", "Auth/login"))
+    test.assert_eq(true, is_there(same, "Auth/login"))
+    test.assert_len(1, same.folders)
+    test.assert_len(1, same.folders[0].requests)
+}
+
+#[test]
+fn moving_something_that_is_not_there_is_refused() {
+    test.assert_contains(
+        refusal_of(rename_or_move_request(empty_collection(), "nope", "elsewhere")),
+        "nope"
+    )
+}
+
+#[test]
+fn a_move_onto_a_taken_path_is_refused_and_leaves_both_where_they_were() {
+    // **The property that matters most here.** Rust arranges it by checking the destination before
+    // removing the source; here it is structural -- on `Err` the caller still holds the collection
+    // it passed in, so a refused move cannot have consumed the original.
+    var c = added(empty_collection(), "login")
+    c = added(c, "logout")
+    val why = refusal_of(rename_or_move_request(c, "login", "logout"))
+    test.assert_contains(why, "logout")
+    test.assert_eq(true, is_there(c, "login"))
+    test.assert_eq(true, is_there(c, "logout"))
+}
+
+// ---------------------------------------------------------------- duplicating
+
+#[test]
+fn duplicating_copies_with_a_fresh_id_and_keeps_the_original() {
+    val c = added(empty_collection(), "login")
+    val original = unwrap(find_request(c, "login")).id
+    val copied = unwrap(duplicate_request(c, "login", "login-copy"))
+    test.assert_eq(true, is_there(copied, "login"))
+    val copy = unwrap(find_request(copied, "login-copy"))
+    test.assert_eq("login-copy", copy.name)
+    // **A duplicate is a distinct thing**: two requests sharing an id would be one request to
+    // anything that keys on it.
+    test.assert_ne(uuid.format(original), uuid.format(copy.id))
+    test.assert_eq(uuid.format(original), uuid.format(unwrap(find_request(copied, "login")).id))
+}
+
+#[test]
+fn duplicating_into_a_folder_works_and_a_taken_destination_is_refused() {
+    var c = added(empty_collection(), "login")
+    c = unwrap(duplicate_request(c, "login", "Archive/login"))
+    test.assert_eq(true, is_there(c, "Archive/login"))
+    test.assert_contains(refusal_of(duplicate_request(c, "login", "Archive/login")), "Archive/login")
+}
+
+#[test]
+fn duplicating_something_that_is_not_there_is_refused() {
+    test.assert_contains(refusal_of(duplicate_request(empty_collection(), "nope", "copy")), "nope")
+}
+
+// ---------------------------------------------------------------- folders
+
+#[test]
+fn adding_a_folder_is_idempotent() {
+    var c = add_folder(empty_collection(), "Auth")
+    c = add_folder(c, "Auth")
+    test.assert_len(1, c.folders)
+    test.assert_eq("Auth", c.folders[0].name)
+}
+
+#[test]
+fn adding_a_folder_creates_the_whole_nested_path() {
+    val c = add_folder(empty_collection(), "A/B/C")
+    test.assert_len(1, c.folders)
+    test.assert_len(1, c.folders[0].folders)
+    test.assert_eq("C", c.folders[0].folders[0].folders[0].name)
+    test.assert_eq(true, is_Some(find_folder(c, "A/B/C")))
+    test.assert_eq(true, is_None(find_folder(c, "A/B/D")))
+}
+
+#[test]
+fn adding_a_folder_inside_an_existing_one_keeps_its_contents() {
+    var c = added(empty_collection(), "Auth/login")
+    c = add_folder(c, "Auth/OAuth")
+    test.assert_len(1, c.folders)
+    test.assert_len(1, c.folders[0].requests)
+    test.assert_len(1, c.folders[0].folders)
+    test.assert_eq(true, is_there(c, "Auth/login"))
+}
+
+#[test]
+fn an_empty_folder_is_removed_without_force() {
+    val c = add_folder(empty_collection(), "Auth")
+    val gone = unwrap(remove_folder(c, "Auth", false))
+    test.assert_eq(true, gone.removed)
+    test.assert_len(0, gone.collection.folders)
+}
+
+#[test]
+fn a_non_empty_folder_is_refused_without_force() {
+    // A typo must not take a subtree with it.
+    val c = added(empty_collection(), "Auth/login")
+    val why = switch remove_folder(c, "Auth", false) {
+        Ok(_) { "no refusal" }
+        Err(message) { message }
+    }
+    test.assert_contains(why, "not empty")
+    test.assert_contains(why, "Auth")
+    // And nothing was removed.
+    test.assert_eq(true, is_there(c, "Auth/login"))
+}
+
+#[test]
+fn a_folder_holding_only_a_subfolder_also_counts_as_non_empty() {
+    val c = add_folder(empty_collection(), "Auth/OAuth")
+    test.assert_eq(true, is_err_of(remove_folder(c, "Auth", false)))
+}
+
+fn is_err_of(r: Result<RemoveOutcome, string>) -> bool {
+    return !is_ok(r)
+}
+
+#[test]
+fn a_non_empty_folder_is_removed_with_force_and_takes_its_contents() {
+    var c = added(empty_collection(), "Auth/login")
+    c = added(c, "Auth/OAuth/refresh")
+    val gone = unwrap(remove_folder(c, "Auth", true))
+    test.assert_eq(true, gone.removed)
+    test.assert_len(0, gone.collection.folders)
+    test.assert_eq(false, is_there(gone.collection, "Auth/login"))
+    test.assert_eq(false, is_there(gone.collection, "Auth/OAuth/refresh"))
+}
+
+#[test]
+fn removing_a_nested_folder_leaves_its_parent() {
+    var c = added(empty_collection(), "Auth/login")
+    c = add_folder(c, "Auth/OAuth")
+    val gone = unwrap(remove_folder(c, "Auth/OAuth", false))
+    test.assert_eq(true, gone.removed)
+    test.assert_len(1, gone.collection.folders)
+    test.assert_len(0, gone.collection.folders[0].folders)
+    test.assert_eq(true, is_there(gone.collection, "Auth/login"))
+}
+
+#[test]
+fn removing_a_folder_that_is_not_there_says_so_rather_than_failing() {
+    val c = add_folder(empty_collection(), "Auth")
+    test.assert_eq(false, unwrap(remove_folder(c, "Nope", false)).removed)
+    test.assert_eq(false, unwrap(remove_folder(c, "Auth/Nope", false)).removed)
+    test.assert_eq(false, unwrap(remove_folder(c, "Nope/Deeper", false)).removed)
+    // An empty path names no folder.
+    test.assert_eq(false, unwrap(remove_folder(c, "", false)).removed)
+}

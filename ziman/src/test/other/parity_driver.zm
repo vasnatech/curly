@@ -5,6 +5,14 @@
 // **This is not a test of the Ziman side on its own** -- `src/test/unit` does that. It exists
 // because "the Ziman implementation replaces the Rust one" is only true if the two agree, and the
 // cheapest way to know is to ask both the same question and compare the answers.
+use core/collection.add_folder
+use core/collection.add_request
+use core/collection.duplicate_request
+use core/collection.remove_folder
+use core/collection.remove_request
+use core/collection.rename_or_move_request
+use core/saved.Collection
+use core/saved.SavedRequest
 use core/saved.collection_from_json
 use core/saved.collection_to_json
 use core/storage.list_collections
@@ -14,6 +22,7 @@ use core/storage.storage_of
 use fs
 use json
 use os
+use uuid.uuid_new
 
 fn env_or(name: string, fallback: string) -> string {
     return switch os.get_env(name) {
@@ -73,5 +82,68 @@ fn main() {
         }
         return
     }
+    if case == "tree-ops" {
+        tree_ops()
+        return
+    }
     os.fatal(concat("unknown case: ", case))
+}
+
+// **The same script of tree operations `parity.sh` drives through the Rust CLI**, so the two
+// resulting collection files can be diffed. Ids are minted fresh by `add_request` and
+// `duplicate_request` on both sides and so cannot match; the harness normalises them away and
+// compares everything else -- names, nesting, ordering, and which operations refused.
+fn a_request(url: string) -> SavedRequest {
+    return SavedRequest {
+        id: uuid_new(),
+        name: "placeholder",
+        method: "GET",
+        url: url,
+        query_params: [],
+        headers: [],
+        body: None,
+        auth: None,
+        extract: []
+    }
+}
+
+fn must_add(c: Collection, path: string) -> Collection {
+    return switch add_request(c, path, a_request(concat("https://example.com/", path))) {
+        Ok(out) { out }
+        Err(why) {
+            os.fatal(concat("add_request failed: ", why))
+            c
+        }
+    }
+}
+
+fn tree_ops() {
+    var c = Collection { id: uuid_new(), name: "Parity", folders: [], requests: [] }
+    c = must_add(c, "login")
+    c = must_add(c, "Auth/OAuth/refresh")
+    c = must_add(c, "Auth/logout")
+    c = add_folder(c, "Archive/Old")
+    c = switch rename_or_move_request(c, "login", "Auth/signin") {
+        Ok(out) { out }
+        Err(why) {
+            os.fatal(concat("rename failed: ", why))
+            c
+        }
+    }
+    c = switch duplicate_request(c, "Auth/logout", "Archive/Old/logout-copy") {
+        Ok(out) { out }
+        Err(why) {
+            os.fatal(concat("duplicate failed: ", why))
+            c
+        }
+    }
+    c = remove_request(c, "Auth/OAuth/refresh").collection
+    c = switch remove_folder(c, "Auth/OAuth", false) {
+        Ok(out) { out.collection }
+        Err(why) {
+            os.fatal(concat("remove_folder failed: ", why))
+            c
+        }
+    }
+    print(json.format(collection_to_json(c), 2))
 }

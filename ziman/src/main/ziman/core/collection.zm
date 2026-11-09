@@ -1,0 +1,365 @@
+// The request tree inside a collection: finding, adding, removing, renaming, duplicating, and the
+// folders along the way. A request is addressed by a slash-separated path from the collection root,
+// `Auth/OAuth/refresh`.
+//
+// **Rust navigates this tree through `&mut` references and mutates in place; this rebuilds it.**
+// Ziman values are not aliasable that way, so every operation here takes a collection and answers a
+// new one. The outside behaviour is the same, and one property Rust has to arrange deliberately
+// comes free: `rename_or_move_request` documents that a failed rename "never loses the original"
+// because it checks the destination *before* removing the source -- here a failed operation returns
+// `Err` and the caller still holds the collection it passed in, so losing the original is not a
+// thing the code can do.
+//
+// The cost is that a deep `add_request` copies the folder chain it descends. A collection is a few
+// hundred requests in a file somebody edits by hand, so that is not a figure worth optimising
+// against; it is worth knowing before anyone puts a tree of a different size through here.
+use core/saved.Collection
+use core/saved.Folder
+use core/saved.SavedRequest
+use uuid.uuid_new
+
+// A node's two child lists. Both `Collection` and `Folder` carry exactly this pair, so the
+// recursive helpers work on it and the two public wrappers put it back where it came from.
+struct Node {
+    folders: [Folder]
+    requests: [SavedRequest]
+}
+
+// A removal, and whether it removed anything. Ziman has no tuple type, so Rust's `bool` return
+// beside an in-place mutation is a named pair.
+pub struct RemoveOutcome {
+    collection: Collection
+    removed: bool
+}
+
+struct NodeRemoval {
+    node: Node
+    removed: bool
+}
+
+// The folder segments and the leaf name: `Auth/OAuth/login` is `(["Auth", "OAuth"], "login")`, and a
+// bare `login` is `([], "login")`.
+//
+// **Empty segments are dropped**, so `Auth//login` behaves as `Auth/login` and a trailing slash is
+// ignored. A path that is entirely empty keeps the path itself as the leaf, which is Rust's
+// `pop().unwrap_or(path)` -- it then matches no request, and the operation fails on that rather than
+// on the parse.
+struct PathParts {
+    segments: [string]
+    leaf: string
+}
+
+fn split_request_path(path: string) -> PathParts {
+    val kept = mutable_array_new<string>()
+    for piece in split(path, "/") {
+        if len(piece) != 0 {
+            push(kept, piece)
+        }
+    }
+    val all = snapshot(kept)
+    if len(all) == 0 {
+        return PathParts { segments: [], leaf: path }
+    }
+    return PathParts {
+        segments: slice(all, 0, len(all) - 1),
+        leaf: all[len(all) - 1]
+    }
+}
+
+// Just the folder segments, for the two operations whose whole path names a folder.
+fn folder_segments(path: string) -> [string] {
+    val kept = mutable_array_new<string>()
+    for piece in split(path, "/") {
+        if len(piece) != 0 {
+            push(kept, piece)
+        }
+    }
+    return snapshot(kept)
+}
+
+fn node_of(c: Collection) -> Node {
+    return Node { folders: c.folders, requests: c.requests }
+}
+
+fn collection_with(c: Collection, n: Node) -> Collection {
+    return with c { folders: n.folders, requests: n.requests }
+}
+
+fn folder_with(f: Folder, n: Node) -> Folder {
+    return with f { folders: n.folders, requests: n.requests }
+}
+
+fn folder_named(folders: [Folder], name: string) -> Option<int> {
+    for i in 0..len(folders) {
+        if folders[i].name == name {
+            return Some(i)
+        }
+    }
+    return None
+}
+
+// ---------------------------------------------------------------- finding
+
+fn node_find(node: Node, segments: [string], leaf: string) -> Option<SavedRequest> {
+    if len(segments) == 0 {
+        for r in node.requests {
+            if r.name == leaf {
+                return Some(r)
+            }
+        }
+        return None
+    }
+    val at = switch folder_named(node.folders, segments[0]) {
+        Some(i) { i }
+        None { return None }
+    }
+    val child = node.folders[at]
+    return node_find(
+        Node { folders: child.folders, requests: child.requests },
+        slice(segments, 1, len(segments)),
+        leaf
+    )
+}
+
+// The request at `path`, or nothing. **A missing folder segment answers nothing rather than
+// failing**, so a caller asking "is there one there?" gets an answer either way.
+pub fn find_request(c: Collection, path: string) -> Option<SavedRequest> {
+    val parts = split_request_path(path)
+    return node_find(node_of(c), parts.segments, parts.leaf)
+}
+
+pub fn find_folder(c: Collection, path: string) -> Option<Folder> {
+    var folders = c.folders
+    var found = Option<Folder>.None
+    for segment in folder_segments(path) {
+        val at = switch folder_named(folders, segment) {
+            Some(i) { i }
+            None { return None }
+        }
+        found = Option<Folder>.Some(folders[at])
+        folders = folders[at].folders
+    }
+    return found
+}
+
+// ---------------------------------------------------------------- adding
+
+// Descends `segments`, **creating any folder that is not there**, and adds the request at the end.
+fn node_add(node: Node, segments: [string], leaf: string, request: SavedRequest, path: string) -> Result<Node, string> {
+    if len(segments) == 0 {
+        for r in node.requests {
+            if r.name == leaf {
+                return err(prelude.format("a request already exists at \"{}\"", path))
+            }
+        }
+        val requests = mutable_array_new<SavedRequest>()
+        for r in node.requests {
+            push(requests, r)
+        }
+        // The leaf of the path wins over whatever name the request arrived with, so that
+        // `add_request("Auth/login", r)` cannot store a request called something else.
+        push(requests, with request { name: leaf })
+        return ok(with node { requests: snapshot(requests) })
+    }
+    val head = segments[0]
+    val rest = slice(segments, 1, len(segments))
+    val folders = mutable_array_new<Folder>()
+    var placed = false
+    for f in node.folders {
+        if f.name == head && !placed {
+            val grown = try node_add(
+                Node { folders: f.folders, requests: f.requests },
+                rest,
+                leaf,
+                request,
+                path
+            )
+            push(folders, folder_with(f, grown))
+            placed = true
+        } else {
+            push(folders, f)
+        }
+    }
+    if !placed {
+        val fresh = Folder { id: uuid_new(), name: head, folders: [], requests: [] }
+        val grown = try node_add(Node { folders: [], requests: [] }, rest, leaf, request, path)
+        push(folders, folder_with(fresh, grown))
+    }
+    return ok(with node { folders: snapshot(folders) })
+}
+
+// Adds `request` at `path`, creating any missing folders. Refuses if a request is already there.
+pub fn add_request(c: Collection, path: string, request: SavedRequest) -> Result<Collection, string> {
+    val parts = split_request_path(path)
+    return ok(collection_with(c, try node_add(node_of(c), parts.segments, parts.leaf, request, path)))
+}
+
+// Creates a folder at `path` and any missing ancestor. **Idempotent**: a folder already there is a
+// no-op rather than an error, as `git init` is on an existing repository.
+pub fn add_folder(c: Collection, path: string) -> Collection {
+    return collection_with(c, node_add_folder(node_of(c), folder_segments(path)))
+}
+
+fn node_add_folder(node: Node, segments: [string]) -> Node {
+    if len(segments) == 0 {
+        return node
+    }
+    val head = segments[0]
+    val rest = slice(segments, 1, len(segments))
+    val folders = mutable_array_new<Folder>()
+    var placed = false
+    for f in node.folders {
+        if f.name == head && !placed {
+            val grown = node_add_folder(Node { folders: f.folders, requests: f.requests }, rest)
+            push(folders, folder_with(f, grown))
+            placed = true
+        } else {
+            push(folders, f)
+        }
+    }
+    if !placed {
+        val fresh = Folder { id: uuid_new(), name: head, folders: [], requests: [] }
+        push(folders, folder_with(fresh, node_add_folder(Node { folders: [], requests: [] }, rest)))
+    }
+    return with node { folders: snapshot(folders) }
+}
+
+// ---------------------------------------------------------------- removing
+
+fn node_remove_request(node: Node, segments: [string], leaf: string) -> NodeRemoval {
+    if len(segments) == 0 {
+        val kept = mutable_array_new<SavedRequest>()
+        for r in node.requests {
+            if r.name != leaf {
+                push(kept, r)
+            }
+        }
+        val left = snapshot(kept)
+        return NodeRemoval {
+            node: with node { requests: left },
+            removed: len(left) != len(node.requests)
+        }
+    }
+    val head = segments[0]
+    val rest = slice(segments, 1, len(segments))
+    val folders = mutable_array_new<Folder>()
+    var removed = false
+    for f in node.folders {
+        if f.name == head && !removed {
+            val inner = node_remove_request(
+                Node { folders: f.folders, requests: f.requests },
+                rest,
+                leaf
+            )
+            push(folders, folder_with(f, inner.node))
+            removed = inner.removed
+        } else {
+            push(folders, f)
+        }
+    }
+    return NodeRemoval { node: with node { folders: snapshot(folders) }, removed: removed }
+}
+
+// Removes the request at `path`. `removed` is false when there was none -- **not an error**, because
+// "delete this" and "there was nothing there" are both fine answers for a caller tidying up.
+pub fn remove_request(c: Collection, path: string) -> RemoveOutcome {
+    val parts = split_request_path(path)
+    val outcome = node_remove_request(node_of(c), parts.segments, parts.leaf)
+    return RemoveOutcome { collection: collection_with(c, outcome.node), removed: outcome.removed }
+}
+
+// Removes the folder at `path` and everything inside it. **Refuses a non-empty folder unless
+// `force`**, so a typo cannot silently take a subtree with it. `removed` is false when `path` names
+// no folder.
+pub fn remove_folder(c: Collection, path: string, force: bool) -> Result<RemoveOutcome, string> {
+    val segments = folder_segments(path)
+    if len(segments) == 0 {
+        return ok(RemoveOutcome { collection: c, removed: false })
+    }
+    val outcome = try node_remove_folder(node_of(c), segments, force, path)
+    return ok(RemoveOutcome { collection: collection_with(c, outcome.node), removed: outcome.removed })
+}
+
+fn node_remove_folder(node: Node, segments: [string], force: bool, path: string) -> Result<NodeRemoval, string> {
+    val head = segments[0]
+    val rest = slice(segments, 1, len(segments))
+    if len(rest) == 0 {
+        val at = switch folder_named(node.folders, head) {
+            Some(i) { i }
+            None { return ok(NodeRemoval { node: node, removed: false }) }
+        }
+        val target = node.folders[at]
+        if !force && (len(target.folders) != 0 || len(target.requests) != 0) {
+            return err(prelude.format(
+                "folder \"{}\" is not empty (pass force to delete it and everything inside)",
+                path
+            ))
+        }
+        val kept = mutable_array_new<Folder>()
+        for i in 0..len(node.folders) {
+            if i != at {
+                push(kept, node.folders[i])
+            }
+        }
+        return ok(NodeRemoval { node: with node { folders: snapshot(kept) }, removed: true })
+    }
+    val at = switch folder_named(node.folders, head) {
+        Some(i) { i }
+        None { return ok(NodeRemoval { node: node, removed: false }) }
+    }
+    val folders = mutable_array_new<Folder>()
+    var removed = false
+    for i in 0..len(node.folders) {
+        if i == at {
+            val child = node.folders[i]
+            val inner = try node_remove_folder(
+                Node { folders: child.folders, requests: child.requests },
+                rest,
+                force,
+                path
+            )
+            push(folders, folder_with(child, inner.node))
+            removed = inner.removed
+        } else {
+            push(folders, node.folders[i])
+        }
+    }
+    return ok(NodeRemoval { node: with node { folders: snapshot(folders) }, removed: removed })
+}
+
+// ---------------------------------------------------------------- moving and copying
+
+// Renames and/or moves the request at `old_path` to `new_path`. Identical paths are a no-op.
+//
+// **The destination is checked before the source is removed**, so a refused move leaves the
+// collection exactly as it was -- which here is structural rather than careful: on `Err` the caller
+// still holds the value it passed in.
+pub fn rename_or_move_request(c: Collection, old_path: string, new_path: string) -> Result<Collection, string> {
+    if old_path == new_path {
+        return ok(c)
+    }
+    val request = switch find_request(c, old_path) {
+        Some(r) { r }
+        None { return err(prelude.format("no request found at \"{}\"", old_path)) }
+    }
+    if is_Some(find_request(c, new_path)) {
+        return err(prelude.format("a request already exists at \"{}\"", new_path))
+    }
+    // The id, body, auth and extraction rules travel unchanged: this is the same request, moved.
+    return add_request(remove_request(c, old_path).collection, new_path, request)
+}
+
+// Copies the request at `path` to `new_path`, leaving the original.
+//
+// **The copy gets a fresh id**, because a duplicate is a distinct thing -- two requests sharing an
+// id would be one request in anything that keys on it.
+pub fn duplicate_request(c: Collection, path: string, new_path: string) -> Result<Collection, string> {
+    val request = switch find_request(c, path) {
+        Some(r) { r }
+        None { return err(prelude.format("no request found at \"{}\"", path)) }
+    }
+    if is_Some(find_request(c, new_path)) {
+        return err(prelude.format("a request already exists at \"{}\"", new_path))
+    }
+    return add_request(c, new_path, with request { id: uuid_new() })
+}

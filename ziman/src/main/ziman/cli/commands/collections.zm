@@ -46,6 +46,7 @@ use core/storage.load_collection
 use core/storage.load_collection_opt
 use core/storage.save_collection
 use fs
+use io
 use uuid.uuid_new
 
 pub fn run(action: string, rest: Parsed, store: Storage) -> Result<unit, string> {
@@ -246,16 +247,25 @@ fn import_from(rest: Parsed, store: Storage) -> Result<unit, string> {
         // **The command may come from stdin**, which is how a multi-line "Copy as cURL" paste gets
         // in without shell quoting fighting it.
         //
-        // **Read through `/dev/stdin`, because Ziman has no stdin API** -- nothing in `io` or `os`
-        // exposes it. That file exists on Linux and macOS and handles a multi-line pipe correctly,
-        // so the behaviour matches; on a platform without it the read fails and says so, which is
-        // better than the command silently becoming empty and importing a request with no URL.
+        // **Read through `io.stdin()`.** This was `fs.read_text("/dev/stdin")` until 2026-11-09,
+        // for want of a stdin API; that worked on Linux and macOS and was a lie everywhere else,
+        // and on a pipe rather than a file it was not a file at all. `io.stdin()` is the real
+        // thing, and reads a multi-line paste the same way.
+        //
+        // Drained whole rather than streamed, because a curl command *is* a whole value: there is
+        // nothing to do with half of one. No ceiling (`-1`), matching the Rust side, which reads
+        // stdin to a `String` with no cap either -- the input here is a paste from a browser's
+        // developer tools, not a download.
         val command = if len(rest.positionals) >= 4 {
             rest.positionals[3]
         } else {
-            switch fs.read_text("/dev/stdin") {
-                Ok(text) { text }
+            val typed = switch io.drain(io.stdin(), 0 - 1) {
+                Ok(bytes) { bytes }
                 Err(_) { return err("failed to read curl command from stdin") }
+            }
+            switch bytes_to_string(typed) {
+                Ok(text) { text }
+                Err(_) { return err("the curl command on stdin is not UTF-8 text") }
             }
         }
         val saved = try import_curl(leaf_of(path), command)

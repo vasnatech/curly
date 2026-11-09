@@ -320,6 +320,52 @@ if [ -x "$ZCLI" ]; then
   else
     bad "cli: secret flag did not survive" "$("$RUST" env show shared --data-dir "$wdir" 2>&1 | tr '\n' ' ')"
   fi
+
+  # **The curl command on standard input**, which the importer check above cannot reach: it passes
+  # the command as an argument, and the stdin path is a different branch on both sides. It is also
+  # the branch a user actually takes -- "Copy as cURL" produces a multi-line paste, and piping it
+  # is how it gets in without the shell fighting the quoting.
+  #
+  # Worth a check of its own because the Ziman side read `/dev/stdin` as a whole file until
+  # 2026-11-09, for want of a stdin API; it now reads `io.stdin()`, and the thing to hold is that
+  # the *collection written* is byte-identical, not merely that the command parsed.
+  stdin_cmd="curl -X POST 'https://example.com/api/items' \\
+  -H 'Content-Type: application/json' \\
+  -H 'X-Trace: abc' \\
+  --data-raw '{\"name\":\"one\"}'"
+  for impl in rust ziman; do
+    rm -rf "$work/stdin-$impl"
+    mkdir -p "$work/stdin-$impl"
+  done
+  printf '%s\n' "$stdin_cmd" | "$RUST" collections import curl Piped Items/create \
+    --data-dir "$work/stdin-rust" >/dev/null 2>&1
+  printf '%s\n' "$stdin_cmd" | ZIMAN="$ZIMAN" "$ZCLI" collections import curl Piped Items/create \
+    --data-dir "$work/stdin-ziman" >/dev/null 2>&1
+  if [ -f "$work/stdin-rust/collections/piped.json" ] && [ -f "$work/stdin-ziman/collections/piped.json" ]; then
+    normalise "$work/stdin-rust/collections/piped.json" > "$work/stdin.rust.norm"
+    normalise "$work/stdin-ziman/collections/piped.json" > "$work/stdin.ziman.norm"
+    if diff -q "$work/stdin.rust.norm" "$work/stdin.ziman.norm" >/dev/null; then
+      ok "cli: a multi-line curl command piped on stdin imports identically"
+    else
+      bad "cli: piped curl import differs" \
+        "$(diff "$work/stdin.rust.norm" "$work/stdin.ziman.norm" | head -8 | tr '\n' ' ')"
+    fi
+  else
+    bad "cli: a piped curl command did not import" \
+      "rust=$([ -f "$work/stdin-rust/collections/piped.json" ] && echo yes || echo no) ziman=$([ -f "$work/stdin-ziman/collections/piped.json" ] && echo yes || echo no)"
+  fi
+
+  # Empty standard input: both must refuse, with the same words. This is the case the `/dev/stdin`
+  # read got right by accident and `io.stdin()` gets right by its end-of-input contract -- an empty
+  # source is `None` on the first pull, not an empty chunk, so the command is "" and the parser
+  # refuses it rather than importing a request with no URL.
+  empty_rust="$(printf '' | "$RUST" collections import curl Empty r --data-dir "$work/stdin-rust" 2>&1)" || true
+  empty_zim="$(printf '' | ZIMAN="$ZIMAN" "$ZCLI" collections import curl Empty r --data-dir "$work/stdin-ziman" 2>&1)" || true
+  if [ "$empty_rust" = "$empty_zim" ] && [ -n "$empty_rust" ]; then
+    ok "cli: empty stdin is refused the same way"
+  else
+    bad "cli: empty stdin refusals differ" "rust=[$empty_rust] ziman=[$empty_zim]"
+  fi
 else
   echo "  SKIP cli checks: $ZCLI is not executable"
 fi

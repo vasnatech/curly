@@ -512,6 +512,132 @@ PYJSON
   run_both "a later run substitutes what an earlier one extracted" api/uses-token
 fi
 
+# ---- empty-state messages -----------------------------------------------------------------------
+#
+# **Every list command's "nothing here yet" line, compared against an empty root.** These were
+# never checked before, because the sample tree always has collections, environments and scenarios
+# in it -- and two of them were wrong: `scenario list`'s message, and `scenario show`'s
+# `  (no imports)` line for an import-less scenario. Both found by reading the Rust source rather
+# than by the harness, which is exactly the gap this section closes.
+
+if [ -x "$ZCLI" ]; then
+  empty="$work/empty"
+  mkdir -p "$empty"
+  empty_both() {
+    local label="$1"; shift
+    local a b
+    a="$("$RUST" "$@" --data-dir "$empty" 2>&1)" || true
+    b="$(ZIMAN="$ZIMAN" "$ZCLI" "$@" --data-dir "$empty" 2>&1)" || true
+    if [ "$a" = "$b" ]; then
+      ok "empty: $label"
+    else
+      bad "empty: $label" "rust=[$a] ziman=[$b]"
+    fi
+  }
+  empty_both "collections list" collections list
+  empty_both "env list" env list
+  empty_both "scenario list" scenario list
+  empty_both "session show" session show
+  empty_both "history" history
+
+  # An import-less scenario, written by hand since no command creates one.
+  mkdir -p "$empty/scenarios"
+  cat > "$empty/scenarios/bare.json" <<'JSON'
+{ "name": "bare", "requests": { "type": "sequence", "items": [{ "request": "x" }] } }
+JSON
+  empty_both "scenario show with no imports" scenario show bare
+fi
+
+# ---- whole scenario runs ------------------------------------------------------------------------
+#
+# **The check this harness was built for.** Everything before it compares stored shapes or one
+# request; this runs a multi-step scenario through both implementations against one stub and diffs
+# the step log, the extractions, and the final verdict. If these agree, the two implementations
+# orchestrate identically.
+
+if [ -x "$ZCLI" ]; then
+  sc_tmpl="$work/scen-template"
+  mkdir -p "$sc_tmpl/scenarios"
+  "$RUST" collections add-request api ok "$OSB/plain" --data-dir "$sc_tmpl" >/dev/null 2>&1
+  "$RUST" collections add-request api token "$OSB/token" --data-dir "$sc_tmpl" >/dev/null 2>&1
+  "$RUST" collections add-request api uses "$OSB/echo?t={{TOKEN}}" --data-dir "$sc_tmpl" >/dev/null 2>&1
+  "$RUST" collections add-request api boom "$OSB/boom" --data-dir "$sc_tmpl" >/dev/null 2>&1
+  python3 -I - "$sc_tmpl/collections/api.json" <<'PYJSON'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+for r in d["requests"]:
+    if r["name"] == "token":
+        r["extract"] = [{"source": "body", "name": "TOKEN", "path": "token", "secret": False}]
+json.dump(d, open(p, "w"), indent=2)
+PYJSON
+
+  write_scenario() {
+    cat > "$sc_tmpl/scenarios/$1.json"
+  }
+  write_scenario happy <<'JSON'
+{ "name": "happy", "imports": { "default": "api" },
+  "requests": { "type": "sequence", "items": [{ "request": "ok" }, { "request": "token" }, { "request": "uses" }] } }
+JSON
+  write_scenario halts <<'JSON'
+{ "name": "halts", "imports": { "default": "api" },
+  "requests": { "type": "sequence", "items": [{ "request": "ok" }, { "request": "boom" }, { "request": "ok" }] } }
+JSON
+  write_scenario handled <<'JSON'
+{ "name": "handled", "imports": { "default": "api" },
+  "requests": { "type": "sequence", "items": [
+    { "request": "boom" },
+    { "choice": { "cases": [{ "when": { "status": { "eq": 500 } }, "then": { "request": "ok" } }] } }
+  ] } }
+JSON
+  write_scenario unmatched <<'JSON'
+{ "name": "unmatched", "imports": { "default": "api" },
+  "requests": { "type": "sequence", "items": [
+    { "request": "ok" },
+    { "choice": { "cases": [{ "when": { "status": { "eq": 404 } }, "then": { "request": "ok" } }] } }
+  ] } }
+JSON
+  write_scenario parallel <<'JSON'
+{ "name": "parallel", "imports": { "default": "api" },
+  "requests": { "type": "sequence", "items": [
+    { "requests": { "type": "parallel", "items": [{ "request": "ok" }, { "request": "boom" }] } },
+    { "choice": { "cases": [{ "when": { "status": { "eq": 500 } }, "then": { "request": "ok" } }] } }
+  ] } }
+JSON
+
+  sr_root="$work/scen-rust"
+  sz_root="$work/scen-ziman"
+  cp -r "$sc_tmpl" "$sr_root"
+  cp -r "$sc_tmpl" "$sz_root"
+
+  scenario_both() {
+    local label="$1"; shift
+    local a b
+    a="$("$RUST" scenario run "$@" --data-dir "$sr_root" 2>&1 | os_normalise | sed "s|$sr_root|<root>|g")" || true
+    b="$(ZIMAN="$ZIMAN" "$ZCLI" scenario run "$@" --data-dir "$sz_root" 2>&1 | os_normalise | sed "s|$sz_root|<root>|g")" || true
+    if [ "$a" = "$b" ]; then
+      ok "scenario run: $label"
+    else
+      bad "scenario run: $label" "$(diff <(echo "$a") <(echo "$b") | head -8 | tr '\n' '|')"
+    fi
+  }
+
+  scenario_both "a sequence that completes, with an extraction feeding the next step" happy
+  scenario_both "an unhandled failure halts and names the request" halts
+  scenario_both "a failure handled by a following choice completes" handled
+  scenario_both "a choice matching nothing with no default halts" unmatched
+  scenario_both "a parallel block's failure handled by a following choice" parallel
+
+  # A refusal, first line only -- `anyhow`'s `Caused by:` paragraph again.
+  a_out="$("$RUST" scenario run no-such-scenario --data-dir "$sr_root" 2>&1 | head -1 | sed "s|$sr_root|<root>|g")" || true
+  b_out="$(ZIMAN="$ZIMAN" "$ZCLI" scenario run no-such-scenario --data-dir "$sz_root" 2>&1 | head -1 | sed "s|$sz_root|<root>|g")" || true
+  if [ "$a_out" = "$b_out" ]; then
+    ok "scenario run: a scenario that does not exist"
+  else
+    bad "scenario run: a scenario that does not exist" "rust=[$a_out] ziman=[$b_out]"
+  fi
+fi
+
 # ---- the slug -----------------------------------------------------------------------------------
 #
 # Both sides turn a display name into the same filename, or `load` misses what `save` wrote.

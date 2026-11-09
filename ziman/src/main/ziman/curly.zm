@@ -50,6 +50,9 @@ fn flags_for(command: string, action: string) -> [string] {
     if command == "session" {
         return concat(global_values, ["--env"])
     }
+    if command == "scenario" && action == "run" {
+        return concat(global_values, ["--env", "--var"])
+    }
     if command == "history" {
         return concat(global_values, ["--limit"])
     }

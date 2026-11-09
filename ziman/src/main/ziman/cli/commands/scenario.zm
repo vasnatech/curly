@@ -3,7 +3,13 @@
 // **There is no `add` or `edit`**, deliberately: authoring a scenario is JSON-only, so a
 // `.curly/scenarios/<name>.json` is hand-edited. That decision is the project's, not this port's.
 use cli/args.Parsed
+use cli/args.all_of
+use cli/args.pad_right
+use cli/args.parse_assignment
+use cli/args.value_of
+use core/model.Pair
 use core/scenario.Scenario
+use core/scenario_run.run as execute_scenario
 use core/storage.Storage
 use core/storage.delete_scenario
 use core/storage.list_scenarios
@@ -13,7 +19,7 @@ pub fn run(action: string, rest: Parsed, store: Storage) -> Result<unit, string>
     if action == "list" {
         val names = try list_scenarios(store)
         if len(names) == 0 {
-            print("no scenarios yet — add one as .curly/scenarios/<name>.json")
+            print("no scenarios yet — create one at .curly/scenarios/<name>.json (see docs/ROADMAP.md)")
             return ok(unit)
         }
         for name in names {
@@ -28,6 +34,9 @@ pub fn run(action: string, rest: Parsed, store: Storage) -> Result<unit, string>
         val scenario = try load_scenario(store, rest.positionals[0])
         show(scenario)
         return ok(unit)
+    }
+    if action == "run" {
+        return run_scenario(rest, store)
     }
     if action == "delete" {
         if len(rest.positionals) == 0 {
@@ -45,12 +54,70 @@ pub fn run(action: string, rest: Parsed, store: Storage) -> Result<unit, string>
 // it -- and Ziman's `Map` keeps insertion order, which for a parsed file is the file's own.
 fn show(s: Scenario) {
     print(s.name)
-    val aliases = mutable_array_new<string>()
-    for alias in keys(s.imports) {
-        push(aliases, alias)
-    }
-    for alias in sort(snapshot(aliases)) {
-        print(prelude.format("  {} -> {}", alias, get_or(s.imports, alias, "")))
+    if len(s.imports) == 0 {
+        // A scenario with no imports can still be valid -- every reference would have to name an
+        // alias, so it would always fail -- but it has to say something rather than nothing.
+        print("  (no imports)")
+    } else {
+        val aliases = mutable_array_new<string>()
+        for alias in keys(s.imports) {
+            push(aliases, alias)
+        }
+        for alias in sort(snapshot(aliases)) {
+            print(prelude.format("  {} -> {}", alias, get_or(s.imports, alias, "")))
+        }
     }
     print(prelude.format("  {} top-level step(s)", str(len(s.requests.items))))
+}
+
+// `curly scenario run <name> [--env E] [--var K=V]...`
+//
+// **The step log is a flat back-to-back list**, one line per request node in the order it
+// completed, with the extractions that fired under it. Rust's own comment calls this a first pass
+// rather than a settled output format, so it is copied exactly rather than improved: a prettier log
+// here would be a difference nobody asked for.
+pub fn run_scenario(rest: Parsed, store: Storage) -> Result<unit, string> {
+    if len(rest.positionals) == 0 {
+        return err("usage: curly scenario run <name>")
+    }
+    val name = rest.positionals[0]
+    val scenario = try load_scenario(store, name)
+    val overrides = mutable_array_new<Pair>()
+    for raw in all_of(rest, "var") {
+        val pair = try parse_assignment(raw, "--var")
+        push(overrides, Pair { name: pair.key, value: pair.value })
+    }
+    val outcome = try execute_scenario(scenario, store, value_of(rest, "env"), snapshot(overrides))
+
+    for step in outcome.steps {
+        switch step.status {
+            Some(status) { print(prelude.format("{} {} -> {}", pad_right(step.method, 7), step.url, str(status))) }
+            None {
+                print(prelude.format(
+                    "{} {} -> (no response: {})",
+                    pad_right(step.method, 7),
+                    step.url,
+                    switch step.error {
+                        Some(why) { why }
+                        None { "?" }
+                    }
+                ))
+            }
+        }
+        if len(step.extracted) != 0 {
+            print(concat("  ~ extracted ", join(separator: ", ", pieces: step.extracted)))
+        }
+    }
+
+    return switch outcome.outcome {
+        Ok {
+            print(prelude.format("scenario \"{}\" completed", name))
+            ok(unit)
+        }
+        // **Only reachable if the top-level container returned it directly**, which it does not:
+        // a sequence or a parallel block always resolves an unforgiven failure into a halt. Kept so
+        // the match is exhaustive without a wildcard hiding a real variant -- Rust's reason too.
+        HttpFailure { err(prelude.format("scenario \"{}\" ended with an unhandled HTTP failure", name)) }
+        Halted(reason) { err(prelude.format("scenario \"{}\" halted: {}", name, reason)) }
+    }
 }

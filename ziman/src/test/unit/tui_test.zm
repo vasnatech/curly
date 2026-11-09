@@ -1,0 +1,309 @@
+// The UI's two pure halves: the tree flattening and the frame.
+//
+// **Both are pure so that this file can exist.** `tui/app.zm` reads keys and writes bytes and needs
+// a terminal; `tui/rows.zm` and `tui/render.zm` take values and answer values, so what the user
+// would see is an assertion rather than something to squint at. That split is the one
+// `lib/core/terminal.zm` made for its own escape-sequence table, for the same reason.
+use core/saved.Collection
+use core/saved.Folder
+use core/saved.SavedRequest
+use terminal
+use test
+use tui/render
+use tui/render.Pane
+use tui/render.Screen
+use tui/rows
+use tui/rows.Row
+use tui/rows.row_key
+use uuid.uuid_new
+
+fn request_of(name: string, method: string) -> SavedRequest {
+    return SavedRequest {
+        id: uuid_new(),
+        name: name,
+        method: method,
+        url: concat("https://example.com/", name),
+        query_params: [],
+        headers: [],
+        body: None,
+        auth: None,
+        extract: []
+    }
+}
+
+fn folder_of(name: string, folders: [Folder], requests: [SavedRequest]) -> Folder {
+    return Folder { id: uuid_new(), name: name, folders: folders, requests: requests }
+}
+
+// One collection, two levels deep, with a request at the root as well as inside folders --
+// the shape that catches a flattener that forgets either.
+fn sample() -> [Collection] {
+    return [Collection {
+        id: uuid_new(),
+        name: "Api",
+        folders: [
+            folder_of(
+                "Auth",
+                [folder_of("OAuth", [], [request_of("refresh", "POST")])],
+                [request_of("login", "POST")]
+            )
+        ],
+        requests: [request_of("health", "GET")]
+    }]
+}
+
+fn labels_of(found: [Row]) -> [string] {
+    val out = mutable_array_new<string>()
+    for row in found {
+        push(out, prelude.format("{}:{}", str(row.depth), row.label))
+    }
+    return snapshot(out)
+}
+
+// ---------------------------------------------------------------- flattening
+
+#[test]
+fn a_collapsed_collection_is_one_row() {
+    val found = rows.rows_of(sample(), snapshot(mutable_set_new<string>()))
+    test.assert_eq(["0:Api"], labels_of(found))
+    // Expandable, because it has children -- the marker the renderer draws depends on it.
+    test.assert(found[0].expandable)
+}
+
+#[test]
+fn expanding_a_collection_shows_its_folders_then_its_requests() {
+    // **Folders before requests**, matching `collections show`. The two views of one tree
+    // disagreeing about order would be its own small bug.
+    val found = rows.rows_of(sample(), rows.all_collections_expanded(sample()))
+    test.assert_eq(["0:Api", "1:Auth", "1:health"], labels_of(found))
+}
+
+#[test]
+fn a_nested_folder_opens_only_when_its_own_key_is_expanded() {
+    val expanded = mutable_set_new<string>()
+    add(expanded, "Api")
+    add(expanded, concat("Api", concat("\t", "Auth")))
+    val found = rows.rows_of(sample(), snapshot(expanded))
+    // `OAuth` appears but stays shut: its children need its own key.
+    test.assert_eq(["0:Api", "1:Auth", "2:OAuth", "2:login", "1:health"], labels_of(found))
+}
+
+#[test]
+fn a_fully_expanded_tree_reaches_the_deepest_request() {
+    val expanded = mutable_set_new<string>()
+    add(expanded, "Api")
+    add(expanded, concat("Api", concat("\t", "Auth")))
+    add(expanded, concat("Api", concat("\t", "Auth/OAuth")))
+    val found = rows.rows_of(sample(), snapshot(expanded))
+    test.assert_eq(
+        ["0:Api", "1:Auth", "2:OAuth", "3:refresh", "2:login", "1:health"],
+        labels_of(found)
+    )
+}
+
+#[test]
+fn a_request_path_is_the_address_find_request_takes() {
+    // **No leading slash**, which is the thing that would silently make every send fail to find
+    // its request: `core/collection.find_request` is given `Auth/OAuth/refresh`.
+    val expanded = mutable_set_new<string>()
+    add(expanded, "Api")
+    add(expanded, concat("Api", concat("\t", "Auth")))
+    add(expanded, concat("Api", concat("\t", "Auth/OAuth")))
+    val found = rows.rows_of(sample(), snapshot(expanded))
+    test.assert_eq("Auth/OAuth/refresh", found[3].path)
+    test.assert_eq("health", found[5].path)
+}
+
+#[test]
+fn the_expansion_key_separates_two_collections_with_the_same_path() {
+    // Two collections very often both have an `Auth/login`; a key that was the path alone would
+    // open both folders at once.
+    val one = rows.rows_of(sample(), rows.all_collections_expanded(sample()))[1]
+    val other = with one { collection: "Other" }
+    test.assert_ne(row_key(one), row_key(other))
+    // A collection's own key is its name, with no separator.
+    test.assert_eq("Api", row_key(rows.rows_of(sample(), snapshot(mutable_set_new<string>()))[0]))
+}
+
+#[test]
+fn an_empty_collection_is_not_expandable() {
+    val empty = [Collection { id: uuid_new(), name: "Empty", folders: [], requests: [] }]
+    val found = rows.rows_of(empty, rows.all_collections_expanded(empty))
+    test.assert_len(1, found)
+    test.assert_false(found[0].expandable)
+}
+
+// ---------------------------------------------------------------- scrolling
+
+#[test]
+fn a_list_that_fits_never_scrolls() {
+    test.assert_eq(0, render.first_visible(0, 5, 10))
+    test.assert_eq(0, render.first_visible(4, 5, 10))
+}
+
+#[test]
+fn the_selection_is_pinned_to_an_edge_rather_than_re_centred() {
+    // Re-centring makes the whole list jump when the user moves one row, which reads as the list
+    // moving rather than the cursor. So moving down past the margin scrolls by exactly one.
+    test.assert_eq(0, render.first_visible(3, 20, 6))
+    test.assert_eq(1, render.first_visible(5, 20, 6))
+    test.assert_eq(2, render.first_visible(6, 20, 6))
+}
+
+#[test]
+fn scrolling_stops_at_the_end_of_the_list() {
+    // The last row visible with no blank lines under it: a window that scrolled past the end would
+    // show empty space below a list the user has not finished reading.
+    test.assert_eq(14, render.first_visible(19, 20, 6))
+}
+
+#[test]
+fn the_pane_is_bounded_on_both_sides() {
+    // Unbounded on a tall terminal leaves the tree a sliver; proportional on a short one leaves it
+    // nothing.
+    test.assert_eq(3, render.pane_lines(terminal.Size { rows: 6, cols: 80 }))
+    test.assert_eq(8, render.pane_lines(terminal.Size { rows: 24, cols: 80 }))
+    test.assert_eq(12, render.pane_lines(terminal.Size { rows: 100, cols: 80 }))
+}
+
+#[test]
+fn the_tree_keeps_at_least_one_line_on_an_absurdly_short_terminal() {
+    // A height of zero or less would make `first_visible` and the row loop meaningless.
+    val tiny = terminal.Size { rows: 1, cols: 10 }
+    test.assert_eq(1, render.tree_height(tiny, render.pane_lines(tiny)))
+}
+
+// ---------------------------------------------------------------- the pane
+
+fn screen_with(pane: Pane) -> Screen {
+    val collections = sample()
+    return Screen {
+        rows: rows.rows_of(collections, rows.all_collections_expanded(collections)),
+        selected: 0,
+        expanded: rows.all_collections_expanded(collections),
+        env_name: None,
+        pane: pane,
+        size: terminal.Size { rows: 24, cols: 80 },
+        status: ""
+    }
+}
+
+#[test]
+fn the_pane_tells_empty_from_sending() {
+    // **Three states, not two.** "nothing yet" and "in flight" look the same to a renderer that
+    // only knows about responses, and the difference is the only feedback during a slow request.
+    test.assert_contains(render.pane_body(screen_with(Pane.Empty))[0], "press enter")
+    test.assert_contains(render.pane_body(screen_with(Pane.Sending("GET a")))[0], "sending GET a")
+    test.assert_contains(render.pane_body(screen_with(Pane.Failed("no route")))[0], "failed: no route")
+}
+
+// ---------------------------------------------------------------- the frame
+
+#[test]
+fn the_frame_is_one_string_that_starts_by_clearing_and_ends_reset() {
+    // One write per frame is what makes a paint look instantaneous, and an unreset frame would
+    // leave the user's shell styled.
+    val frame = render.frame(screen_with(Pane.Empty))
+    test.assert_starts_with(frame, terminal.clear_screen())
+    test.assert_ends_with(frame, terminal.reset_style())
+}
+
+#[test]
+fn the_selected_row_is_drawn_in_reverse_and_only_that_row() {
+    // Reverse video rather than a colour: a colour might clash with the user's theme or be
+    // invisible in it, where reverse is the user's own two colours swapped.
+    val frame = render.frame(screen_with(Pane.Empty))
+    test.assert_contains(frame, terminal.reverse())
+    // One selection, so one reverse sequence.
+    test.assert_eq(1, occurrences(frame, terminal.reverse()))
+}
+
+fn occurrences(haystack: string, needle: string) -> int {
+    var count = 0
+    var from = 0
+    while true {
+        val at = index_of(haystack, needle, from)
+        if at < 0 {
+            return count
+        }
+        count = count + 1
+        from = at + len(needle)
+    }
+    return count
+}
+
+#[test]
+fn the_frame_never_exceeds_the_window_it_was_given() {
+    // A row written past the last column wraps and pushes the rest of the frame down by a line,
+    // which corrupts every position after it. Narrow window, long labels.
+    // **Labels long enough to overflow**, which the short sample is not: with `Api`/`Auth`/`health`
+    // every row fits twenty columns even untruncated, so this test passed either way until the
+    // names got long. A test that cannot fail is worse than no test.
+    val collections = [Collection {
+        id: uuid_new(),
+        name: "a-collection-name-far-longer-than-twenty-columns",
+        folders: [folder_of(
+            "a-folder-name-also-far-longer-than-twenty-columns",
+            [],
+            [request_of("a-request-name-that-is-likewise-much-too-long", "PROPFIND")]
+        )],
+        requests: [request_of("another-very-long-request-name-at-the-root", "GET")]
+    }]
+    val expanded = mutable_set_new<string>()
+    add(expanded, "a-collection-name-far-longer-than-twenty-columns")
+    add(expanded, concat(
+        "a-collection-name-far-longer-than-twenty-columns",
+        concat("\t", "a-folder-name-also-far-longer-than-twenty-columns")
+    ))
+    val narrow = Screen {
+        rows: rows.rows_of(collections, snapshot(expanded)),
+        selected: 0,
+        expanded: snapshot(expanded),
+        env_name: Some("staging"),
+        pane: Pane.Failed("a refusal far longer than the twenty columns this window has"),
+        size: terminal.Size { rows: 10, cols: 20 },
+        status: "a status line that is also much too long for twenty columns"
+    }
+    // **Split on the cursor moves, not on newlines**: the frame contains no newlines at all -- it
+    // positions each line with `at(row, 1)` -- so splitting on "\n" measures the whole frame as one
+    // line and the assertion means nothing. This is the mistake this test made first, and it hid
+    // the real defect it was written to catch (rows were not truncated).
+    for segment in split(render.frame(narrow), concat(escape_char(), "[")) {
+        test.assert_le(len(visible_text(concat(escape_char(), concat("[", segment)))), 20)
+    }
+}
+
+// The printable characters of a frame segment, with the escape sequences removed -- what actually
+// occupies columns.
+fn visible_text(line: string) -> string {
+    val out = mutable_string_new()
+    var i = 0
+    while i < len(line) {
+        val ch = substring(line, i, i + 1)
+        if ch != escape_char() {
+            append(out, ch)
+            i = i + 1
+            continue
+        }
+        // Skip to the sequence's final byte, which for CSI is in the `@`-`~` range.
+        i = i + 1
+        if i < len(line) && substring(line, i, i + 1) == "[" {
+            i = i + 1
+            while i < len(line) {
+                val c = substring(line, i, i + 1)
+                i = i + 1
+                if c >= "@" && c <= "~" {
+                    break
+                }
+            }
+        }
+    }
+    return snapshot(out)
+}
+
+fn escape_char() -> string {
+    return switch bytes_to_string([27b]) {
+        Ok(text) { text }
+        Err(_) { "" }
+    }
+}

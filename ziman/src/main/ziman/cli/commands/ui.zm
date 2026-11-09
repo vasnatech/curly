@@ -1,0 +1,26 @@
+// `curly ui` -- the terminal interface, and `curly gui`, which says where the graphical one went.
+//
+// **Two different answers to two different questions**, which is why they are in one file. The
+// graphical application was never part of this binary and still is not; the terminal one now is.
+use core/storage.Storage
+use tui/app
+
+pub fn run(store: Storage) -> Result<unit, string> {
+    return app.run(store)
+}
+
+// **Kept word for word from the Rust CLI's `gui_moved`.** `curly gui` used to launch a bundled egui
+// window; that application is gone and the message is the contract a user who types the old command
+// meets. It was in ziman's subcommand list with no handler until 2026-11-09, so it answered
+// "unrecognised command: gui" with status 2 where Rust answers this with status 1 -- a parity gap
+// nothing in the harness looked at, because nothing compared a command that only prints a refusal.
+//
+// **`ui` is deliberately not the same command.** The terminal interface is this implementation's
+// own, and pointing `gui` at it would tell a user who asked for a window that they got one.
+pub fn gui_moved() -> Result<unit, string> {
+    return err(
+        // The em-dash is literal, matching Rust byte for byte. Ziman has no `\u` escape, but a string
+        // literal holds UTF-8 directly, so the character itself is the way to write it.
+        "the graphical interface is a separate application and is not part of this binary — see docs/GUI.md for how to run it"
+    )
+}

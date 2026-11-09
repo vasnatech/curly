@@ -1,0 +1,302 @@
+// **Rows plus state, into one frame.** Pure, and that is the point: a frame is a string, so a test
+// asserts what the user would see rather than driving a terminal and squinting.
+//
+// One write per frame is what makes a paint look instantaneous (see `lib/core/terminal.zm`'s
+// painting helpers), so everything here composes and nothing writes.
+use core/exec.ResponseSummary
+use terminal
+use tui/rows.Row
+use tui/rows.RowKind
+use tui/rows.row_key
+
+// What the bottom pane is showing. **Three states, not two**: "nothing yet" and "sending" look the
+// same to a renderer that only knows about responses, and the difference is the only feedback a
+// user gets while a request is in flight.
+pub enum Pane {
+    Empty
+    Sending(string)
+    Answered(ResponseSummary)
+    Failed(string)
+}
+
+pub struct Screen {
+    rows: [Row]
+    selected: int
+    expanded: Set<string>
+    // The environment whose variables a send resolves against, or `None` for `global` only.
+    env_name: Option<string>
+    pane: Pane
+    size: terminal.Size
+    // A one-line message under the footer: what just happened, or what went wrong.
+    status: string
+}
+
+// How many lines the bottom pane and the chrome take, so the tree knows its own height.
+val header_lines = 2
+val footer_lines = 3
+
+// **The visible window of the tree, scrolled to keep the selection in view.** Returned as the first
+// row index rather than as a slice, because the renderer needs the absolute index to know which row
+// is selected.
+//
+// Scrolls by the minimum that works: the selection is pinned to the top or the bottom edge, never
+// re-centred. Re-centring makes the whole list jump when the user moves one row, which reads as the
+// list moving rather than the cursor.
+pub fn first_visible(selected: int, total: int, height: int) -> int {
+    if height <= 0 || total <= height {
+        return 0
+    }
+    // Keep the selection at least this far from an edge where there is room, so the user can see
+    // what is coming.
+    val margin = 1
+    var first = 0
+    if selected > height - 1 - margin {
+        first = selected - (height - 1 - margin)
+    }
+    if first > total - height {
+        first = total - height
+    }
+    if first < 0 {
+        first = 0
+    }
+    return first
+}
+
+// The number of tree lines this window has room for.
+pub fn tree_height(size: terminal.Size, pane_lines: int) -> int {
+    val height = size.rows - header_lines - footer_lines - pane_lines
+    if height < 1 {
+        return 1
+    }
+    return height
+}
+
+// How many lines the bottom pane gets: a third of the window, at least 3 and at most 12. **Bounded
+// both ways**: an unbounded pane on a tall terminal leaves the tree a sliver, and a proportional
+// one on a short terminal leaves it nothing.
+pub fn pane_lines(size: terminal.Size) -> int {
+    val third = size.rows / 3
+    if third < 3 {
+        return 3
+    }
+    if third > 12 {
+        return 12
+    }
+    return third
+}
+
+// The whole frame, ready for one `os.write_stdout`.
+pub fn frame(screen: Screen) -> string {
+    val out = mutable_string_new()
+    append(out, terminal.clear_screen())
+    val body = pane_lines(screen.size)
+    val height = tree_height(screen.size, body)
+    val first = first_visible(screen.selected, len(screen.rows), height)
+
+    append(out, terminal.at(1, 1))
+    append(out, header(screen))
+
+    var line = header_lines + 1
+    for i in first..min_of(first + height, len(screen.rows)) {
+        append(out, terminal.at(line, 1))
+        append(out, row_text(screen.rows[i], i == screen.selected, screen.expanded, screen.size.cols))
+        line = line + 1
+    }
+
+    // The divider sits at a fixed line so the pane does not move as the tree grows or shrinks.
+    val divider_line = header_lines + height + 1
+    append(out, terminal.at(divider_line, 1))
+    append(
+        out,
+        concat(terminal.dim(), concat(truncate(rule(screen.size.cols), screen.size.cols), terminal.reset_style()))
+    )
+
+    append(out, pane_text(screen, divider_line + 1, body))
+
+    append(out, terminal.at(screen.size.rows - 1, 1))
+    append(out, footer(screen))
+    append(out, terminal.at(screen.size.rows, 1))
+    append(out, concat(terminal.clear_to_line_end(), truncate(screen.status, screen.size.cols)))
+    // The cursor parks at the end of the status line rather than in the middle of the tree, where
+    // it would sit on top of a row even with the cursor hidden on terminals that ignore that.
+    append(out, terminal.reset_style())
+    return snapshot(out)
+}
+
+fn min_of(a: int, b: int) -> int {
+    if a < b {
+        return a
+    }
+    return b
+}
+
+fn header(screen: Screen) -> string {
+    val env = switch screen.env_name {
+        Some(name) { name }
+        None { "global" }
+    }
+    return concat(
+        terminal.bold(),
+        concat(
+            "  curly",
+            concat(
+                terminal.reset_style(),
+                concat(terminal.dim(), concat(concat("  env: ", env), terminal.reset_style()))
+            )
+        )
+    )
+}
+
+// **The selected row is drawn in reverse rather than in a colour.** A colour might clash with the
+// user's theme or be invisible in it; reverse video is the user's own two colours, swapped.
+//
+// **The text is built plain, truncated, and only then styled** -- which is the order that matters,
+// and the one this got wrong at first. A row written past the last column wraps, and a wrapped row
+// pushes every later line of the frame down by one, so a single long request name corrupts the
+// whole screen. Truncating after styling would have counted the escape sequences as width and cut
+// short rows for no reason; truncating before means the styles wrap exactly what is shown.
+fn row_text(row: Row, selected: bool, expanded: Set<string>, cols: int) -> string {
+    val marker = if !row.expandable {
+        "  "
+    } else {
+        if contains(expanded, row_key(row)) { "- " } else { "+ " }
+    }
+    val body = switch row.kind {
+        CollectionRow { row.label }
+        FolderRow { concat(row.label, "/") }
+        RequestRow { concat(pad(row.method, 7), concat(" ", row.label)) }
+    }
+    val text = truncate(concat(spaces(2 + row.depth * 2), concat(marker, body)), cols)
+    // A collection is the heading of its subtree, so it is bold -- unless it is also selected,
+    // where reverse already distinguishes it and bold on top reads as noise.
+    val styled = if selected {
+        concat(terminal.reverse(), concat(text, terminal.reset_style()))
+    } else {
+        if is_collection(row) {
+            concat(terminal.bold(), concat(text, terminal.reset_style()))
+        } else {
+            text
+        }
+    }
+    return concat(terminal.clear_to_line_end(), styled)
+}
+
+fn is_collection(row: Row) -> bool {
+    return switch row.kind {
+        CollectionRow { true }
+        FolderRow { false }
+        RequestRow { false }
+    }
+}
+
+// The bottom pane: the response, or what is happening instead.
+fn pane_text(screen: Screen, from_line: int, lines: int) -> string {
+    val out = mutable_string_new()
+    val shown = pane_body(screen)
+    for i in 0..lines {
+        append(out, terminal.at(from_line + i, 1))
+        append(out, terminal.clear_to_line_end())
+        if i < len(shown) {
+            append(out, truncate(shown[i], screen.size.cols))
+        }
+    }
+    return snapshot(out)
+}
+
+// The pane's lines, before truncation. Separate from `pane_text` so a test can assert the content
+// without the escape sequences around it.
+pub fn pane_body(screen: Screen) -> [string] {
+    return switch screen.pane {
+        Empty { ["  select a request and press enter"] }
+        Sending(what) { [concat("  sending ", what, " ...")] }
+        Failed(why) { [concat("  failed: ", why)] }
+        Answered(response) { answered_lines(response) }
+    }
+}
+
+fn answered_lines(response: ResponseSummary) -> [string] {
+    val out = mutable_array_new<string>()
+    push(out, prelude.format(
+        "  {} {}  {} ms  {}",
+        str(response.status),
+        status_word(response.status),
+        str(response.elapsed_millis),
+        content_type_of(response)
+    ))
+    // The body a line at a time, as it came. **Not re-wrapped**: a JSON body is one long line and
+    // wrapping it would hide the start of the next field behind the end of the last.
+    for line in split(replace(response.body, "\r\n", "\n"), "\n") {
+        push(out, concat("  ", line))
+    }
+    return snapshot(out)
+}
+
+fn content_type_of(response: ResponseSummary) -> string {
+    for header in response.headers {
+        if to_lower(header.name) == "content-type" {
+            return header.value
+        }
+    }
+    return "(no content-type)"
+}
+
+// The reason phrase is not taken from the response: `client` does not carry one, and inventing a
+// phrase per code is a table that goes stale. These are the five classes a user reads at a glance.
+fn status_word(status: int) -> string {
+    if status >= 200 && status < 300 {
+        return "OK"
+    }
+    if status >= 300 && status < 400 {
+        return "redirect"
+    }
+    if status >= 400 && status < 500 {
+        return "client error"
+    }
+    if status >= 500 {
+        return "server error"
+    }
+    return ""
+}
+
+fn footer(screen: Screen) -> string {
+    val keys = "  up/down move   enter send   space expand   e env   r reload   q quit"
+    return concat(
+        terminal.clear_to_line_end(),
+        concat(terminal.dim(), concat(truncate(keys, screen.size.cols), terminal.reset_style()))
+    )
+}
+
+fn rule(cols: int) -> string {
+    val out = mutable_string_new()
+    for _ in 0..cols {
+        append(out, "-")
+    }
+    return snapshot(out)
+}
+
+fn spaces(n: int) -> string {
+    val out = mutable_string_new()
+    for _ in 0..n {
+        append(out, " ")
+    }
+    return snapshot(out)
+}
+
+fn pad(text: string, width: int) -> string {
+    if len(text) >= width {
+        return text
+    }
+    return concat(text, spaces(width - len(text)))
+}
+
+// **Truncated by characters, not bytes**, so a multi-byte character is never cut in half -- which
+// would put an invalid sequence on the terminal and corrupt the rest of the line.
+fn truncate(text: string, cols: int) -> string {
+    if cols <= 0 {
+        return ""
+    }
+    if len(text) <= cols {
+        return text
+    }
+    return substring(text, 0, cols)
+}

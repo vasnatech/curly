@@ -243,6 +243,14 @@ else
   bad "the rust side could not import the curl command" "$(head -2 "$work/cl.err" 2>/dev/null | tr '\n' ' ')"
 fi
 
+# **One deliberate divergence, recorded here so it is a decision and not a gap**: `curly ui` is the
+# Ziman implementation's terminal interface and the Rust CLI has no such command. The project's
+# direction is that Ziman replaces Rust, so a capability only the replacement has is expected -- but
+# an unrecorded one is indistinguishable from an oversight, which is what this comment is for.
+# `gui` is compared above and must stay identical: it is about the *graphical* application, which
+# neither binary contains, and pointing it at the terminal UI would tell a user who asked for a
+# window that they got one.
+
 # ---- the CLI's own output ------------------------------------------------------------------------
 #
 # Every read-only command, run through both binaries against the same tree, diffed line for line.
@@ -297,6 +305,11 @@ if [ -x "$ZCLI" ]; then
   cli_refusal_both "env show, missing" env show no-such-env
   cli_refusal_both "scenario show, missing" scenario show no-such-scenario
   cli_refusal_both "env unset, no such variable" env unset global NO_SUCH_KEY
+  # **`gui` is in both implementations' subcommand lists and prints only a refusal**, which is
+  # exactly the shape nothing here was comparing: the ziman side had the word in its list and no
+  # branch for it, so it answered "unrecognised command: gui" with status 2 where rust answers its
+  # own sentence with status 1. Found 2026-11-09, while adding `ui`.
+  cli_refusal_both "gui, which moved out of the binary" gui
 
   # Round-tripping through the writing commands, then reading back with the *other* binary --
   # which is the real test of "these two share a storage root".

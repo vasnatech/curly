@@ -1,0 +1,339 @@
+// **The loop: the only part of the UI that is not a pure function.** It reads keys, sends requests
+// and writes frames; `tui/rows.zm` decides what is on screen and `tui/render.zm` turns that into
+// one string, and both are testable with no terminal attached.
+//
+// That split is the lesson `lib/core/terminal.zm` learned about itself (its escape-sequence table
+// is pure for the same reason) and it is why this file is the short one.
+use clock
+use core/collection.find_request
+use core/exec
+use core/exec.ResponseSummary
+use core/extraction.apply
+use core/saved.Collection
+use core/saved.environment_set
+use core/saved.into_request
+use core/saved.resolve as resolve_request
+use core/scenario_run.merged_variables
+use core/storage.Storage
+use core/storage.append_history
+use core/storage.history_entry_of
+use core/storage.list_collections
+use core/storage.list_environments
+use core/storage.load_collection
+use core/storage.load_session
+use core/storage.save_session
+use os
+use terminal
+use tui/render
+use tui/render.Pane
+use tui/render.Screen
+use tui/rows
+use tui/rows.Row
+use tui/rows.RowKind
+use tui/rows.row_key
+
+// How long a frame waits for a key before redrawing anyway. **This is also how a resize is
+// noticed**: `terminal.size()` is polled per frame rather than delivered (decision 3.4 of
+// docs/design/terminal.md), so the only thing that makes a resize visible is the redraw this
+// timeout forces. 100 ms is below what reads as lag and far above what costs anything.
+val idle_ms = 100
+
+pub fn run(store: Storage) -> Result<unit, string> {
+    // **Refused before anything is drawn**, which is what `terminal.is_tty` is for: a TUI whose
+    // input is a pipe should say so rather than render a frame into a file.
+    if !terminal.is_tty() {
+        return err("curly ui needs a terminal (standard input is not one)")
+    }
+    val collections = try load_all(store)
+    if len(collections) == 0 {
+        return err("no collections found -- try `curly collections import` or `curly init` first")
+    }
+    // Both scopes, so the user's shell comes back exactly as they left it however this ends --
+    // including a crash and a SIGTERM, which is what makes them scopes rather than call pairs.
+    return terminal.with_screen<unit>(fn() -> Result<unit, string> {
+        return terminal.with_raw<unit>(fn() -> Result<unit, string> {
+            return loop(store, collections)
+        })
+    })
+}
+
+fn load_all(store: Storage) -> Result<[Collection], string> {
+    val names = try list_collections(store)
+    val out = mutable_array_new<Collection>()
+    for name in names {
+        push(out, try load_collection(store, name))
+    }
+    return snapshot(out)
+}
+
+fn loop(store: Storage, initial: [Collection]) -> Result<unit, string> {
+    var collections = initial
+    var expanded = rows.all_collections_expanded(collections)
+    var visible = rows.rows_of(collections, expanded)
+    var selected = 0
+    var pane = Pane.Empty
+    var status = ""
+    var env_name = Option<string>.None
+    var running = true
+    // **The last frame written, so an unchanged one is not written again.**
+    //
+    // The idle timeout fires ten times a second whether or not anything happened, and redrawing on
+    // each would be about 20 KB a second of identical bytes -- invisible locally and plainly
+    // wasteful over ssh. Comparing the composed frame is the cheap and complete test: it is one
+    // string, every input to it is in it, and **a resize changes it**, which is what keeps decision
+    // 3.4's polled resize working. Caching the inputs instead would mean listing them, and a list
+    // is a thing to forget to add to.
+    var painted = ""
+
+    while running {
+        val size = try terminal.size()
+        // Clamped every frame rather than at each move: a reload or a collapse can shorten the list
+        // under a selection that was valid a moment ago.
+        if selected >= len(visible) {
+            selected = len(visible) - 1
+        }
+        if selected < 0 {
+            selected = 0
+        }
+        val next_frame = render.frame(Screen {
+            rows: visible,
+            selected: selected,
+            expanded: expanded,
+            env_name: env_name,
+            pane: pane,
+            size: size,
+            status: status
+        })
+        if next_frame != painted {
+            os.write_stdout(next_frame)
+            painted = next_frame
+        }
+
+        val key = switch try terminal.read_key(idle_ms) {
+            Some(k) { k }
+            // Timed out: redraw, which is how a resize becomes visible.
+            None { continue }
+        }
+        val name = terminal.key_name(key)
+
+        // **Predicates, not a `switch`.** A `switch` over `Key` needs all eighteen arms (there is no
+        // default arm, by design), and this cares about seven of them -- see docs/design/terminal.md
+        // §7, which was written with a sketch that did not compile for exactly this reason.
+        if name == "q" || terminal.Key.is_Escape(key) {
+            running = false
+            continue
+        }
+        if terminal.Key.is_Up(key) || name == "k" {
+            if selected > 0 {
+                selected = selected - 1
+            }
+            status = ""
+            continue
+        }
+        if terminal.Key.is_Down(key) || name == "j" {
+            if selected < len(visible) - 1 {
+                selected = selected + 1
+            }
+            status = ""
+            continue
+        }
+        if terminal.Key.is_Home(key) {
+            selected = 0
+            continue
+        }
+        if terminal.Key.is_End(key) {
+            selected = len(visible) - 1
+            continue
+        }
+        if terminal.Key.is_PageUp(key) {
+            selected = selected - render.tree_height(size, render.pane_lines(size))
+            continue
+        }
+        if terminal.Key.is_PageDown(key) {
+            selected = selected + render.tree_height(size, render.pane_lines(size))
+            continue
+        }
+        if name == "r" {
+            // Reload from disk, so an edit made with the CLI in another window shows up without
+            // restarting. The expansion state is kept: it is keyed by name, so it survives a
+            // reload and a renamed folder simply comes back collapsed.
+            switch load_all(store) {
+                Ok(found) {
+                    collections = found
+                    visible = rows.rows_of(collections, expanded)
+                    status = prelude.format("  reloaded {} collection(s)", str(len(collections)))
+                }
+                Err(why) { status = concat("  reload failed: ", why) }
+            }
+            continue
+        }
+        if name == "e" {
+            switch next_environment(store, env_name) {
+                Ok(chosen) {
+                    env_name = chosen
+                    status = switch chosen {
+                        Some(n) { concat("  env: ", n) }
+                        None { "  env: global only" }
+                    }
+                }
+                Err(why) { status = concat("  cannot list environments: ", why) }
+            }
+            continue
+        }
+        if len(visible) == 0 {
+            continue
+        }
+        val row = visible[selected]
+        if name == " " || terminal.Key.is_Tab(key) {
+            if row.expandable {
+                expanded = toggled(expanded, row_key(row))
+                visible = rows.rows_of(collections, expanded)
+            }
+            continue
+        }
+        if terminal.Key.is_Enter(key) {
+            if !is_request(row) {
+                // A collection or folder: enter expands, which is what pressing it on a row with
+                // children should do rather than nothing.
+                if row.expandable {
+                    expanded = toggled(expanded, row_key(row))
+                    visible = rows.rows_of(collections, expanded)
+                }
+                continue
+            }
+            // **The in-flight frame is drawn before the send**, because a send blocks: without it
+            // the UI looks frozen for however long the server takes.
+            pane = Pane.Sending(concat(row.method, concat(" ", row.path)))
+            status = ""
+            val sending_frame = render.frame(Screen {
+                rows: visible,
+                selected: selected,
+                expanded: expanded,
+                env_name: env_name,
+                pane: pane,
+                size: size,
+                status: status
+            })
+            os.write_stdout(sending_frame)
+            painted = sending_frame
+            switch send_row(store, collections, row, env_name) {
+                Ok(response) {
+                    pane = Pane.Answered(response)
+                    status = ""
+                }
+                Err(why) {
+                    pane = Pane.Failed(why)
+                    status = ""
+                }
+            }
+            continue
+        }
+        // Anything else: ignored. An unknown key is not an error, and `Unknown` carrying its bytes
+        // means a terminal sending something this build does not know cannot break the loop.
+    }
+    return ok(unit)
+}
+
+fn is_request(row: Row) -> bool {
+    return switch row.kind {
+        CollectionRow { false }
+        FolderRow { false }
+        RequestRow { true }
+    }
+}
+
+fn toggled(expanded: Set<string>, key: string) -> Set<string> {
+    val out = mutable_set_new<string>()
+    for one in expanded {
+        if one != key {
+            add(out, one)
+        }
+    }
+    if !contains(expanded, key) {
+        add(out, key)
+    }
+    return snapshot(out)
+}
+
+// The next environment in the list, wrapping back to `None` (global only) after the last. **A cycle
+// rather than a picker**, because a picker is a second screen and this is a runner.
+fn next_environment(store: Storage, current: Option<string>) -> Result<Option<string>, string> {
+    val names = try list_environments(store)
+    val usable = mutable_array_new<string>()
+    for name in names {
+        // `global` is always merged in, so offering it as a selection would mean nothing.
+        if name != "global" {
+            push(usable, name)
+        }
+    }
+    val choices = snapshot(usable)
+    if len(choices) == 0 {
+        return ok(Option<string>.None)
+    }
+    val at = switch current {
+        Some(name) { index_of_name(choices, name) }
+        None { 0 - 1 }
+    }
+    if at + 1 >= len(choices) {
+        return ok(Option<string>.None)
+    }
+    return ok(Option<string>.Some(choices[at + 1]))
+}
+
+fn index_of_name(names: [string], wanted: string) -> int {
+    for i in 0..len(names) {
+        if names[i] == wanted {
+            return i
+        }
+    }
+    return 0 - 1
+}
+
+// **The same path `curly run` takes**, deliberately: resolve against the merged variables, send,
+// record history, then extract. A UI that sent requests differently from the CLI would be a second
+// implementation of the one thing this program does.
+fn send_row(
+    store: Storage,
+    collections: [Collection],
+    row: Row,
+    env_name: Option<string>
+) -> Result<ResponseSummary, string> {
+    val collection = switch find_collection(collections, row.collection) {
+        Some(found) { found }
+        None { return err(concat("collection is no longer loaded: ", row.collection)) }
+    }
+    val saved = switch find_request(collection, row.path) {
+        Some(found) { found }
+        None { return err(concat("no request at ", row.path)) }
+    }
+    val variables = try merged_variables(store, env_name, [])
+    val request = try into_request(try resolve_request(saved, variables))
+    val response = try exec.send(request)
+    // A failure to record history never fails the request: the exchange happened and the user wants
+    // the response. Same rule, and the same `val _`, as `cli/execute.zm`.
+    val _ = append_history(store, history_entry_of(request, response))
+    // **Only a 2xx is extracted from**, matching `run`: a failed login has no token to pull out,
+    // and that is an expected absence rather than a bug.
+    if response.status >= 200 && response.status < 300 && len(saved.extract) > 0 {
+        val scope = switch env_name {
+            Some(name) { name }
+            None { "global" }
+        }
+        val extracted = try apply(saved.extract, response, variables)
+        var session = try load_session(store, scope)
+        for one in extracted {
+            session = environment_set(session, one.name, one.value, one.secret)
+        }
+        try save_session(store, session)
+    }
+    return ok(response)
+}
+
+fn find_collection(collections: [Collection], name: string) -> Option<Collection> {
+    for one in collections {
+        if one.name == name {
+            return Option<Collection>.Some(one)
+        }
+    }
+    return Option<Collection>.None
+}

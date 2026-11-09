@@ -23,6 +23,7 @@ use cli/commands/one_shot as one_shot_command
 use cli/commands/run as run_command
 use cli/commands/scenario as scenario_command
 use cli/commands/session as session_command
+use cli/commands/ui as ui_command
 use core/storage.Storage
 use core/storage.resolve
 use os
@@ -35,7 +36,7 @@ val global_values = ["--data-dir"]
 // should be a request to a host that does not resolve, not a complaint about an unknown command.
 fn is_subcommand(word: string) -> bool {
     return contains(
-        ["init", "env", "collections", "scenario", "session", "history", "run", "gui"],
+        ["init", "env", "collections", "scenario", "session", "history", "run", "gui", "ui"],
         word
     )
 }
@@ -198,6 +199,17 @@ fn main() {
     }
     if command == "history" {
         finish(history_command.run(rest, store))
+        return
+    }
+    if command == "ui" {
+        finish(ui_command.run(store))
+        return
+    }
+    // `gui` is in the subcommand list and had no branch until 2026-11-09, so it fell through to
+    // "unrecognised command" with status 2 where the Rust CLI answers its own message with status
+    // 1. The message is the contract for a user who types the old command.
+    if command == "gui" {
+        finish(ui_command.gui_moved())
         return
     }
 

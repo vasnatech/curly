@@ -1,0 +1,147 @@
+// **The tree, flattened into a list of rows -- and nothing else.** No terminal, no escape
+// sequences, no state beyond what is passed in.
+//
+// This is the split that `lib/core/terminal.zm` demonstrated and that made its own table testable:
+// the part that decides *what* is on screen is a pure function, and only the loop that reads keys
+// and writes bytes is not. A tree walk with an off-by-one in its depth, or an expansion key that
+// does not match the one the renderer wrote, is a bug that should be caught by an assertion rather
+// than by squinting at a terminal.
+use core/saved.Collection
+use core/saved.Folder
+use core/saved.SavedRequest
+
+pub enum RowKind {
+    // A collection: the top level, always expandable, named by the file it came from.
+    CollectionRow
+    // A folder inside a collection.
+    FolderRow
+    // A saved request -- the only kind that can be sent.
+    RequestRow
+}
+
+pub struct Row {
+    kind: RowKind
+    // 0 for a collection, 1 for its direct children, and so on. The renderer indents by this.
+    depth: int
+    label: string
+    // The HTTP method, for a request row; empty for the others.
+    method: string
+    // The URL as saved, with its `{{variables}}` unresolved -- what the tree shows, not what gets
+    // sent. Empty for the others.
+    url: string
+    // Which collection this row belongs to, for every kind including the collection itself.
+    collection: string
+    // The slash-separated path from the collection root (`Auth/OAuth/refresh`), which is the
+    // address `collection.find_request` and `core/collection` already use. Empty for a collection.
+    path: string
+    expandable: bool
+}
+
+// **The key a row is expanded under**, and the one thing in this file that must not be got wrong
+// quietly: the renderer reads expansion state with it and the loop writes with it, so a mismatch
+// shows as a folder that will not open rather than as an error.
+//
+// It is the collection name and the path joined, because a path alone is ambiguous across
+// collections -- two of them very often both have an `Auth/login`.
+pub fn row_key(row: Row) -> string {
+    if len(row.path) == 0 {
+        return row.collection
+    }
+    return concat(row.collection, concat("\t", row.path))
+}
+
+// The collections, flattened to the rows that are currently visible: a collection's children appear
+// only when its key is in `expanded`, and the same for a folder's.
+//
+// **Folders before requests at every level**, matching `collections show`'s own ordering -- the two
+// views of the same tree disagreeing about order would be its own small bug.
+pub fn rows_of(collections: [Collection], expanded: Set<string>) -> [Row] {
+    val out = mutable_array_new<Row>()
+    for collection in collections {
+        val row = Row {
+            kind: RowKind.CollectionRow,
+            depth: 0,
+            label: collection.name,
+            method: "",
+            url: "",
+            collection: collection.name,
+            path: "",
+            expandable: has_children_collection(collection)
+        }
+        push(out, row)
+        if !contains(expanded, row_key(row)) {
+            continue
+        }
+        append_level(out, collection.name, "", collection.folders, collection.requests, 1, expanded)
+    }
+    return snapshot(out)
+}
+
+fn has_children_collection(collection: Collection) -> bool {
+    return len(collection.folders) > 0 || len(collection.requests) > 0
+}
+
+fn has_children_folder(folder: Folder) -> bool {
+    return len(folder.folders) > 0 || len(folder.requests) > 0
+}
+
+// One level of the tree, appended in place. Recursive, because the tree is.
+fn append_level(
+    out: MutableArray<Row>,
+    collection: string,
+    prefix: string,
+    folders: [Folder],
+    requests: [SavedRequest],
+    depth: int,
+    expanded: Set<string>
+) {
+    for folder in folders {
+        val path = join_path(prefix, folder.name)
+        val row = Row {
+            kind: RowKind.FolderRow,
+            depth: depth,
+            label: folder.name,
+            method: "",
+            url: "",
+            collection: collection,
+            path: path,
+            expandable: has_children_folder(folder)
+        }
+        push(out, row)
+        if !contains(expanded, row_key(row)) {
+            continue
+        }
+        append_level(out, collection, path, folder.folders, folder.requests, depth + 1, expanded)
+    }
+    for request in requests {
+        push(out, Row {
+            kind: RowKind.RequestRow,
+            depth: depth,
+            label: request.name,
+            method: request.method,
+            url: request.url,
+            collection: collection,
+            path: join_path(prefix, request.name),
+            expandable: false
+        })
+    }
+}
+
+// `""` + `"Auth"` is `"Auth"`, not `"/Auth"`. A leading slash would make every path fail to match
+// the one `find_request` is given.
+fn join_path(prefix: string, name: string) -> string {
+    if len(prefix) == 0 {
+        return name
+    }
+    return concat(prefix, concat("/", name))
+}
+
+// **Every collection expanded**, which is the state the UI opens in: a tree that starts entirely
+// collapsed shows the user a list of filenames and makes them press keys before they see anything.
+pub fn all_collections_expanded(collections: [Collection]) -> Set<string> {
+    val out = mutable_set_new<string>()
+    for collection in collections {
+        add(out, collection.name)
+    }
+    return snapshot(out)
+}

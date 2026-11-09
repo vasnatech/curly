@@ -10,6 +10,10 @@
 //   * **An unknown flag is an error**, not a silently ignored token. A mistyped `--secrt` that is
 //     quietly dropped writes an unmasked secret.
 //   * **`--` ends flag parsing**, so a positional that begins with a dash is still reachable.
+//   * **A flag may repeat.** `-H` is given once per header, and a parser that kept only the last
+//     would send one header out of four and look like it had worked. Every occurrence is kept;
+//     `value_of` answers the last, which is what clap does for a non-repeatable flag, and `all_of`
+//     answers them all.
 //
 // Short flags are matched as whole tokens (`-k`, `-v`) and not bundled (`-kv`), which is the subset
 // the Rust CLI's own flags need.
@@ -18,8 +22,8 @@
 pub struct Parsed {
     // Non-flag arguments, in order.
     positionals: [string]
-    // `--name value` and `--name=value`, by name without the dashes.
-    values: Map<string, string>
+    // Every occurrence of each value-taking flag, in order, by name without the dashes.
+    values: Map<string, [string]>
     // Flags present with no value, by name without the dashes.
     switches: [string]
 }
@@ -28,12 +32,26 @@ pub fn has_switch(p: Parsed, name: string) -> bool {
     return contains(p.switches, name)
 }
 
+// The **last** occurrence, which is what clap gives a flag declared as taking one value.
 pub fn value_of(p: Parsed, name: string) -> Option<string> {
-    return get(p.values, name)
+    val all = all_of(p, name)
+    if len(all) == 0 {
+        return None
+    }
+    return Some(all[len(all) - 1])
 }
 
 pub fn value_or(p: Parsed, name: string, fallback: string) -> string {
-    return get_or(p.values, name, fallback)
+    return switch value_of(p, name) {
+        Some(v) { v }
+        None { fallback }
+    }
+}
+
+// Every occurrence, in the order given -- for a repeatable flag like `-H`.
+pub fn all_of(p: Parsed, name: string) -> [string] {
+    val none: [string] = []
+    return get_or(p.values, name, none)
 }
 
 // Parses `argv`.
@@ -43,7 +61,7 @@ pub fn value_or(p: Parsed, name: string, fallback: string) -> string {
 // point: a CLI that ignores what it does not recognise obeys a command nobody wrote.
 pub fn parse(argv: [string], value_flags: [string], known_switches: [string]) -> Result<Parsed, string> {
     val positionals = mutable_array_new<string>()
-    val values = mutable_map_new<string, string>()
+    val values = mutable_map_new<string, [string]>()
     val switches = mutable_array_new<string>()
     var i = 0
     var only_positionals = false
@@ -71,7 +89,7 @@ pub fn parse(argv: [string], value_flags: [string], known_switches: [string]) ->
             if !contains(value_flags, name) {
                 return err(concat("unexpected value for ", name))
             }
-            set(values, bare(name), substring(token, equals + 1, len(token)))
+            append_value(values, bare(name), substring(token, equals + 1, len(token)))
             i = i + 1
             continue
         }
@@ -79,7 +97,7 @@ pub fn parse(argv: [string], value_flags: [string], known_switches: [string]) ->
             if i + 1 >= len(argv) {
                 return err(concat("a value is required for ", token))
             }
-            set(values, bare(token), argv[i + 1])
+            append_value(values, bare(token), argv[i + 1])
             i = i + 2
             continue
         }
@@ -95,6 +113,17 @@ pub fn parse(argv: [string], value_flags: [string], known_switches: [string]) ->
         values: snapshot(values),
         switches: snapshot(switches)
     })
+}
+
+fn append_value(values: MutableMap<string, [string]>, name: string, value: string) {
+    val none: [string] = []
+    val existing = get_or(values, name, none)
+    val grown = mutable_array_new<string>()
+    for one in existing {
+        push(grown, one)
+    }
+    push(grown, value)
+    set(values, name, snapshot(grown))
 }
 
 // A flag's name without its leading dashes, which is how a command asks for it.
@@ -116,10 +145,15 @@ pub struct Assignment {
 
 pub fn parse_assignment(text: string, what: string) -> Result<Assignment, string> {
     val at = index_of(text, "=", 0)
-    // **The key may not be empty**, since `=v` names no variable, and the value may be: setting a
-    // variable to the empty string is a legitimate thing to want.
-    if at <= 0 {
-        return err(prelude.format("invalid {} value (expected KEY=VALUE): {}", what, text))
+    // **Split on the first `=` only**, so a value may contain one -- and the wording is Rust's
+    // `parse_kv`, verbatim, because it is shared by `-Q`, `--data-urlencode`, `-F` and `env set`
+    // and `parity.sh` compares all four.
+    //
+    // **An empty key is accepted**, which is Rust's `split_once('=')` on `=v` giving `("", "v")`.
+    // Rejecting it would be the better rule and is deliberately not applied: a stricter CLI refuses
+    // a command the one it replaces accepted, however silly that command is.
+    if at < 0 {
+        return err(prelude.format("invalid {} value (expected \"key=value\"): {}", what, text))
     }
     return ok(Assignment {
         key: substring(text, 0, at),

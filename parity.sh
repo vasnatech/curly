@@ -324,6 +324,98 @@ else
   echo "  SKIP cli checks: $ZCLI is not executable"
 fi
 
+# ---- one-shot mode ------------------------------------------------------------------------------
+#
+# The curl-like path, through both binaries against one stub server, output diffed.
+#
+# **Only two things are normalised, and both are genuinely non-deterministic**: `elapsed_ms`, which
+# is a measurement, and a multipart boundary, which is random on both sides by design. Everything
+# else -- header names and their order, JSON key order, the exact wording of a refusal -- is
+# compared as it comes out, because those are the things that drift.
+
+OS_PORT=18761
+STUB="$work/httpstub.py"
+cat > "$STUB" <<'STUBEOF'
+import json, sys
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse
+class H(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    def _h(self):
+        p = urlparse(self.path)
+        n = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(n) if n else b""
+        if p.path == "/plain":
+            body, ct, code = b"hello world", "text/plain", 200
+        elif p.path == "/boom":
+            body, ct, code = b'{"error":"nope"}', "application/json", 500
+        else:
+            body = json.dumps({
+                "method": self.command, "path": p.path, "query": p.query,
+                "headers": {k.lower(): v for k, v in self.headers.items()
+                            if k.lower() in ("authorization", "content-type", "x-one", "x-two")},
+                "body": raw.decode("utf-8", "replace"),
+            }, sort_keys=True).encode()
+            ct, code = "application/json", 200
+        self.send_response(code)
+        self.send_header("Content-Type", ct)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    do_GET = do_POST = do_PUT = do_DELETE = _h
+    def log_message(self, *a): pass
+ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
+STUBEOF
+python3 -I "$STUB" "$OS_PORT" >/dev/null 2>&1 &
+stub_pid=$!
+# Killed by PID, never by pattern: `pkill -f` on a name that appears in this script's own command
+# line kills the script.
+trap 'kill "$stub_pid" 2>/dev/null; rm -rf "$work"' EXIT
+for _ in $(seq 1 40); do
+  if (exec 3<>"/dev/tcp/127.0.0.1/$OS_PORT") 2>/dev/null; then exec 3>&-; break; fi
+  sleep 0.1
+done
+
+OSB="http://127.0.0.1:$OS_PORT"
+os_normalise() {
+  sed -E -e 's/"elapsed_ms": [0-9]+/"elapsed_ms": <ms>/' \
+         -e 's/boundary=[A-Za-z0-9-]+/boundary=<b>/g' \
+         -e 's/--[A-Za-z0-9-]{20,}/--<b>/g'
+}
+
+one_shot_both() {
+  local label="$1"; shift
+  local a b
+  a="$("$RUST" "$@" --data-dir "$work/os-rust" 2>&1 | os_normalise)" || true
+  b="$(ZIMAN="$ZIMAN" "$ZCLI" "$@" --data-dir "$work/os-ziman" 2>&1 | os_normalise)" || true
+  if [ "$a" = "$b" ]; then
+    ok "one-shot: $label"
+  else
+    bad "one-shot: $label" "$(diff <(echo "$a") <(echo "$b") | head -5 | tr '\n' ' ')"
+  fi
+}
+
+if [ -x "$ZCLI" ]; then
+  one_shot_both "a plain GET" "$OSB/plain"
+  one_shot_both "-X PUT" -X PUT "$OSB/echo"
+  one_shot_both "repeated -H" "$OSB/echo" -H 'X-One: 1' -H 'X-Two: 2'
+  one_shot_both "repeated -Q" "$OSB/echo" -Q a=1 -Q 'b=two words'
+  one_shot_both "-d defaults the method to POST" "$OSB/echo" -d '{"a":1}'
+  one_shot_both "--data-urlencode" "$OSB/echo" --data-urlencode a=1 --data-urlencode 'b=x y'
+  one_shot_both "-F multipart" "$OSB/echo" -F caption=hi
+  one_shot_both "-u basic auth" "$OSB/echo" -u ann:s3cret
+  one_shot_both "--bearer" "$OSB/echo" --bearer tok123
+  one_shot_both "-i include headers" -i "$OSB/plain"
+  one_shot_both "-p pretty" -p "$OSB/echo"
+  one_shot_both "--json" --json "$OSB/echo"
+  one_shot_both "--fail on a 500" --fail "$OSB/boom"
+  one_shot_both "conflicting body sources" "$OSB/echo" -d a -F b=c
+  one_shot_both "both auth kinds" "$OSB/echo" -u a:b --bearer t
+  one_shot_both "a malformed -u" "$OSB/echo" -u nocolon
+  one_shot_both "a malformed -H" "$OSB/echo" -H nocolon
+  one_shot_both "a malformed -Q" "$OSB/echo" -Q nokey
+fi
+
 # ---- the slug -----------------------------------------------------------------------------------
 #
 # Both sides turn a display name into the same filename, or `load` misses what `save` wrote.

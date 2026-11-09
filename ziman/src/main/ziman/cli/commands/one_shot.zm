@@ -1,0 +1,192 @@
+// `curly <url> [flags]` with no subcommand -- the curl-like path.
+use cli/args.Parsed
+use cli/args.all_of
+use cli/args.parse_assignment
+use cli/args.value_of
+use cli/connection
+use cli/execute
+use cli/output
+use core/exec.ResponseSummary
+use core/model.Auth
+use core/model.BasicAuth
+use core/model.Body
+use core/model.MultipartField
+use core/model.MultipartFile
+use core/model.MultipartText
+use core/model.Pair
+use core/model.Request
+use core/model.request_of
+use core/storage.Storage
+use fs
+use http
+use http.Header
+
+// Every flag one-shot mode takes, declared so that the parser rejects a typo rather than treating
+// it as the URL.
+pub fn value_flags() -> [string] {
+    return concat(
+        ["-X", "--request", "-H", "--header", "-Q", "--query", "-d", "--data",
+            "--data-urlencode", "--data-binary", "-F", "--form", "-u", "--user", "--bearer"],
+        concat(connection.value_flags(), output.value_flags())
+    )
+}
+
+pub fn switch_flags() -> [string] {
+    return concat(connection.switch_flags(), output.switch_flags())
+}
+
+// `Name: value`, for `-H`.
+fn parse_header(raw: string) -> Result<Header, string> {
+    val at = index_of(raw, ":", 0)
+    if at < 0 {
+        return err(concat("invalid header (expected \"Name: value\"): ", raw))
+    }
+    return ok(Header {
+        name: trim(substring(raw, 0, at)),
+        value: trim(substring(raw, at + 1, len(raw)))
+    })
+}
+
+// `name=@path` uploads a file, `name=value` is text.
+fn parse_form_field(raw: string) -> Result<MultipartField, string> {
+    val pair = try parse_assignment(raw, "-F/--form")
+    if starts_with(pair.value, "@") {
+        return ok(MultipartField.File(MultipartFile {
+            name: pair.key,
+            path: substring(pair.value, 1, len(pair.value))
+        }))
+    }
+    return ok(MultipartField.Text(MultipartText { name: pair.key, value: pair.value }))
+}
+
+fn repeated(p: Parsed, short: string, long: string) -> [string] {
+    return concat(all_of(p, short), all_of(p, long))
+}
+
+fn single(p: Parsed, short: string, long: string) -> Option<string> {
+    return switch value_of(p, short) {
+        Some(v) { Some(v) }
+        None { value_of(p, long) }
+    }
+}
+
+// **One body source only.** `-d`, `--data-urlencode`, `--data-binary` and `-F` mean different
+// content types and encodings; taking whichever came last would send something the command did not
+// ask for.
+fn build_body(p: Parsed) -> Result<Option<Body>, string> {
+    val data = single(p, "d", "data")
+    val urlencoded = all_of(p, "data-urlencode")
+    val binary = value_of(p, "data-binary")
+    val form = repeated(p, "F", "form")
+
+    var given = 0
+    if is_Some(data) {
+        given = given + 1
+    }
+    if len(urlencoded) != 0 {
+        given = given + 1
+    }
+    if is_Some(binary) {
+        given = given + 1
+    }
+    if len(form) != 0 {
+        given = given + 1
+    }
+    if given > 1 {
+        return err("only one of -d/--data-urlencode/--data-binary/-F may be used per request")
+    }
+
+    if Some(raw) = data {
+        return ok(Some(Body.Raw(raw)))
+    }
+    if len(urlencoded) != 0 {
+        val fields = mutable_array_new<Pair>()
+        for raw in urlencoded {
+            val pair = try parse_assignment(raw, "--data-urlencode")
+            push(fields, Pair { name: pair.key, value: pair.value })
+        }
+        return ok(Some(Body.Form(snapshot(fields))))
+    }
+    if Some(given_path) = binary {
+        // An optional leading `@`, the same convention `-d` and curl's own flags use.
+        val path = if starts_with(given_path, "@") { substring(given_path, 1, len(given_path)) } else { given_path }
+        val bytes = switch fs.read_bytes(path) {
+            Ok(b) { b }
+            Err(e) { return err(concat("failed to read --data-binary file: ", path, ": ", fs.fs_error_message(e))) }
+        }
+        return ok(Some(Body.Binary(bytes)))
+    }
+    if len(form) != 0 {
+        val fields = mutable_array_new<MultipartField>()
+        for raw in form {
+            push(fields, try parse_form_field(raw))
+        }
+        return ok(Some(Body.Multipart(snapshot(fields))))
+    }
+    return ok(None)
+}
+
+fn build_auth(p: Parsed) -> Result<Option<Auth>, string> {
+    val user = single(p, "u", "user")
+    val bearer = value_of(p, "bearer")
+    if is_Some(user) && is_Some(bearer) {
+        return err("only one of -u/--user or --bearer may be used per request")
+    }
+    if Some(pair) = user {
+        val at = index_of(pair, ":", 0)
+        if at < 0 {
+            return err(concat("invalid -u/--user value (expected \"user:password\"): ", pair))
+        }
+        return ok(Some(Auth.Basic(BasicAuth {
+            username: substring(pair, 0, at),
+            password: substring(pair, at + 1, len(pair))
+        })))
+    }
+    if Some(token) = bearer {
+        return ok(Some(Auth.Bearer(token)))
+    }
+    return ok(None)
+}
+
+pub fn build_request(p: Parsed) -> Result<Request, string> {
+    if len(p.positionals) == 0 {
+        return err(concat(
+            "a URL is required (or use a subcommand: init, env, collections, run, history, ",
+            "session, scenario)"
+        ))
+    }
+    val url = p.positionals[0]
+    val body = try build_body(p)
+    val auth = try build_auth(p)
+
+    // **A body with no `-X` means POST**, which is curl's behaviour.
+    val method = switch single(p, "X", "request") {
+        Some(m) { to_upper(m) }
+        None { if is_Some(body) { "POST" } else { "GET" } }
+    }
+    val headers = mutable_array_new<Header>()
+    for raw in repeated(p, "H", "header") {
+        push(headers, try parse_header(raw))
+    }
+    val params = mutable_array_new<Pair>()
+    for raw in repeated(p, "Q", "query") {
+        val pair = try parse_assignment(raw, "-Q/--query")
+        push(params, Pair { name: pair.key, value: pair.value })
+    }
+    return ok(with request_of(http.method_parse(method), url) {
+        headers: snapshot(headers),
+        query_params: snapshot(params),
+        body: body,
+        auth: auth
+    })
+}
+
+fn nothing_after(response: ResponseSummary) -> Result<unit, string> {
+    return ok(unit)
+}
+
+pub fn run(p: Parsed, store: Storage) -> Result<unit, string> {
+    val request = try build_request(p)
+    // One-shot mode has no extraction rules, so nothing happens after the response is shown.
+    return execute.run(request, try connection.from_args(p), output.from_args(p), store, nothing_after)
+}

@@ -19,6 +19,7 @@ use cli/commands/collections as collections_command
 use cli/commands/env as env_command
 use cli/commands/history as history_command
 use cli/commands/init as init_command
+use cli/commands/one_shot as one_shot_command
 use cli/commands/scenario as scenario_command
 use cli/commands/session as session_command
 use core/storage.Storage
@@ -27,6 +28,16 @@ use os
 
 // Flags every command accepts.
 val global_values = ["--data-dir"]
+
+// A token that is not one of the subcommands is a URL, which is what puts the CLI into one-shot
+// mode. Checked by name rather than by "does it look like a URL", because `curly exmaple.com`
+// should be a request to a host that does not resolve, not a complaint about an unknown command.
+fn is_subcommand(word: string) -> bool {
+    return contains(
+        ["init", "env", "collections", "scenario", "session", "history", "run", "gui"],
+        word
+    )
+}
 
 fn flags_for(command: string, action: string) -> [string] {
     if command == "env" && action == "import-postman" {
@@ -82,6 +93,33 @@ fn main() {
     }
     if argv[0] == "-h" || argv[0] == "--help" || argv[0] == "help" {
         help()
+        return
+    }
+
+    // **One-shot mode**: no subcommand, so the whole vector is its arguments and the URL is the
+    // first positional.
+    if !is_subcommand(argv[0]) {
+        val parsed = switch args.parse(
+            argv,
+            concat(global_values, one_shot_command.value_flags()),
+            one_shot_command.switch_flags()
+        ) {
+            Ok(p) { p }
+            Err(why) {
+                os.write_stderr(concat("Error: ", why, "\n"))
+                os.exit(2)
+                return
+            }
+        }
+        val store = switch resolve(args.value_of(parsed, "data-dir"), os.get_env("CURLY_DATA_DIR"), cwd_or_dot()) {
+            Ok(s) { s }
+            Err(why) {
+                os.write_stderr(concat("Error: ", why, "\n"))
+                os.exit(1)
+                return
+            }
+        }
+        finish(one_shot_command.run(parsed, store))
         return
     }
 

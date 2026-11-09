@@ -1,0 +1,95 @@
+// The output flags, and rendering a response as the text that gets printed or written.
+use cli/args.Parsed
+use cli/args.has_switch
+use cli/args.value_of
+use core/exec.ResponseSummary
+use http.Header
+use json
+use json.Json
+
+pub struct OutputArgs {
+    output_path: Option<string>
+    include: bool
+    json_output: bool
+    pretty: bool
+    verbose: bool
+    fail: bool
+}
+
+pub fn value_flags() -> [string] {
+    return ["-o", "--output"]
+}
+pub fn switch_flags() -> [string] {
+    return ["-i", "--include", "--json", "-p", "--pretty", "-v", "--verbose", "--fail"]
+}
+
+pub fn from_args(p: Parsed) -> OutputArgs {
+    return OutputArgs {
+        output_path: switch value_of(p, "o") {
+            Some(v) { Some(v) }
+            None { value_of(p, "output") }
+        },
+        include: has_switch(p, "i") || has_switch(p, "include"),
+        json_output: has_switch(p, "json"),
+        pretty: has_switch(p, "p") || has_switch(p, "pretty"),
+        verbose: has_switch(p, "v") || has_switch(p, "verbose"),
+        fail: has_switch(p, "fail")
+    }
+}
+
+pub fn defaults() -> OutputArgs {
+    return OutputArgs {
+        output_path: None,
+        include: false,
+        json_output: false,
+        pretty: false,
+        verbose: false,
+        fail: false
+    }
+}
+
+// **A body that is not JSON is printed as it is**, not refused: `-p` is a convenience for reading a
+// response, and a server that answered HTML should still be readable.
+pub fn pretty_json(body: string) -> string {
+    return switch json.parse(body) {
+        Ok(parsed) { json.format(parsed, 2) }
+        Err(_) { body }
+    }
+}
+
+// The raw body by default, pretty JSON with `-p`, or one machine-readable object with `--json`.
+pub fn render_body(args: OutputArgs, response: ResponseSummary) -> Result<string, string> {
+    if args.json_output {
+        // **Keys sorted, both here and in the nested headers object.** Rust builds this with
+        // `serde_json::json!`, whose `Map` is a `BTreeMap`, so its output is in key order --
+        // unlike a struct, which serde writes in declaration order. That distinction is why the
+        // saved-file codecs keep declaration order and this one does not.
+        val headers = mutable_array_new<string>()
+        for h in response.headers {
+            push(headers, h.name)
+        }
+        val header_object = mutable_map_new<string, Json>()
+        for name in sort(snapshot(headers)) {
+            set(header_object, name, Json.JString(header_value(response.headers, name)))
+        }
+        return ok(json.format(Json.JObject(Map<string, Json> {
+            "body": Json.JString(response.body),
+            "elapsed_ms": json.int_to_json(response.elapsed_millis),
+            "headers": Json.JObject(snapshot(header_object)),
+            "status": json.int_to_json(response.status)
+        }), 2))
+    }
+    if args.pretty {
+        return ok(pretty_json(response.body))
+    }
+    return ok(response.body)
+}
+
+fn header_value(headers: [Header], name: string) -> string {
+    for h in headers {
+        if h.name == name {
+            return h.value
+        }
+    }
+    return ""
+}

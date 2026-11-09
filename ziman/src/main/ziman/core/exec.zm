@@ -43,6 +43,20 @@ pub struct ResponseSummary {
 // included: a status is an answer, and only a failure to exchange anything at all is an error. That
 // is `client`'s rule as well as reqwest's.
 pub fn send(request: Request) -> Result<ResponseSummary, string> {
+    return send_configured(request, None, None, None, None)
+}
+
+// `send` with the connection options the CLI's flags set: `--max-time`, `-L`/`--max-redirects`,
+// `--cacert` and `-x`/`--proxy`. Each is `None` for the client's own default, which is what plain
+// `send` passes -- so a scenario run and a one-shot request take the same path and only the CLI
+// has to know these flags exist.
+pub fn send_configured(
+    request: Request,
+    timeout_ms: Option<int>,
+    max_redirects: Option<int>,
+    ca_file: Option<string>,
+    proxy: Option<string>
+) -> Result<ResponseSummary, string> {
     val target = with_query(request.url, request.query_params)
     val headers = mutable_array_new<Header>()
     for h in request.headers {
@@ -68,7 +82,10 @@ pub fn send(request: Request) -> Result<ResponseSummary, string> {
         url: target,
         headers: Some(snapshot(headers)),
         body: payload,
-        timeout_ms: None
+        timeout_ms: timeout_ms,
+        max_redirects: max_redirects,
+        ca_file: ca_file,
+        proxy: proxy
     )
     val elapsed = clock.monotonic_millis() - started
     val response = switch answered {
@@ -79,11 +96,27 @@ pub fn send(request: Request) -> Result<ResponseSummary, string> {
     val raw = response.body
     return ok(ResponseSummary {
         status: response.status,
-        headers: response.headers,
+        headers: lowercased(response.headers),
         body: lossy_text(raw),
         body_bytes: raw,
         elapsed_millis: elapsed
     })
+}
+
+// **Response header names are lowercased**, which is what `reqwest`'s `HeaderMap` does and
+// therefore what the Rust implementation prints -- so `-i`, `-v`, `--json` and the history file all
+// agree between the two. Ziman's client preserves the case the server sent, which is arguably more
+// faithful, but a header name is case-insensitive by definition and this is the one place the
+// choice is visible to anyone scripting against the output.
+//
+// Nothing downstream depends on the case: every lookup here and in `core/scenario` already compares
+// case-insensitively.
+fn lowercased(headers: [Header]) -> [Header] {
+    val out = mutable_array_new<Header>()
+    for h in headers {
+        push(out, with h { name: to_lower(h.name) })
+    }
+    return snapshot(out)
 }
 
 fn has_header(headers: [Header], lowercase_name: string) -> bool {

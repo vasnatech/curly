@@ -1,0 +1,78 @@
+// The shared "send a built request and show the result" pipeline, used by one-shot mode and by
+// `curly run`: trace, send, record history, render. Only how the request got built differs between
+// the two callers, which is why this is one function and not two.
+//
+// **`after_send` runs once the response has been printed**, not before. If an extraction rule fails
+// -- a bad path, a missing header -- the response you are debugging that failure against must still
+// be on screen rather than swallowed by the error. `curly run` passes its rules; one-shot mode has
+// none and passes a function that does nothing.
+use cli/connection.ConnectionArgs
+use cli/connection.send_with
+use cli/output.OutputArgs
+use cli/output.render_body
+use core/exec.ResponseSummary
+use core/model.Request
+use core/storage.Storage
+use core/storage.append_history
+use core/storage.history_entry_of
+use fs
+use http
+use os
+
+pub fn run(
+    request: Request,
+    connection: ConnectionArgs,
+    output: OutputArgs,
+    store: Storage,
+    after_send: fn(ResponseSummary) -> Result<unit, string>
+) -> Result<unit, string> {
+    if output.verbose {
+        // **The trace goes to stderr**, so `curly ... > body.json` still captures only the body.
+        os.write_stderr(prelude.format("> {} {}\n", http.method_name(request.method), request.url))
+        for h in request.headers {
+            os.write_stderr(prelude.format("> {}: {}\n", h.name, h.value))
+        }
+    }
+
+    val response = try send_with(request, connection)
+
+    // **A failure to record history never fails the request.** Rust discards the result with
+    // `let _ =` for the same reason: the exchange happened, and the caller wants the response.
+    val _ = append_history(store, history_entry_of(request, response))
+
+    if output.verbose {
+        os.write_stderr(prelude.format("< status: {} ({}ms)\n", str(response.status), str(response.elapsed_millis)))
+        for h in response.headers {
+            os.write_stderr(prelude.format("< {}: {}\n", h.name, h.value))
+        }
+    }
+
+    // `-i` prints the status line and headers before the body -- but not under `--json`, which
+    // already carries both inside its object.
+    if output.include && !output.json_output {
+        print(concat("HTTP ", str(response.status)))
+        for h in response.headers {
+            print(concat(h.name, ": ", h.value))
+        }
+        print("")
+    }
+
+    val rendered = try render_body(output, response)
+    switch output.output_path {
+        Some(path) {
+            if Err(e) = fs.write_text(path, rendered) {
+                return err(concat("failed to write response body to ", path, ": ", fs.fs_error_message(e)))
+            }
+        }
+        None { print(rendered) }
+    }
+
+    try after_send(response)
+
+    // **`--fail` turns a 4xx or 5xx into a non-zero exit**, after the body has been shown -- so a
+    // script can branch on it and a person can still read what came back.
+    if output.fail && response.status >= 400 {
+        return err(concat("server returned HTTP ", str(response.status)))
+    }
+    return ok(unit)
+}

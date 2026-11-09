@@ -1,0 +1,96 @@
+// The connection flags, and sending a request with them.
+//
+// **Three of curl's flags have no equivalent here, and are refused rather than ignored.**
+// `lib/core/client.zm` says of its `ca_file` argument that "the certificate is always verified":
+// there is no insecure mode, by design, and no client-certificate support either. So:
+//
+//   * `-k`/`--insecure` -- cannot be honoured. Ignoring it would let a request fail on a
+//     certificate the user explicitly said to accept, which looks like a bug in curly.
+//   * `--cert`/`--key` -- cannot be honoured. Ignoring these is worse: the request would go out
+//     without the client certificate it was supposed to present, and the server's refusal would
+//     look like a server problem.
+//
+// Refusing names the flag and says why. A flag silently dropped is the failure mode worth avoiding:
+// the command appears to have done what was asked.
+use cli/args.Parsed
+use cli/args.has_switch
+use cli/args.value_of
+use client
+use core/exec.ResponseSummary
+use core/exec.send_configured
+use core/model.Request
+
+pub struct ConnectionArgs {
+    max_redirects: Option<int>
+    timeout_ms: Option<int>
+    proxy: Option<string>
+    ca_file: Option<string>
+}
+
+// Every connection flag, so the dispatcher can declare them and the parser can reject a typo.
+pub fn value_flags() -> [string] {
+    return ["--max-redirects", "--max-time", "-x", "--proxy", "--cacert", "--cert", "--key"]
+}
+pub fn switch_flags() -> [string] {
+    return ["-k", "--insecure", "-L", "--location"]
+}
+
+pub fn from_args(p: Parsed) -> Result<ConnectionArgs, string> {
+    if has_switch(p, "k") || has_switch(p, "insecure") {
+        return err(concat(
+            "-k/--insecure is not supported: this implementation's HTTP client always verifies ",
+            "the server certificate. Pass --cacert with the CA that signed it instead."
+        ))
+    }
+    if is_Some(value_of(p, "cert")) || is_Some(value_of(p, "key")) {
+        return err(concat(
+            "--cert/--key are not supported: this implementation's HTTP client cannot present a ",
+            "client certificate."
+        ))
+    }
+    // `-L` follows redirects, which the client does by default (five of them); `--max-redirects`
+    // sets the bound either way. Without `-L`, curl does not follow at all -- so the bound is 0.
+    val follow = has_switch(p, "L") || has_switch(p, "location")
+    val bound = switch value_of(p, "max-redirects") {
+        Some(text) {
+            switch parse_int(text) {
+                Ok(n) { Option<int>.Some(n) }
+                Err(_) { return err(concat("invalid --max-redirects value: ", text)) }
+            }
+        }
+        None { if follow { Option<int>.None } else { Option<int>.Some(0) } }
+    }
+    // `--max-time` is seconds, possibly fractional; the client takes milliseconds.
+    val timeout = switch value_of(p, "max-time") {
+        Some(text) {
+            switch parse_float(text) {
+                Ok(seconds) { Option<int>.Some((seconds * 1000.0) as int) }
+                Err(_) { return err(concat("invalid --max-time value: ", text)) }
+            }
+        }
+        None { Option<int>.None }
+    }
+    return ok(ConnectionArgs {
+        max_redirects: bound,
+        timeout_ms: timeout,
+        proxy: switch value_of(p, "x") {
+            Some(v) { Some(v) }
+            None { value_of(p, "proxy") }
+        },
+        ca_file: value_of(p, "cacert")
+    })
+}
+
+pub fn defaults() -> ConnectionArgs {
+    return ConnectionArgs { max_redirects: None, timeout_ms: None, proxy: None, ca_file: None }
+}
+
+pub fn send_with(request: Request, connection: ConnectionArgs) -> Result<ResponseSummary, string> {
+    return send_configured(
+        request,
+        connection.timeout_ms,
+        connection.max_redirects,
+        connection.ca_file,
+        connection.proxy
+    )
+}

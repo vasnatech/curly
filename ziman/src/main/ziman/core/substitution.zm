@@ -1,0 +1,59 @@
+// `{{variable}}` substitution against a merged variable scope.
+//
+// **An undefined variable is an error, not a literal left in place.** Postman and GUI-style tools
+// leave an unresolved `{{var}}` in the request; for a CLI and CI tool, sending the literal text
+// `{{var}}` to a server is almost always a mistake worth failing loudly on. Ported verbatim from
+// `crates/curly-core/src/substitution.rs`, which says the same.
+//
+// **This module holds only `substitute`, where Rust's also holds `resolve`.** Rust's modules are
+// mutually referential inside one crate -- `storage` names `extraction`, `extraction` names
+// `substitution`, `substitution` names `storage` -- which a module graph cannot be. `resolve` wants
+// `SavedRequest`, so it lives beside it in `core/saved.zm`, and what is left here is a pure string
+// function that nothing else in the port has to depend on in the wrong direction.
+
+// Replaces every `{{name}}` in `input` with the scope's value for `name`.
+//
+// **Every undefined name is reported, not just the first**, because a run that fails on a missing
+// variable usually has more than one missing and fixing them one error at a time is the slow way.
+// Names are reported in the order they were met and never twice.
+pub fn substitute(input: string, variables: Map<string, string>) -> Result<string, string> {
+    val out = mutable_string_new()
+    val undefined = mutable_array_new<string>()
+    var rest = input
+
+    while true {
+        val start = index_of(rest, "{{", 0)
+        if start < 0 {
+            break
+        }
+        append(out, substring(rest, 0, start))
+        val after_open = substring(rest, start + 2, len(rest))
+        val end = index_of(after_open, "}}", 0)
+        if end < 0 {
+            // An unterminated `{{` is literal text: the rest of the string is not a variable and
+            // guessing where it ends would be worse than leaving it alone.
+            append(out, "{{")
+            rest = after_open
+            break
+        }
+        val name = trim(substring(after_open, 0, end))
+        switch get(variables, name) {
+            Some(value) { append(out, value) }
+            None {
+                if !contains(snapshot(undefined), name) {
+                    push(undefined, name)
+                }
+            }
+        }
+        rest = substring(after_open, end + 2, len(after_open))
+    }
+    append(out, rest)
+
+    if len(undefined) != 0 {
+        return err(concat(
+            "undefined variable(s): ",
+            join(separator: ", ", pieces: snapshot(undefined))
+        ))
+    }
+    return ok(snapshot(out))
+}

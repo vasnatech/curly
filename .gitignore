@@ -1,2 +1,7 @@
-/target
+# Build output, per component. `/target` alone stopped being enough when the Cargo
+# workspace moved into rust/ and the Tauri shell grew a target of its own.
+/*/target
+/*/*/target
+node_modules/
+
 .DS_Store

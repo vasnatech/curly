@@ -1,0 +1,77 @@
+// Drives the Ziman implementation for `parity.sh`, which compares it against the Rust binary over
+// the same `.curly/` tree. One case per `CURLY_CASE`, each printing exactly what the corresponding
+// Rust command prints, so the comparison is a plain `diff` and not a parser.
+//
+// **This is not a test of the Ziman side on its own** -- `src/test/unit` does that. It exists
+// because "the Ziman implementation replaces the Rust one" is only true if the two agree, and the
+// cheapest way to know is to ask both the same question and compare the answers.
+use core/saved.collection_from_json
+use core/saved.collection_to_json
+use core/storage.list_collections
+use core/storage.list_environments
+use core/storage.slugify
+use core/storage.storage_of
+use fs
+use json
+use os
+
+fn env_or(name: string, fallback: string) -> string {
+    return switch os.get_env(name) {
+        Some(v) { v }
+        None { fallback }
+    }
+}
+
+fn print_names(r: Result<[string], string>) {
+    val none: [string] = []
+    for name in switch r {
+        Ok(found) { found }
+        Err(_) { none }
+    } {
+        print(name)
+    }
+}
+
+fn main() {
+    val case = env_or("CURLY_CASE", "list-collections")
+    val root = env_or("CURLY_ROOT", ".curly")
+    val s = storage_of(root)
+
+    if case == "list-collections" {
+        print_names(list_collections(s))
+        return
+    }
+    if case == "list-environments" {
+        print_names(list_environments(s))
+        return
+    }
+    if case == "slugify" {
+        print(slugify(env_or("CURLY_NAME", "")))
+        return
+    }
+    if case == "rewrite-collection" {
+        // Read a collection file and write it back out. The bytes must match what the Rust
+        // implementation writes for the same input, which is the whole storage-format contract.
+        val path = env_or("CURLY_FILE", "")
+        val text = switch fs.read_text(path) {
+            Ok(t) { t }
+            Err(_) {
+                os.fatal(concat("cannot read ", path))
+                return
+            }
+        }
+        val parsed = switch json.parse(text) {
+            Ok(j) { j }
+            Err(why) {
+                os.fatal(concat("not JSON: ", why))
+                return
+            }
+        }
+        switch collection_from_json(parsed) {
+            Ok(c) { print(json.format(collection_to_json(c), 2)) }
+            Err(why) { os.fatal(concat("decode failed: ", why)) }
+        }
+        return
+    }
+    os.fatal(concat("unknown case: ", case))
+}

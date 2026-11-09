@@ -1,6 +1,6 @@
 # Curly CLI — Manual Testing Scenarios
 
-Hand-run scenarios for exercising `curly` the way an end user would, on top of the automated unit tests (`cargo test -p curly-cli`) and integration tests (`cargo test -p curly-core`). Run these after any change that touches `crates/curly-cli/src/` or `crates/curly-core/src/`, and before tagging a release.
+Hand-run scenarios for exercising `curly` the way an end user would, on top of the automated unit tests (`cargo test -p curly-cli`) and integration tests (`cargo test -p curly-core`), both run from `rust/`. Run these after any change that touches `rust/crates/curly-cli/src/` or `rust/crates/curly-core/src/`, and before tagging a release. `./run-all.sh` at the repository root runs everything automated, for both implementations.
 
 Uses [httpbin.org](https://httpbin.org) as the target — a public HTTP-echo service, no setup required. If it's unreachable, most scenarios also work against `https://postman-echo.com` with minor path adjustments, or a locally-run `python3 -m http.server`/httpbin Docker image for offline testing.
 
@@ -12,8 +12,8 @@ rm -rf "$XDG_DATA_HOME"   # start clean
 
 Build first:
 ```sh
-cargo build --release
-alias curly=./target/release/curly   # or use cargo run -- ... directly
+cd rust && cargo build --release
+alias curly=./rust/target/release/curly   # or use cargo run -- ... directly
 ```
 
 ## 1. Basic requests

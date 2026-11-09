@@ -1,0 +1,327 @@
+// Post-response variable extraction: pull a value out of a response body by JSON path, out of a
+// response header, or compute one from a template over already-known variables.
+//
+// **Declarative on purpose, not a scripting language.** Rust's module says why, and it still holds:
+// "pull this path out of the body" / "this header" / "this template" covers the actual use case --
+// chaining an auth token into the next request -- without the complexity, security surface or
+// version-compatibility burden of an embedded interpreter.
+//
+// `core/saved.zm` embeds `Extraction` in `SavedRequest.extract`, which is why the type and its codec
+// come first in this file and `apply` after: nothing can be read off disk until a rule can be
+// decoded.
+use core/exec.ResponseSummary
+use core/substitution.substitute
+use http.Header
+use json
+use json.Json
+
+// **A companion struct per variant, because Ziman variants hold at most one payload** and never a
+// tuple or inline struct-shaped one. Rust writes `Body { name, path, secret }` inline; the wire
+// format is unchanged either way, since the codec below is hand-written.
+pub struct BodyRule {
+    name: string
+    // Dot and bracket syntax: `data.user.id`, `items[0].token`.
+    path: string
+    secret: bool
+}
+
+pub struct HeaderRule {
+    name: string
+    // Matched case-insensitively, as HTTP header names are.
+    header: string
+    secret: bool
+}
+
+pub struct TemplateRule {
+    name: string
+    template: string
+    secret: bool
+}
+
+pub enum Extraction {
+    Body(BodyRule)
+    Header(HeaderRule)
+    Template(TemplateRule)
+}
+
+// The variable this rule defines, whichever kind it is.
+pub fn rule_name(e: Extraction) -> string {
+    return switch e {
+        Body(r) { r.name }
+        Header(r) { r.name }
+        Template(r) { r.name }
+    }
+}
+
+// Whether the extracted value should be masked when a session is displayed.
+pub fn rule_secret(e: Extraction) -> bool {
+    return switch e {
+        Body(r) { r.secret }
+        Header(r) { r.secret }
+        Template(r) { r.secret }
+    }
+}
+
+// ---------------------------------------------------------------- the wire format
+//
+// **Hand-written, because `#[derive(Json)]` cannot produce this shape.** Serde writes an internally
+// tagged enum with the payload's fields *inlined* beside the tag -- `{"source":"body","name":"X",
+// "path":"id","secret":false}` -- while the derive emits the variant name as declared and nests the
+// payload under `"value"`. The files are shared with the Rust implementation, so the format is the
+// requirement and the codec bends to it.
+//
+// `secret` is absent in files written before it existed, and serde's `#[serde(default)]` reads that
+// as `false`; so does this.
+pub fn extraction_to_json(e: Extraction) -> Json {
+    return switch e {
+        Body(r) {
+            Json.JObject(Map<string, Json> {
+                "source": Json.JString("body"),
+                "name": Json.JString(r.name),
+                "path": Json.JString(r.path),
+                "secret": Json.JBool(r.secret)
+            })
+        }
+        Header(r) {
+            Json.JObject(Map<string, Json> {
+                "source": Json.JString("header"),
+                "name": Json.JString(r.name),
+                "header": Json.JString(r.header),
+                "secret": Json.JBool(r.secret)
+            })
+        }
+        Template(r) {
+            Json.JObject(Map<string, Json> {
+                "source": Json.JString("template"),
+                "name": Json.JString(r.name),
+                "template": Json.JString(r.template),
+                "secret": Json.JBool(r.secret)
+            })
+        }
+    }
+}
+
+pub fn extraction_from_json(j: Json) -> Result<Extraction, string> {
+    val source = try json.require_string(j, "source")
+    val name = try json.require_string(j, "name")
+    val secret = optional_bool(j, "secret", false)
+    if source == "body" {
+        return ok(Extraction.Body(BodyRule {
+            name: name,
+            path: try json.require_string(j, "path"),
+            secret: secret
+        }))
+    }
+    if source == "header" {
+        return ok(Extraction.Header(HeaderRule {
+            name: name,
+            header: try json.require_string(j, "header"),
+            secret: secret
+        }))
+    }
+    if source == "template" {
+        return ok(Extraction.Template(TemplateRule {
+            name: name,
+            template: try json.require_string(j, "template"),
+            secret: secret
+        }))
+    }
+    return err(concat("unknown extraction source: ", source))
+}
+
+// A boolean that may be absent, which is what `#[serde(default)]` means on the wire.
+pub fn optional_bool(j: Json, key: string, fallback: bool) -> bool {
+    return switch json.get(j, key) {
+        Some(found) {
+            switch json.bool_from_json(found) {
+                Ok(b) { b }
+                Err(_) { fallback }
+            }
+        }
+        None { fallback }
+    }
+}
+
+// ---------------------------------------------------------------- applying the rules
+
+// One variable successfully extracted: its name, its value, and whether it should be masked when a
+// session is displayed.
+pub struct Extracted {
+    name: string
+    value: string
+    secret: bool
+}
+
+// Runs `rules` in order against `response`, answering every variable extracted.
+//
+// **A rule can see what an earlier rule in the same list extracted**, on top of `known_vars` (the
+// scope the request itself ran with). That is the whole point of the feature: a `Body` rule pulls a
+// token out and a `Template` rule right after it builds the `Authorization` header from it.
+//
+// **The first rule that cannot be satisfied fails the lot.** Callers only apply rules to a 2xx
+// response, where a missing path or header means the response is not the shape the collection was
+// written against -- a real problem, not an expected absence worth skipping quietly.
+pub fn apply(
+    rules: [Extraction],
+    response: ResponseSummary,
+    known_vars: Map<string, string>
+) -> Result<[Extracted], string> {
+    if len(rules) == 0 {
+        // Before the body is parsed, deliberately: a response that is not JSON is no reason to
+        // fail a request that asked for nothing to be extracted.
+        return ok([])
+    }
+    // `.ok()` in Rust: a body that is not JSON is `None` here and only fails a `Body` rule.
+    val body_json = switch json.parse(response.body) {
+        Ok(j) { Option<Json>.Some(j) }
+        Err(_) { Option<Json>.None }
+    }
+    val scope = mutable(known_vars)
+    val results = mutable_array_new<Extracted>()
+    for rule in rules {
+        val name = rule_name(rule)
+        val value = switch rule {
+            Body(r) {
+                if None = body_json {
+                    return err(prelude.format(
+                        "response body is not JSON, cannot extract \"{}\" via path \"{}\"",
+                        name,
+                        r.path
+                    ))
+                }
+                switch json_at_path(unwrap(body_json), r.path) {
+                    Some(found) { json_text_of(found) }
+                    None {
+                        return err(prelude.format(
+                            "path \"{}\" not found in response body (extracting \"{}\")",
+                            r.path,
+                            name
+                        ))
+                    }
+                }
+            }
+            Header(r) {
+                switch header_value(response.headers, r.header) {
+                    Some(found) { found }
+                    None {
+                        return err(prelude.format(
+                            "header \"{}\" not found in response (extracting \"{}\")",
+                            r.header,
+                            name
+                        ))
+                    }
+                }
+            }
+            Template(r) { try substitute(r.template, snapshot(scope)) }
+        }
+        set(scope, name, value)
+        push(results, Extracted { name: name, value: value, secret: rule_secret(rule) })
+    }
+    return ok(snapshot(results))
+}
+
+// A response header by name, matched case-insensitively as HTTP header names are. The first match
+// wins, which is what `find` does in Rust.
+fn header_value(headers: [Header], wanted: string) -> Option<string> {
+    val target = to_lower(wanted)
+    for h in headers {
+        if to_lower(h.name) == target {
+            return Some(h.value)
+        }
+    }
+    return None
+}
+
+// **A JSON string becomes its own text; anything else becomes its JSON.** So `42` extracts as
+// "42", `true` as "true", `null` as "null" and an object as its compact JSON -- matching Rust,
+// where a `Value::String` is cloned and everything else goes through `to_string()`. Without the
+// special case a token would arrive wrapped in quotes and every request using it would fail.
+fn json_text_of(j: Json) -> string {
+    return switch j {
+        JString(s) { s }
+        JNumber(_) { json.format(j) }
+        JBool(_) { json.format(j) }
+        JNull { json.format(j) }
+        JArray(_) { json.format(j) }
+        JObject(_) { json.format(j) }
+    }
+}
+
+// ---------------------------------------------------------------- the path
+
+// A step through a JSON document: a key of an object, or an index of an array.
+enum PathSegment {
+    Key(string)
+    Index(int)
+}
+
+// Parses `data.items[0].id` into `[Key(data), Key(items), Index(0), Key(id)]`. A leading `[0]` with
+// no key before it is valid, so `[0].id` works on a response whose top level is an array.
+//
+// **Malformed brackets are skipped rather than refused**, as in Rust: an unterminated `[` ends the
+// parse of that part, and `[abc]` contributes no segment because it does not parse as a number. A
+// path that resolves to nothing then fails in `apply` with the path quoted, which is a better error
+// than a parse complaint about a syntax nobody documented.
+fn parse_path(path: string) -> [PathSegment] {
+    val segments = mutable_array_new<PathSegment>()
+    for part in split(path, ".") {
+        val bracket = index_of(part, "[", 0)
+        if bracket < 0 {
+            if len(part) != 0 {
+                push(segments, PathSegment.Key(part))
+            }
+            continue
+        }
+        val key = substring(part, 0, bracket)
+        if len(key) != 0 {
+            push(segments, PathSegment.Key(key))
+        }
+        var rest = substring(part, bracket, len(part))
+        while starts_with(rest, "[") {
+            val after_open = substring(rest, 1, len(rest))
+            val close = index_of(after_open, "]", 0)
+            if close < 0 {
+                break
+            }
+            val inside = substring(after_open, 0, close)
+            if Ok(index) = parse_int(inside) {
+                push(segments, PathSegment.Index(index))
+            }
+            rest = substring(after_open, close + 1, len(after_open))
+        }
+    }
+    return snapshot(segments)
+}
+
+// Walks a parsed path. `None` the moment a segment does not resolve -- a missing key, an index past
+// the end, or a key used on an array (and an index on an object), which is what `serde_json`'s own
+// `get` answers for a mismatched container.
+pub fn json_at_path(root: Json, path: string) -> Option<Json> {
+    var current = root
+    for segment in parse_path(path) {
+        val next = switch segment {
+            Key(key) {
+                if !Json.is_JObject(current) {
+                    return None
+                }
+                json.get(current, key)
+            }
+            Index(index) {
+                if !Json.is_JArray(current) {
+                    return None
+                }
+                val cells = Json.unwrap_JArray(current)
+                if index < 0 || index >= len(cells) {
+                    Option<Json>.None
+                } else {
+                    Option<Json>.Some(cells[index])
+                }
+            }
+        }
+        if None = next {
+            return None
+        }
+        current = unwrap(next)
+    }
+    return Some(current)
+}

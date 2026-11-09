@@ -13,10 +13,10 @@ Curly isn't published to a package registry yet. For now, build it from source.
 ```sh
 git clone git@github.com:vasnatech/curly.git
 cd curly
-cargo build --release
+cd rust && cargo build --release
 ```
 
-The compiled binary is at `target/release/curly` (`target\release\curly.exe` on Windows). Either run it by full path, or copy/symlink it somewhere on your `PATH` (e.g. `~/.local/bin` on Linux/macOS) so you can just type `curly`.
+The compiled binary is at `rust/target/release/curly` (`target\release\curly.exe` on Windows). Either run it by full path, or copy/symlink it somewhere on your `PATH` (e.g. `~/.local/bin` on Linux/macOS) so you can just type `curly`.
 
 While developing, you can also run it directly without a separate build step:
 

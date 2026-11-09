@@ -1,0 +1,538 @@
+// `core/storage`: where a `.curly/` tree is found, and what reading and writing it does.
+//
+// Ported from `crates/curly-core/tests/storage_test.rs`, which is the biggest test file in the Rust
+// crate and for good reason -- **the failure mode here is silent**. A resolution order that is one
+// step out reads from the wrong directory and reports that the project has no collections; a slug
+// that differs by one character makes `load` miss a file `save` just wrote.
+//
+// These use a real directory under `fs.temp_dir()` rather than a fake filesystem, because the
+// things being tested are `exists`, `is_dir` and `parent_dir` on a real tree.
+use core/exec.ResponseSummary
+use core/model.Auth
+use core/model.BasicAuth
+use core/model.Body
+use core/model.Pair
+use core/model.Request
+use core/model.request_of
+use core/saved.Collection
+use core/saved.Environment
+use core/saved.SavedRequest
+use core/saved.Variable
+use core/saved.environment_set
+use core/saved.environment_unset
+use core/saved.kv_pair_of
+use core/storage.Storage
+use core/storage.append_history
+use core/storage.clear_all_sessions
+use core/storage.clear_session
+use core/storage.delete_collection
+use core/storage.find_project_local_root
+use core/storage.history_entry_of
+use core/storage.history_entry_to_json
+use core/storage.init_project_local
+use core/storage.list_collections
+use core/storage.list_environments
+use core/storage.list_history
+use core/storage.load_collection
+use core/storage.load_collection_opt
+use core/storage.load_environment_opt
+use core/storage.load_session
+use core/storage.resolve
+use core/storage.save_collection
+use core/storage.save_environment
+use core/storage.save_session
+use core/storage.slugify
+use core/storage.storage_of
+use fs
+use http.Header
+use http.HttpMethod
+use json
+use test
+use uuid
+use uuid.uuid_new
+
+// A directory of this test's own, named after the case, so no two cases can see each other's files.
+fn scratch(name: string) -> string {
+    val dir = fs.path_join(fs.temp_dir(), concat("curly-storage-test-", name, "-", uuid.format(uuid_new())))
+    if Err(e) = fs.make_dirs(dir) {
+        test.fail(concat("cannot make ", dir, ": ", fs.fs_error_message(e)))
+    }
+    return dir
+}
+
+// There is no `repeat` builtin, and these tests need a body either side of the 8192-byte cap.
+fn repeated(ch: string, times: int) -> string {
+    val out = mutable_string_new()
+    for _ in 0..times {
+        append(out, ch)
+    }
+    return snapshot(out)
+}
+
+fn a_collection(name: string) -> Collection {
+    return Collection {
+        id: uuid_new(),
+        name: name,
+        folders: [],
+        requests: [with a_request("get-user") { name: "get-user" }]
+    }
+}
+
+fn a_request(name: string) -> SavedRequest {
+    return SavedRequest {
+        id: uuid_new(),
+        name: name,
+        method: "GET",
+        url: "https://example.com/{{id}}",
+        query_params: [],
+        headers: [kv_pair_of("Accept", "application/json")],
+        body: None,
+        auth: None,
+        extract: []
+    }
+}
+
+// ---------------------------------------------------------------- slugify
+
+#[test]
+fn slugify_lowercases_and_collapses_separators() {
+    test.assert_eq("health-record-api", slugify("Health Record API"))
+    test.assert_eq("a-b", slugify("a    b"))
+    test.assert_eq("keeps_underscores-and-dashes", slugify("keeps_underscores and-dashes"))
+    test.assert_eq("trimmed", slugify("  Trimmed  "))
+}
+
+#[test]
+fn slugify_collapses_a_run_of_punctuation_to_one_dash() {
+    test.assert_eq("a-b", slugify("a!!!???b"))
+    test.assert_eq("a-b", slugify("a / b"))
+}
+
+#[test]
+fn slugify_trims_dashes_off_both_ends() {
+    test.assert_eq("name", slugify("...name..."))
+}
+
+#[test]
+fn slugify_answers_untitled_when_nothing_usable_is_left() {
+    // An empty filename would be a file called `.json`, which nothing could then address by name.
+    test.assert_eq("untitled", slugify(""))
+    test.assert_eq("untitled", slugify("!!!"))
+    test.assert_eq("untitled", slugify("   "))
+}
+
+#[test]
+fn slugify_drops_non_ascii_rather_than_lowercasing_it() {
+    // Rust's `is_ascii_alphanumeric` is false for these, so they collapse to a dash like any other
+    // separator. A filename of ASCII is the point.
+    test.assert_eq("caf", slugify("café"))
+    test.assert_eq("a-b", slugify("a→b"))
+}
+
+// ---------------------------------------------------------------- collections on disk
+
+#[test]
+fn a_collection_round_trips_through_disk() {
+    val s = storage_of(scratch("rt"))
+    test.assert_eq(true, is_ok(save_collection(s, a_collection("My API"))))
+    val back = load_collection(s, "My API")
+    if Err(why) = back {
+        test.fail(concat("load refused: ", why))
+    }
+    test.assert_eq("My API", unwrap(back).name)
+    test.assert_len(1, unwrap(back).requests)
+    test.assert_eq("get-user", unwrap(back).requests[0].name)
+}
+
+#[test]
+fn a_collection_is_found_by_any_name_with_the_same_slug() {
+    // `save` slugifies the collection's own name and `load` slugifies the name asked for, so
+    // casing and spacing do not have to match.
+    val s = storage_of(scratch("slug-lookup"))
+    test.assert_eq(true, is_ok(save_collection(s, a_collection("My API"))))
+    test.assert_eq(true, is_ok(load_collection(s, "my api")))
+    test.assert_eq(true, is_ok(load_collection(s, "MY   API")))
+}
+
+#[test]
+fn list_collections_answers_sorted_slugs() {
+    val s = storage_of(scratch("list"))
+    val _ = save_collection(s, a_collection("Zebra"))
+    val _ = save_collection(s, a_collection("alpha"))
+    val _ = save_collection(s, a_collection("Middle"))
+    test.assert_eq(["alpha", "middle", "zebra"], unwrap(list_collections(s)))
+}
+
+#[test]
+fn listing_a_directory_that_is_not_there_is_empty_not_an_error() {
+    // A storage root with nothing saved yet is the normal state of a new project.
+    val s = storage_of(scratch("empty"))
+    test.assert_len(0, unwrap(list_collections(s)))
+    test.assert_len(0, unwrap(list_environments(s)))
+    test.assert_len(0, unwrap(list_history(s, 10)))
+}
+
+#[test]
+fn loading_a_collection_that_is_not_there_refuses_and_names_it() {
+    val s = storage_of(scratch("missing"))
+    val why = switch load_collection(s, "Nope") {
+        Ok(_) { "no refusal" }
+        Err(message) { message }
+    }
+    test.assert_contains(why, "Nope")
+    // The path is in the message, because "no collection named X" with no location is the kind of
+    // error that sends somebody looking in the wrong directory.
+    test.assert_contains(why, "nope.json")
+}
+
+#[test]
+fn load_collection_opt_answers_nothing_rather_than_refusing() {
+    val s = storage_of(scratch("opt"))
+    test.assert_eq(true, is_None(unwrap(load_collection_opt(s, "Nope"))))
+    val _ = save_collection(s, a_collection("There"))
+    test.assert_eq(true, is_Some(unwrap(load_collection_opt(s, "There"))))
+}
+
+#[test]
+fn delete_collection_removes_it_and_refuses_a_second_time() {
+    val s = storage_of(scratch("delete"))
+    val _ = save_collection(s, a_collection("Gone"))
+    test.assert_eq(true, is_ok(delete_collection(s, "Gone")))
+    test.assert_len(0, unwrap(list_collections(s)))
+    test.assert_eq(true, !is_ok(delete_collection(s, "Gone")))
+}
+
+// ---------------------------------------------------------------- environments and sessions
+
+#[test]
+fn an_environment_round_trips_and_set_replaces_in_place() {
+    val s = storage_of(scratch("env"))
+    var env = Environment { name: "dev", variables: [] }
+    env = environment_set(env, "BASE_URL", "http://localhost:8080", false)
+    env = environment_set(env, "TOKEN", "t1", true)
+    env = environment_set(env, "BASE_URL", "http://localhost:9090", false)
+    test.assert_eq(true, is_ok(save_environment(s, env)))
+    val back = unwrap(unwrap(load_environment_opt(s, "dev")))
+    test.assert_len(2, back.variables)
+    // Replaced in place, so BASE_URL is still first -- re-setting a value must not reshuffle the
+    // file and turn a one-line change into a whole-file diff.
+    test.assert_eq("BASE_URL", back.variables[0].key)
+    test.assert_eq("http://localhost:9090", back.variables[0].value)
+    test.assert_eq(true, back.variables[1].secret)
+}
+
+#[test]
+fn environment_unset_removes_a_key_and_says_whether_it_did() {
+    var env = Environment { name: "dev", variables: [] }
+    env = environment_set(env, "A", "1", false)
+    env = environment_set(env, "B", "2", false)
+    val gone = environment_unset(env, "A")
+    test.assert_eq(true, gone.removed)
+    test.assert_len(1, gone.environment.variables)
+    test.assert_eq("B", gone.environment.variables[0].key)
+    // Nothing to remove is answered, not refused.
+    test.assert_eq(false, environment_unset(gone.environment, "A").removed)
+}
+
+#[test]
+fn load_environment_opt_answers_nothing_when_missing() {
+    val s = storage_of(scratch("env-opt"))
+    test.assert_eq(true, is_None(unwrap(load_environment_opt(s, "nope"))))
+}
+
+#[test]
+fn a_missing_session_is_an_empty_environment_not_an_error() {
+    // The first run of a scenario must not have to create a session first.
+    val s = storage_of(scratch("session-new"))
+    val session = unwrap(load_session(s, "dev"))
+    test.assert_eq("dev", session.name)
+    test.assert_len(0, session.variables)
+}
+
+#[test]
+fn a_session_is_independent_of_an_environment_of_the_same_name() {
+    // **The point of a separate directory**: an extracted token is a fact about this run, and must
+    // never be written back into the environment file somebody edits and commits.
+    val s = storage_of(scratch("session-sep"))
+    val _ = save_environment(s, Environment {
+        name: "dev",
+        variables: [Variable { key: "BASE_URL", value: "http://x", secret: false }]
+    })
+    val _ = save_session(s, Environment {
+        name: "dev",
+        variables: [Variable { key: "TOKEN", value: "abc", secret: true }]
+    })
+    val env = unwrap(unwrap(load_environment_opt(s, "dev")))
+    test.assert_len(1, env.variables)
+    test.assert_eq("BASE_URL", env.variables[0].key)
+    val session = unwrap(load_session(s, "dev"))
+    test.assert_len(1, session.variables)
+    test.assert_eq("TOKEN", session.variables[0].key)
+}
+
+#[test]
+fn clear_session_removes_only_that_environments_session() {
+    val s = storage_of(scratch("session-clear"))
+    val _ = save_session(s, Environment { name: "dev", variables: [Variable { key: "A", value: "1", secret: false }] })
+    val _ = save_session(s, Environment { name: "prod", variables: [Variable { key: "B", value: "2", secret: false }] })
+    test.assert_eq(true, is_ok(clear_session(s, "dev")))
+    test.assert_len(0, unwrap(load_session(s, "dev")).variables)
+    test.assert_len(1, unwrap(load_session(s, "prod")).variables)
+}
+
+#[test]
+fn clearing_a_session_that_is_not_there_is_a_no_op() {
+    val s = storage_of(scratch("session-noop"))
+    test.assert_eq(true, is_ok(clear_session(s, "dev")))
+    test.assert_eq(true, is_ok(clear_all_sessions(s)))
+}
+
+#[test]
+fn clear_all_sessions_removes_every_environments_session() {
+    val s = storage_of(scratch("session-all"))
+    val _ = save_session(s, Environment { name: "dev", variables: [Variable { key: "A", value: "1", secret: false }] })
+    val _ = save_session(s, Environment { name: "prod", variables: [Variable { key: "B", value: "2", secret: false }] })
+    test.assert_eq(true, is_ok(clear_all_sessions(s)))
+    test.assert_len(0, unwrap(load_session(s, "dev")).variables)
+    test.assert_len(0, unwrap(load_session(s, "prod")).variables)
+}
+
+// ---------------------------------------------------------------- finding the root
+
+#[test]
+fn find_project_local_root_finds_dot_curly_in_the_starting_directory() {
+    val dir = scratch("find-here")
+    val _ = fs.make_dirs(fs.path_join(dir, ".curly"))
+    test.assert_eq(fs.path_join(dir, ".curly"), unwrap(find_project_local_root(dir)))
+}
+
+#[test]
+fn find_project_local_root_walks_up_through_ancestors() {
+    // The reason this exists: a project three directories deep shares one storage root with the
+    // rest of the project, the way git finds `.git`.
+    val dir = scratch("find-up")
+    val _ = fs.make_dirs(fs.path_join(dir, ".curly"))
+    val deep = fs.path_join(dir, "a", "b", "c")
+    val _ = fs.make_dirs(deep)
+    test.assert_eq(fs.path_join(dir, ".curly"), unwrap(find_project_local_root(deep)))
+}
+
+#[test]
+fn find_project_local_root_answers_nothing_when_there_is_none() {
+    // Walks to the filesystem root and stops, rather than looping.
+    val dir = scratch("find-none")
+    test.assert_eq(true, is_None(find_project_local_root(fs.path_join(dir, "deep", "deeper"))))
+}
+
+#[test]
+fn find_project_local_root_ignores_a_file_named_dot_curly() {
+    // `is_dir`, not `exists`: a file of that name is not a storage root, and treating it as one
+    // would produce confusing errors from every later read.
+    val dir = scratch("find-file")
+    val _ = fs.write_text(fs.path_join(dir, ".curly"), "not a directory")
+    test.assert_eq(true, is_None(find_project_local_root(dir)))
+}
+
+// ---------------------------------------------------------------- the precedence order
+
+#[test]
+fn resolve_prefers_an_explicit_path_over_everything() {
+    val dir = scratch("res-explicit")
+    val _ = fs.make_dirs(fs.path_join(dir, ".curly"))
+    val chosen = unwrap(resolve(Some("/explicit/path"), Some("/from/env"), dir))
+    test.assert_eq("/explicit/path", chosen.root)
+}
+
+#[test]
+fn resolve_prefers_the_variable_over_an_auto_detected_root() {
+    val dir = scratch("res-env")
+    val _ = fs.make_dirs(fs.path_join(dir, ".curly"))
+    test.assert_eq("/from/env", unwrap(resolve(None, Some("/from/env"), dir)).root)
+}
+
+#[test]
+fn resolve_falls_back_to_the_auto_detected_root() {
+    val dir = scratch("res-local")
+    val _ = fs.make_dirs(fs.path_join(dir, ".curly"))
+    test.assert_eq(fs.path_join(dir, ".curly"), unwrap(resolve(None, None, dir)).root)
+}
+
+#[test]
+fn resolve_ignores_a_blank_variable() {
+    // `export CURLY_DATA_DIR=` must not point storage at nothing; it means unset.
+    val dir = scratch("res-blank")
+    val _ = fs.make_dirs(fs.path_join(dir, ".curly"))
+    test.assert_eq(fs.path_join(dir, ".curly"), unwrap(resolve(None, Some(""), dir)).root)
+    test.assert_eq(fs.path_join(dir, ".curly"), unwrap(resolve(None, Some("   "), dir)).root)
+}
+
+#[test]
+fn resolve_falls_back_to_the_default_location_when_nothing_else_matches() {
+    val dir = scratch("res-default")
+    val chosen = resolve(None, None, fs.path_join(dir, "no", "curly", "here"))
+    // The default ends in `curly`; what precedes it depends on the OS and the environment.
+    if Ok(s) = chosen {
+        test.assert_contains(s.root, "curly")
+    }
+}
+
+// ---------------------------------------------------------------- init
+
+#[test]
+fn init_project_local_creates_dot_curly_with_a_gitignore() {
+    val dir = scratch("init")
+    val made = unwrap(init_project_local(dir))
+    test.assert_eq(true, made.created)
+    test.assert_eq(fs.path_join(dir, ".curly"), made.storage.root)
+    // **Only `collections/` is meant to be committed**; the other three hold real credentials.
+    val ignored = unwrap(fs.read_text(fs.path_join(dir, ".curly", ".gitignore")))
+    test.assert_contains(ignored, "environments/")
+    test.assert_contains(ignored, "session/")
+    test.assert_contains(ignored, "history/")
+    test.assert_not_contains(ignored, "collections/")
+}
+
+#[test]
+fn init_project_local_is_idempotent_and_says_it_did_not_create() {
+    // As `git init` is on an existing repo -- and it must not overwrite a `.gitignore` somebody
+    // has edited, which is why the file is written only on creation.
+    val dir = scratch("init-twice")
+    unwrap(init_project_local(dir))
+    val _ = fs.write_text(fs.path_join(dir, ".curly", ".gitignore"), "edited by hand\n")
+    val again = unwrap(init_project_local(dir))
+    test.assert_eq(false, again.created)
+    test.assert_eq("edited by hand\n", unwrap(fs.read_text(fs.path_join(dir, ".curly", ".gitignore"))))
+}
+
+// ---------------------------------------------------------------- history
+
+fn an_exchange(body: string) -> ResponseSummary {
+    return ResponseSummary {
+        status: 200,
+        headers: [Header { name: "Content-Type", value: "application/json" }],
+        body: body,
+        body_bytes: to_bytes(body),
+        elapsed_millis: 12
+    }
+}
+
+#[test]
+fn a_history_entry_redacts_credential_headers() {
+    // **The difference between a history file and a credential file.**
+    val request = with request_of(HttpMethod.Get, "https://example.com") {
+        headers: [
+            Header { name: "Authorization", value: "Bearer supersecret" },
+            Header { name: "X-Api-Key", value: "key123" },
+            Header { name: "Cookie", value: "session=abc" },
+            Header { name: "Accept", value: "application/json" }
+        ]
+    }
+    val entry = history_entry_of(request, an_exchange("{}"))
+    test.assert_eq("***redacted***", entry.request_headers[0].value)
+    test.assert_eq("***redacted***", entry.request_headers[1].value)
+    test.assert_eq("***redacted***", entry.request_headers[2].value)
+    // Everything else is kept as it was.
+    test.assert_eq("application/json", entry.request_headers[3].value)
+}
+
+#[test]
+fn a_history_entry_records_the_auth_kind_but_never_the_credentials() {
+    val basic = history_entry_of(
+        with request_of(HttpMethod.Get, "https://example.com") {
+            auth: Some(Auth.Basic(BasicAuth { username: "ann", password: "s3cret" }))
+        },
+        an_exchange("{}")
+    )
+    test.assert_eq(true, is_Some(basic.request_auth_kind))
+    val written = json.format(history_entry_to_json(basic))
+    test.assert_contains(written, "\"basic\"")
+    test.assert_not_contains(written, "s3cret")
+    test.assert_not_contains(written, "ann")
+}
+
+#[test]
+fn a_history_entry_records_a_raw_request_body_and_no_other_kind() {
+    val raw = history_entry_of(
+        with request_of(HttpMethod.Post, "https://example.com") { body: Some(Body.Raw("{\"a\":1}")) },
+        an_exchange("{}")
+    )
+    test.assert_eq("{\"a\":1}", unwrap(raw.request_body))
+    // A form body is not recorded: `None` covers both "no body" and "a kind history does not
+    // record", which this cannot tell apart -- as in Rust.
+    val form = history_entry_of(
+        with request_of(HttpMethod.Post, "https://example.com") {
+            body: Some(Body.Form([Pair { name: "a", value: "1" }]))
+        },
+        an_exchange("{}")
+    )
+    test.assert_eq(true, is_None(form.request_body))
+}
+
+#[test]
+fn a_history_entry_truncates_a_large_body_and_says_so() {
+    val big = repeated("x", 9000)
+    val entry = history_entry_of(
+        with request_of(HttpMethod.Post, "https://example.com") { body: Some(Body.Raw(big)) },
+        an_exchange(big)
+    )
+    test.assert_eq(true, entry.request_body_truncated)
+    test.assert_eq(true, entry.response_body_truncated)
+    test.assert_eq(8192, len(unwrap(entry.request_body)))
+    test.assert_eq(8192, len(entry.response_body))
+    // A body at the cap exactly is not truncated.
+    val exact = history_entry_of(request_of(HttpMethod.Get, "https://example.com"), an_exchange(repeated("y", 8192)))
+    test.assert_eq(false, exact.response_body_truncated)
+}
+
+#[test]
+fn history_entries_are_appended_and_listed_newest_first() {
+    val s = storage_of(scratch("history"))
+    for i in 0..3 {
+        val entry = with history_entry_of(request_of(HttpMethod.Get, "https://example.com"), an_exchange("{}")) {
+            url: concat("https://example.com/", str(i)),
+            sent_at: "2026-11-09T04:00:00Z"
+        }
+        test.assert_eq(true, is_ok(append_history(s, entry)))
+    }
+    val listed = unwrap(list_history(s, 10))
+    test.assert_len(3, listed)
+    // Newest first, which within one day file means the last line comes back first.
+    test.assert_eq("https://example.com/2", listed[0].url)
+    test.assert_eq("https://example.com/0", listed[2].url)
+}
+
+#[test]
+fn list_history_stops_at_the_limit() {
+    val s = storage_of(scratch("history-limit"))
+    for i in 0..5 {
+        val _ = append_history(s, with history_entry_of(request_of(HttpMethod.Get, "https://x"), an_exchange("{}")) {
+            url: concat("https://x/", str(i)),
+            sent_at: "2026-11-09T04:00:00Z"
+        })
+    }
+    test.assert_len(2, unwrap(list_history(s, 2)))
+    test.assert_eq("https://x/4", unwrap(list_history(s, 2))[0].url)
+}
+
+#[test]
+fn a_history_entry_written_before_the_newer_fields_still_reads() {
+    // A history file is append-only, so a reader that refused an old line would make
+    // `curly history` unusable the first time the schema moved.
+    val s = storage_of(scratch("history-old"))
+    val dir = fs.path_join(s.root, "history")
+    val _ = fs.make_dirs(dir)
+    val _ = fs.write_text(
+        fs.path_join(dir, "2026-01-01.jsonl"),
+        concat(
+            "{\"sent_at\":\"2026-01-01T00:00:00Z\",\"method\":\"GET\",\"url\":\"https://old\",",
+            "\"request_headers\":[],\"status\":200,\"elapsed_ms\":5,\"response_headers\":[],",
+            "\"response_body\":\"{}\",\"response_body_truncated\":false}\n"
+        )
+    )
+    val listed = unwrap(list_history(s, 10))
+    test.assert_len(1, listed)
+    test.assert_eq("https://old", listed[0].url)
+    test.assert_eq(true, is_None(listed[0].request_body))
+    test.assert_eq(false, listed[0].request_body_truncated)
+    test.assert_eq(true, is_None(listed[0].request_auth_kind))
+}

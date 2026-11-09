@@ -1,0 +1,699 @@
+// Where a `.curly/` tree lives, and reading and writing the files in it.
+//
+// Layout under the storage root:
+//
+//     .curly/
+//     |-- collections/<slug>.json    one file per collection, requests embedded inline
+//     |-- environments/<slug>.json   one file per environment
+//     |-- scenarios/<slug>.json      one file per scenario
+//     |-- session/<slug>.json        variables extracted at run time, per environment
+//     `-- history/<yyyy-mm-dd>.jsonl one line per completed exchange
+//
+// **The precedence order in `resolve` is the part worth getting exactly right**, because getting it
+// wrong means reading somebody's collections from the wrong place and reporting that they have
+// none. It is, in order: an explicit `--data-dir`, then `CURLY_DATA_DIR`, then the nearest `.curly`
+// walking up from the working directory, then the OS default. `resolve` takes the working directory
+// and the variable's value as arguments rather than reading the process state itself, exactly as
+// Rust does and for the same reason -- the precedence is then testable without mutating the
+// environment. `resolve_default` is the wiring to the real process.
+//
+// **Scenarios are not here yet.** Rust's `load_scenario`/`save_scenario` are a copy of the
+// collection pair with `Scenario` in place of `Collection`, and `core/scenario.zm` is not written;
+// they land with it rather than as a stub that cannot be called.
+use clock
+use core/exec.ResponseSummary
+use core/model.Auth
+use core/model.Body
+use core/model.Request
+use core/saved.Collection
+use core/saved.Environment
+use core/saved.collection_from_json
+use core/saved.collection_to_json
+use core/saved.environment_from_json
+use core/saved.environment_to_json
+use fs
+use http
+use json
+use json.Json
+use os
+
+// The directory `curly init` creates and `find_project_local_root` looks for.
+pub val project_local_dir_name = ".curly"
+
+pub struct Storage {
+    root: string
+}
+
+pub fn storage_of(root: string) -> Storage {
+    return Storage { root: root }
+}
+
+// **Walks up from `start` looking for a `.curly` directory, the way git finds `.git`.** Answers the
+// `.curly` path itself, not its parent. A project three directories deep therefore shares one
+// storage root with the rest of the project, which is the whole point -- the alternative is each
+// subdirectory having its own collections.
+pub fn find_project_local_root(start: string) -> Option<string> {
+    var dir = start
+    while true {
+        val candidate = fs.path_join(dir, project_local_dir_name)
+        if fs.is_dir(candidate) {
+            return Some(candidate)
+        }
+        val parent = fs.parent_dir(dir)
+        // `parent_dir` of a root answers the root, so equality is what ends the walk.
+        if parent == dir || len(parent) == 0 {
+            return None
+        }
+        dir = parent
+    }
+    return None
+}
+
+// A display name as a filename: lowercase, `[a-z0-9-_]` only, and a run of anything else collapsed
+// to a single `-`. Leading and trailing dashes are trimmed, and a name with nothing usable in it
+// becomes `untitled` rather than an empty filename.
+pub fn slugify(name: string) -> string {
+    val out = mutable_string_new()
+    var last_was_dash = false
+    val text = trim(name)
+    for i in 0..len(text) {
+        val ch = substring(text, i, i + 1)
+        if is_alpha_numeric(ch) && byte_len(ch) == 1 {
+            // ASCII alphanumeric only: `is_alpha_numeric` is true for letters outside ASCII too,
+            // and Rust's `is_ascii_alphanumeric` is not, so the byte width is what separates them.
+            append(out, to_lower(ch))
+            last_was_dash = false
+            continue
+        }
+        if ch == "-" || ch == "_" {
+            append(out, ch)
+            last_was_dash = false
+            continue
+        }
+        if !last_was_dash {
+            append(out, "-")
+            last_was_dash = true
+        }
+    }
+    val trimmed = trim_chars(snapshot(out), "-")
+    if len(trimmed) == 0 {
+        return "untitled"
+    }
+    return trimmed
+}
+
+// `trim_matches('-')`: dashes off both ends, however many.
+fn trim_chars(text: string, ch: string) -> string {
+    var from = 0
+    var to = len(text)
+    while from < to && substring(text, from, from + 1) == ch {
+        from = from + 1
+    }
+    while to > from && substring(text, to - 1, to) == ch {
+        to = to - 1
+    }
+    return substring(text, from, to)
+}
+
+// ---------------------------------------------------------------- where storage lives
+
+// The OS data directory plus `curly`: `$XDG_DATA_HOME/curly`, or `~/.local/share/curly` when that
+// is unset, which is what `dirs::data_dir()` answers on Linux.
+pub fn default_location() -> Result<Storage, string> {
+    if Some(xdg) = os.get_env("XDG_DATA_HOME") {
+        if len(trim(xdg)) != 0 {
+            return ok(storage_of(fs.path_join(xdg, "curly")))
+        }
+    }
+    val home = switch os.get_env("HOME") {
+        Some(h) { h }
+        None { return err("could not determine the user data directory for this OS") }
+    }
+    if len(trim(home)) == 0 {
+        return err("could not determine the user data directory for this OS")
+    }
+    return ok(storage_of(fs.path_join(home, ".local", "share", "curly")))
+}
+
+// Whether this root is the OS-wide default, as against a project-local `.curly` or an explicit
+// override -- so a caller can label that case ("Default" rather than a path). Best effort: false
+// when the default cannot be worked out.
+pub fn is_default_location(s: Storage) -> bool {
+    return switch default_location() {
+        Ok(d) { d.root == s.root }
+        Err(_) { false }
+    }
+}
+
+// What `init_project_local` answers: Ziman has no tuple type, so Rust's `(Storage, bool)` is a
+// named pair.
+pub struct InitOutcome {
+    storage: Storage
+    created: bool
+}
+
+// Creates -- or opens, if one is already there -- a project-local `.curly` at `dir`. **Idempotent,
+// as `git init` is on an existing repo**, and `created` says which happened.
+//
+// The `.gitignore` is written only when the directory is actually created, and it excludes
+// `environments/`, `session/` and `history/` because those hold real credentials and tokens.
+// **Only `collections/` is meant to be committed.**
+pub fn init_project_local(dir: string) -> Result<InitOutcome, string> {
+    val root = fs.path_join(dir, project_local_dir_name)
+    if fs.is_dir(root) {
+        return ok(InitOutcome { storage: storage_of(root), created: false })
+    }
+    if Err(e) = fs.make_dirs(root) {
+        return err(concat("failed to create ", root, ": ", fs.fs_error_message(e)))
+    }
+    val gitignore = fs.path_join(root, ".gitignore")
+    if Err(e) = fs.write_text(gitignore, "environments/\nsession/\nhistory/\n") {
+        return err(concat("failed to write ", gitignore, ": ", fs.fs_error_message(e)))
+    }
+    return ok(InitOutcome { storage: storage_of(root), created: true })
+}
+
+// **The precedence order**, with the working directory and the variable passed in so that it can be
+// tested without touching the real process state.
+pub fn resolve(explicit: Option<string>, env_data_dir: Option<string>, cwd: string) -> Result<Storage, string> {
+    if Some(path) = explicit {
+        return ok(storage_of(path))
+    }
+    if Some(from_env) = env_data_dir {
+        // An empty or blank variable is treated as unset: exporting `CURLY_DATA_DIR=` should not
+        // point storage at the current directory.
+        if len(trim(from_env)) != 0 {
+            return ok(storage_of(from_env))
+        }
+    }
+    if Some(local) = find_project_local_root(cwd) {
+        return ok(storage_of(local))
+    }
+    return default_location()
+}
+
+// `resolve` wired to the real working directory and `CURLY_DATA_DIR`, which is what the CLI calls.
+pub fn resolve_default(explicit: Option<string>) -> Result<Storage, string> {
+    val cwd = switch os.cwd() {
+        Ok(d) { d }
+        Err(why) { return err(concat("failed to determine current directory: ", why)) }
+    }
+    return resolve(explicit, os.get_env("CURLY_DATA_DIR"), cwd)
+}
+
+// ---------------------------------------------------------------- paths
+
+pub fn root_of(s: Storage) -> string {
+    return s.root
+}
+
+fn collections_dir(s: Storage) -> string {
+    return fs.path_join(s.root, "collections")
+}
+
+fn environments_dir(s: Storage) -> string {
+    return fs.path_join(s.root, "environments")
+}
+
+fn session_dir(s: Storage) -> string {
+    return fs.path_join(s.root, "session")
+}
+
+fn history_dir(s: Storage) -> string {
+    return fs.path_join(s.root, "history")
+}
+
+fn json_path(dir: string, name: string) -> string {
+    return fs.path_join(dir, concat(slugify(name), ".json"))
+}
+
+// Every `.json` stem in a directory, sorted. **A directory that is not there is empty, not an
+// error**: a storage root with no environments yet is the normal state of a new project.
+fn list_json_names(dir: string) -> Result<[string], string> {
+    if !fs.exists(dir) {
+        return ok([])
+    }
+    val entries = switch fs.list_dir(dir) {
+        Ok(found) { found }
+        Err(e) { return err(concat("failed to read ", dir, ": ", fs.fs_error_message(e))) }
+    }
+    val names = mutable_array_new<string>()
+    for entry in entries {
+        // **`fs.extension` answers `.json`, with the dot**, where Rust's `Path::extension` answers
+        // `json` without one. And `fs.list_dir` answers bare names, not paths, so the stem is just
+        // the name with its extension cut.
+        if fs.extension(entry) == ".json" {
+            push(names, substring(entry, 0, len(entry) - 5))
+        }
+    }
+    return ok(sort(snapshot(names)))
+}
+
+// ---------------------------------------------------------------- reading and writing
+
+fn read_json(path: string, what: string, name: string) -> Result<Json, string> {
+    val text = switch fs.read_text(path) {
+        Ok(t) { t }
+        Err(_) { return err(prelude.format("no {} named \"{}\" (looked in {})", what, name, path)) }
+    }
+    return switch json.parse(text) {
+        Ok(j) { ok(j) }
+        Err(why) { err(prelude.format("failed to parse {} file: {} ({})", what, path, why)) }
+    }
+}
+
+// `serde_json::to_string_pretty` plus `fs::write`: two-space indent and **no trailing newline**.
+// Confirmed against the Rust binary's own output; a newline here would rewrite every file in the
+// tree on first save.
+fn write_json(dir: string, path: string, value: Json) -> Result<unit, string> {
+    if Err(e) = fs.make_dirs(dir) {
+        return err(concat("failed to create ", dir, ": ", fs.fs_error_message(e)))
+    }
+    if Err(e) = fs.write_text(path, json.format(value, 2)) {
+        return err(concat("failed to write ", path, ": ", fs.fs_error_message(e)))
+    }
+    return ok(unit)
+}
+
+pub fn list_collections(s: Storage) -> Result<[string], string> {
+    return list_json_names(collections_dir(s))
+}
+
+pub fn load_collection(s: Storage, name: string) -> Result<Collection, string> {
+    val j = try read_json(json_path(collections_dir(s), name), "collection", name)
+    return collection_from_json(j)
+}
+
+// `None` rather than an error when there is no such file, which is what `collections add-request`
+// needs to create a collection on first use.
+pub fn load_collection_opt(s: Storage, name: string) -> Result<Option<Collection>, string> {
+    if !fs.exists(json_path(collections_dir(s), name)) {
+        return ok(None)
+    }
+    return ok(Some(try load_collection(s, name)))
+}
+
+pub fn save_collection(s: Storage, collection: Collection) -> Result<unit, string> {
+    val dir = collections_dir(s)
+    return write_json(dir, json_path(dir, collection.name), collection_to_json(collection))
+}
+
+pub fn delete_collection(s: Storage, name: string) -> Result<unit, string> {
+    val path = json_path(collections_dir(s), name)
+    if Err(_) = fs.remove(path) {
+        return err(prelude.format("no collection named \"{}\" (looked in {})", name, path))
+    }
+    return ok(unit)
+}
+
+pub fn list_environments(s: Storage) -> Result<[string], string> {
+    return list_json_names(environments_dir(s))
+}
+
+pub fn load_environment(s: Storage, name: string) -> Result<Environment, string> {
+    val j = try read_json(json_path(environments_dir(s), name), "environment", name)
+    return environment_from_json(j)
+}
+
+// Absence is not an error for the always-merged `global` environment.
+pub fn load_environment_opt(s: Storage, name: string) -> Result<Option<Environment>, string> {
+    if !fs.exists(json_path(environments_dir(s), name)) {
+        return ok(None)
+    }
+    return ok(Some(try load_environment(s, name)))
+}
+
+pub fn save_environment(s: Storage, env: Environment) -> Result<unit, string> {
+    val dir = environments_dir(s)
+    return write_json(dir, json_path(dir, env.name), environment_to_json(env))
+}
+
+pub fn delete_environment(s: Storage, name: string) -> Result<unit, string> {
+    val path = json_path(environments_dir(s), name)
+    if Err(_) = fs.remove(path) {
+        return err(prelude.format("no environment named \"{}\" (looked in {})", name, path))
+    }
+    return ok(unit)
+}
+
+// ---------------------------------------------------------------- the session
+//
+// Variables extracted at run time, kept per environment and **never written back into the
+// environment file**: an extracted token is a fact about this run, not a setting somebody chose.
+
+// An empty session rather than an error when there is none, so the first run of a scenario does not
+// have to create one first.
+pub fn load_session(s: Storage, env_name: string) -> Result<Environment, string> {
+    val path = json_path(session_dir(s), env_name)
+    if !fs.exists(path) {
+        return ok(Environment { name: env_name, variables: [] })
+    }
+    val j = try read_json(path, "session", env_name)
+    return environment_from_json(j)
+}
+
+pub fn save_session(s: Storage, session: Environment) -> Result<unit, string> {
+    val dir = session_dir(s)
+    return write_json(dir, json_path(dir, session.name), environment_to_json(session))
+}
+
+// Every environment's session at once, by removing the directory. A no-op when there is none.
+pub fn clear_all_sessions(s: Storage) -> Result<unit, string> {
+    val dir = session_dir(s)
+    if !fs.exists(dir) {
+        return ok(unit)
+    }
+    if Err(e) = fs.remove_all(dir) {
+        return err(concat("failed to remove ", dir, ": ", fs.fs_error_message(e)))
+    }
+    return ok(unit)
+}
+
+// A no-op, not an error, when there was nothing to clear.
+pub fn clear_session(s: Storage, env_name: string) -> Result<unit, string> {
+    val path = json_path(session_dir(s), env_name)
+    if !fs.exists(path) {
+        return ok(unit)
+    }
+    if Err(e) = fs.remove(path) {
+        return err(concat("failed to remove ", path, ": ", fs.fs_error_message(e)))
+    }
+    return ok(unit)
+}
+
+// ---------------------------------------------------------------- history
+
+pub val max_history_body_bytes = 8192
+pub val redacted = "***redacted***"
+
+// Which kind of auth a recorded request used -- **never the credentials themselves**.
+pub enum HistoryAuthKind {
+    Basic
+    Bearer
+}
+
+fn auth_kind_name(k: HistoryAuthKind) -> string {
+    return switch k {
+        Basic { "basic" }
+        Bearer { "bearer" }
+    }
+}
+
+// One completed exchange, for `curly history`.
+//
+// **Three things are deliberately not recorded in full**: a header value that looks like a
+// credential is replaced with `redacted`, auth is recorded as its kind only, and both bodies are
+// capped. The cap keeps history files small; the other two are the difference between a history
+// file and a credential file.
+//
+// `sent_at` is held as its RFC 3339 text rather than an instant, because the only two things done
+// with it are writing it and taking its date for the filename.
+pub struct HistoryEntry {
+    sent_at: string
+    method: string
+    url: string
+    request_headers: [http.Header]
+    // Only ever set for a `Raw` request body. `None` covers both "no body" and "a body kind history
+    // does not record", which this alone cannot tell apart -- as in Rust.
+    request_body: Option<string>
+    request_body_truncated: bool
+    request_auth_kind: Option<HistoryAuthKind>
+    status: int
+    elapsed_ms: int
+    response_headers: [http.Header]
+    response_body: string
+    response_body_truncated: bool
+}
+
+struct TruncatedBody {
+    text: string
+    truncated: bool
+}
+
+// At most `max_history_body_bytes`, cut only at a character boundary.
+//
+// **A character whose first byte is inside the cap is kept whole**, so the result can exceed the cap
+// by up to three bytes. That is Rust's `take_while(|(byte_idx, _)| *byte_idx < MAX)` exactly, and
+// the alternative -- cutting mid-character -- produces text that is not valid UTF-8.
+fn truncate_body(text: string) -> TruncatedBody {
+    if byte_len(text) <= max_history_body_bytes {
+        return TruncatedBody { text: text, truncated: false }
+    }
+    val out = mutable_string_new()
+    var byte_at = 0
+    for i in 0..len(text) {
+        if byte_at >= max_history_body_bytes {
+            break
+        }
+        val ch = substring(text, i, i + 1)
+        append(out, ch)
+        byte_at = byte_at + byte_len(ch)
+    }
+    return TruncatedBody { text: snapshot(out), truncated: true }
+}
+
+// The header names whose values never reach a history file.
+fn is_credential_header(name: string) -> bool {
+    val lower = to_lower(name)
+    return lower == "authorization" || lower == "x-api-key" || lower == "cookie"
+}
+
+pub fn history_entry_of(request: Request, response: ResponseSummary) -> HistoryEntry {
+    val headers = mutable_array_new<http.Header>()
+    for h in request.headers {
+        push(headers, http.Header {
+            name: h.name,
+            value: if is_credential_header(h.name) { redacted } else { h.value }
+        })
+    }
+    var body = Option<string>.None
+    var body_truncated = false
+    if Some(b) = request.body {
+        switch b {
+            Raw(content) {
+                val cut = truncate_body(content)
+                body = Option<string>.Some(cut.text)
+                body_truncated = cut.truncated
+            }
+            Binary(_) {}
+            Form(_) {}
+            Multipart(_) {}
+        }
+    }
+    val kind = switch request.auth {
+        Some(a) {
+            switch a {
+                Basic(_) { Option<HistoryAuthKind>.Some(HistoryAuthKind.Basic) }
+                Bearer(_) { Option<HistoryAuthKind>.Some(HistoryAuthKind.Bearer) }
+            }
+        }
+        None { Option<HistoryAuthKind>.None }
+    }
+    val answered = truncate_body(response.body)
+    return HistoryEntry {
+        sent_at: clock.now_iso(),
+        method: http.method_name(request.method),
+        url: request.url,
+        request_headers: snapshot(headers),
+        request_body: body,
+        request_body_truncated: body_truncated,
+        request_auth_kind: kind,
+        status: response.status,
+        elapsed_ms: response.elapsed_millis,
+        response_headers: response.headers,
+        response_body: answered.text,
+        response_body_truncated: answered.truncated
+    }
+}
+
+fn header_pairs_to_json(headers: [http.Header]) -> Json {
+    val out = mutable_array_new<Json>()
+    for h in headers {
+        // `Vec<(String, String)>`, so a pair of arrays rather than an object.
+        push(out, Json.JArray([Json.JString(h.name), Json.JString(h.value)]))
+    }
+    return Json.JArray(snapshot(out))
+}
+
+pub fn history_entry_to_json(e: HistoryEntry) -> Json {
+    return Json.JObject(Map<string, Json> {
+        "sent_at": Json.JString(e.sent_at),
+        "method": Json.JString(e.method),
+        "url": Json.JString(e.url),
+        "request_headers": header_pairs_to_json(e.request_headers),
+        "request_body": switch e.request_body {
+            Some(b) { Json.JString(b) }
+            None { Json.JNull }
+        },
+        "request_body_truncated": Json.JBool(e.request_body_truncated),
+        "request_auth_kind": switch e.request_auth_kind {
+            Some(k) { Json.JString(auth_kind_name(k)) }
+            None { Json.JNull }
+        },
+        "status": json.int_to_json(e.status),
+        "elapsed_ms": json.int_to_json(e.elapsed_ms),
+        "response_headers": header_pairs_to_json(e.response_headers),
+        "response_body": Json.JString(e.response_body),
+        "response_body_truncated": Json.JBool(e.response_body_truncated)
+    })
+}
+
+// One file per day, one **compact** JSON object per line -- `.jsonl`, so appending costs nothing and
+// a day's history can be read a line at a time.
+pub fn append_history(s: Storage, entry: HistoryEntry) -> Result<unit, string> {
+    val dir = history_dir(s)
+    if Err(e) = fs.make_dirs(dir) {
+        return err(concat("failed to create ", dir, ": ", fs.fs_error_message(e)))
+    }
+    // The date out of the RFC 3339 text, which is `%Y-%m-%d` by construction.
+    val day = if len(entry.sent_at) >= 10 { substring(entry.sent_at, 0, 10) } else { entry.sent_at }
+    val path = fs.path_join(dir, concat(day, ".jsonl"))
+    if Err(e) = fs.append_text(path, concat(json.format(history_entry_to_json(entry)), "\n")) {
+        return err(concat("failed to open ", path, ": ", fs.fs_error_message(e)))
+    }
+    return ok(unit)
+}
+
+pub fn history_entry_from_json(j: Json) -> Result<HistoryEntry, string> {
+    val kind = switch json.get(j, "request_auth_kind") {
+        Some(found) {
+            if Json.is_JNull(found) {
+                Option<HistoryAuthKind>.None
+            } else {
+                val name = try json.string_from_json(found)
+                if name == "basic" {
+                    Option<HistoryAuthKind>.Some(HistoryAuthKind.Basic)
+                } else {
+                    if name == "bearer" {
+                        Option<HistoryAuthKind>.Some(HistoryAuthKind.Bearer)
+                    } else {
+                        return err(concat("unknown auth kind in history: ", name))
+                    }
+                }
+            }
+        }
+        None { Option<HistoryAuthKind>.None }
+    }
+    val body = switch json.get(j, "request_body") {
+        Some(found) {
+            if Json.is_JNull(found) {
+                Option<string>.None
+            } else {
+                Option<string>.Some(try json.string_from_json(found))
+            }
+        }
+        None { Option<string>.None }
+    }
+    return ok(HistoryEntry {
+        sent_at: try json.require_string(j, "sent_at"),
+        method: try json.require_string(j, "method"),
+        url: try json.require_string(j, "url"),
+        request_headers: try header_pairs_from_json(j, "request_headers"),
+        // **The four `#[serde(default)]` fields.** An entry written before they existed has none of
+        // them, and a history file is append-only -- so a reader that refused an old line would
+        // make `curly history` unusable the first time the schema moved.
+        request_body: body,
+        request_body_truncated: optional_bool(j, "request_body_truncated", false),
+        request_auth_kind: kind,
+        status: try json.require_int(j, "status"),
+        elapsed_ms: try json.require_int(j, "elapsed_ms"),
+        response_headers: try header_pairs_from_json(j, "response_headers"),
+        response_body: try json.require_string(j, "response_body"),
+        response_body_truncated: optional_bool(j, "response_body_truncated", false)
+    })
+}
+
+fn optional_bool(j: Json, key: string, fallback: bool) -> bool {
+    return switch json.get(j, key) {
+        Some(found) {
+            switch json.bool_from_json(found) {
+                Ok(b) { b }
+                Err(_) { fallback }
+            }
+        }
+        None { fallback }
+    }
+}
+
+fn header_pairs_from_json(j: Json, key: string) -> Result<[http.Header], string> {
+    val found = switch json.get(j, key) {
+        Some(v) { v }
+        None { return ok([]) }
+    }
+    if !Json.is_JArray(found) {
+        return ok([])
+    }
+    val out = mutable_array_new<http.Header>()
+    for cell in Json.unwrap_JArray(found) {
+        if !Json.is_JArray(cell) {
+            return err(concat("expected a [name, value] array in ", key))
+        }
+        val pair = Json.unwrap_JArray(cell)
+        if len(pair) != 2 {
+            return err(concat("expected exactly two cells in ", key))
+        }
+        push(out, http.Header {
+            name: try json.string_from_json(pair[0]),
+            value: try json.string_from_json(pair[1])
+        })
+    }
+    return ok(snapshot(out))
+}
+
+// The most recent `limit` exchanges, newest first.
+//
+// **Newest first across two levels**: the day files are read in reverse date order, and the lines
+// within each day are reversed too, because a `.jsonl` file is appended to and so is oldest-first on
+// disk. Reading stops as soon as `limit` is reached, so asking for ten entries does not parse a
+// year of history.
+pub fn list_history(s: Storage, limit: int) -> Result<[HistoryEntry], string> {
+    val dir = history_dir(s)
+    if !fs.exists(dir) {
+        return ok([])
+    }
+    val entries = switch fs.list_dir(dir) {
+        Ok(found) { found }
+        Err(e) { return err(concat("failed to read ", dir, ": ", fs.fs_error_message(e))) }
+    }
+    val days = mutable_array_new<string>()
+    for entry in entries {
+        if fs.extension(entry) == ".jsonl" {
+            // Joined, because `fs.list_dir` answers bare names: reading `entry` as given would
+            // look for the file beside the working directory instead of in the history directory.
+            push(days, fs.path_join(dir, entry))
+        }
+    }
+    val newest_first = sort_desc(snapshot(days))
+    val out = mutable_array_new<HistoryEntry>()
+    for path in newest_first {
+        val text = switch fs.read_text(path) {
+            Ok(t) { t }
+            Err(e) { return err(concat("failed to read ", path, ": ", fs.fs_error_message(e))) }
+        }
+        val day = mutable_array_new<HistoryEntry>()
+        for line in split(replace(text, "\r\n", "\n"), "\n") {
+            if len(trim(line)) == 0 {
+                continue
+            }
+            val j = switch json.parse(line) {
+                Ok(parsed) { parsed }
+                Err(why) { return err(concat("failed to parse ", path, ": ", why)) }
+            }
+            push(day, try history_entry_from_json(j))
+        }
+        val lines = snapshot(day)
+        var i = len(lines) - 1
+        while i >= 0 {
+            push(out, lines[i])
+            i = i - 1
+        }
+        if len(out) >= limit {
+            break
+        }
+    }
+    val found = snapshot(out)
+    if len(found) <= limit {
+        return ok(found)
+    }
+    return ok(slice(found, 0, limit))
+}

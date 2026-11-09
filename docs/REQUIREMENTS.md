@@ -78,7 +78,7 @@ Curly is a REST API testing tool, positioned as a lighter, self-contained altern
 
 ## 8. Open Questions
 
-- One combined binary (`curly` vs `curly gui`) vs. two separate binaries (`curly` + `curly-gui`)? Leaning combined for distribution simplicity — see Design doc §3.
+- One combined binary (`curly` vs `curly gui`) vs. two separate binaries (`curly` + `curly-gui`)? **Settled the other way, 2026-11-09**: the GUI is a separate Tauri application and the `curly` binary is CLI-only — see Design doc §3's superseding note.
 - Pre-request scripts remain unaddressed (post-response is done declaratively, no scripting language — see FR-10). Revisit only if a real need surfaces that the declarative extraction rules can't cover.
 - Exact storage format: single JSON/TOML file per collection vs. SQLite. Leaning plain files for git-friendliness and NFR-5; see Design doc.
 - OAuth2 flows requiring a local redirect listener — acceptable to spin up a temporary localhost server for the CLI's interactive login too, or GUI-only?

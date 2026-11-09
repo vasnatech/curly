@@ -1,0 +1,344 @@
+// Building and sending one `Request`, and what came back. The single execution path the CLI and the
+// server front end both use, as `crates/curly-core/src/exec.rs` is for the Rust CLI and GUI.
+//
+// **Rust's version is 97 lines because `reqwest` does the work; this one is longer because four of
+// those lines have no equivalent in `client`:**
+//
+//   * `builder.query(&pairs)` -- appended to the URL here, since `client.request` takes a finished
+//     URL. Written by hand rather than with `client.form_encode`, which takes a `Map` and so cannot
+//     carry two parameters of the same name or keep the order they were declared in.
+//   * `builder.form(pairs)` -- same encoder, plus the `Content-Type` reqwest sets implicitly.
+//   * `builder.multipart(..)` -- `client` has no multipart builder, so the body is assembled here.
+//   * `String::from_utf8_lossy` -- `bytes_to_string` is strict, so `lossy_text` below.
+use client
+use clock
+use core/model.Auth
+use core/model.Body
+use core/model.MultipartField
+use core/model.Pair
+use core/model.Request
+use encoding
+use fs
+use http
+use http.Header
+use url
+use uuid
+use uuid.uuid_new
+
+// What one exchange produced.
+//
+// **`body` and `body_bytes` are both kept, and the reason is in Rust's own comment**: `body` is the
+// lossy UTF-8 text everything displays, and `body_bytes` is what the server actually sent, needed
+// by anything that has to reproduce the response exactly -- an image preview, "save response to a
+// file". A binary response gets a garbled-but-harmless `body` and exact bytes.
+pub struct ResponseSummary {
+    status: int
+    headers: [Header]
+    body: string
+    body_bytes: [byte]
+    elapsed_millis: int
+}
+
+// Sends the request, or says why it could not be sent. **Any HTTP status is a success here**, 500
+// included: a status is an answer, and only a failure to exchange anything at all is an error. That
+// is `client`'s rule as well as reqwest's.
+pub fn send(request: Request) -> Result<ResponseSummary, string> {
+    val target = with_query(request.url, request.query_params)
+    val headers = mutable_array_new<Header>()
+    for h in request.headers {
+        push(headers, h)
+    }
+    if Some(auth) = request.auth {
+        push(headers, authorization(auth))
+    }
+    var payload = Option<[byte]>.None
+    if Some(body) = request.body {
+        val built = try body_bytes_of(body)
+        // A `Form` or `Multipart` body carries the `Content-Type` reqwest would have set, and only
+        // when the caller has not set one: an explicit `-H 'Content-Type: ..'` wins, as there.
+        if built.content_type != "" && !has_header(snapshot(headers), "content-type") {
+            push(headers, Header { name: "Content-Type", value: built.content_type })
+        }
+        payload = Option<[byte]>.Some(built.data)
+    }
+
+    val started = clock.monotonic_millis()
+    val answered = client.request(
+        method: request.method,
+        url: target,
+        headers: Some(snapshot(headers)),
+        body: payload,
+        timeout_ms: None
+    )
+    val elapsed = clock.monotonic_millis() - started
+    val response = switch answered {
+        Ok(r) { r }
+        Err(why) { return err(client.client_error_message(why)) }
+    }
+    // `client.request` answers an `http.Response`, whose `body` is already the bytes.
+    val raw = response.body
+    return ok(ResponseSummary {
+        status: response.status,
+        headers: response.headers,
+        body: lossy_text(raw),
+        body_bytes: raw,
+        elapsed_millis: elapsed
+    })
+}
+
+fn has_header(headers: [Header], lowercase_name: string) -> bool {
+    for h in headers {
+        if to_lower(h.name) == lowercase_name {
+            return true
+        }
+    }
+    return false
+}
+
+// ---------------------------------------------------------------- the URL and the query
+
+// `builder.query(&pairs)` **appends**, so a URL that already carries a query keeps it and the saved
+// parameters are added after it.
+fn with_query(base: string, params: [Pair]) -> string {
+    if len(params) == 0 {
+        return base
+    }
+    val joiner = if contains(base, "?") { "&" } else { "?" }
+    return concat(base, joiner, form_encoded(params))
+}
+
+// `application/x-www-form-urlencoded`, which is the same encoding a query string uses and the same
+// `serde_urlencoded` reqwest reaches for in both places -- **space becomes `+`**, not `%20`.
+fn form_encoded(params: [Pair]) -> string {
+    val parts = mutable_array_new<string>()
+    for p in params {
+        push(parts, concat(url.percent_encode(p.name, true), "=", url.percent_encode(p.value, true)))
+    }
+    return join(separator: "&", pieces: snapshot(parts))
+}
+
+// ---------------------------------------------------------------- auth
+
+fn authorization(auth: Auth) -> Header {
+    return switch auth {
+        Basic(b) {
+            Header {
+                name: "Authorization",
+                value: concat("Basic ", encoding.base64_encode(to_bytes(concat(b.username, ":", b.password))))
+            }
+        }
+        Bearer(token) { Header { name: "Authorization", value: concat("Bearer ", token) } }
+    }
+}
+
+// ---------------------------------------------------------------- the body
+
+struct BuiltBody {
+    data: [byte]
+    // Empty when the caller is expected to have set it: `Raw` and `Binary` carry no implied type,
+    // exactly as `builder.body(..)` sets none.
+    content_type: string
+}
+
+fn body_bytes_of(body: Body) -> Result<BuiltBody, string> {
+    return switch body {
+        Raw(content) { ok(BuiltBody { data: to_bytes(content), content_type: "" }) }
+        Binary(data) { ok(BuiltBody { data: data, content_type: "" }) }
+        Form(fields) {
+            ok(BuiltBody {
+                data: to_bytes(form_encoded(fields)),
+                content_type: "application/x-www-form-urlencoded"
+            })
+        }
+        Multipart(fields) { multipart_body(fields) }
+    }
+}
+
+// **`multipart/form-data`, assembled here because `client` has no builder for it.** The shape is
+// the one RFC 7578 describes and every server parses: a boundary line before each part, the part's
+// `Content-Disposition`, a blank line, the bytes, and a closing boundary with a trailing `--`.
+//
+// The boundary is a fresh UUID with a fixed prefix. It only has to be a string that does not occur
+// in the payload, and a v4 UUID will not.
+fn multipart_body(fields: [MultipartField]) -> Result<BuiltBody, string> {
+    val boundary = concat("curlyFormBoundary", replace(uuid.format(uuid_new()), "-", ""))
+    val out = mutable_array_new<byte>()
+    for field in fields {
+        append_text(out, concat("--", boundary, "\r\n"))
+        switch field {
+            Text(p) {
+                append_text(out, concat(
+                    "Content-Disposition: form-data; name=\"",
+                    p.name,
+                    "\"\r\n\r\n"
+                ))
+                append_text(out, p.value)
+            }
+            File(f) {
+                val data = switch fs.read_bytes(f.path) {
+                    Ok(bytes) { bytes }
+                    Err(_) { return err(concat("failed to read file for --form: ", f.path)) }
+                }
+                append_text(out, concat(
+                    "Content-Disposition: form-data; name=\"",
+                    f.name,
+                    "\"; filename=\"",
+                    base_name(f.path),
+                    "\"\r\n\r\n"
+                ))
+                for b in data {
+                    push(out, b)
+                }
+            }
+        }
+        append_text(out, "\r\n")
+    }
+    append_text(out, concat("--", boundary, "--\r\n"))
+    return ok(BuiltBody {
+        data: snapshot(out),
+        content_type: concat("multipart/form-data; boundary=", boundary)
+    })
+}
+
+fn append_text(out: MutableArray<byte>, text: string) {
+    for b in to_bytes(text) {
+        push(out, b)
+    }
+}
+
+// The last path segment, which is what reqwest sends as `filename`. Empty for a path that ends in a
+// separator, as `Path::file_name` answers `None` there.
+fn base_name(path: string) -> string {
+    var at = len(path) - 1
+    while at >= 0 {
+        if substring(path, at, at + 1) == "/" {
+            return substring(path, at + 1, len(path))
+        }
+        at = at - 1
+    }
+    return path
+}
+
+// ---------------------------------------------------------------- lossy text
+
+// U+FFFD, the replacement character, built from its bytes because **Ziman has no `\u` escape**.
+fn replacement() -> string {
+    return switch bytes_to_string([239b, 191b, 189b]) {
+        Ok(c) { c }
+        Err(_) { "?" }
+    }
+}
+
+// `String::from_utf8_lossy`: the bytes as text, with anything that is not valid UTF-8 replaced
+// rather than refused. A REST client has to show *something* for a response it did not expect to be
+// binary, and `bytes_to_string` is strict.
+//
+// **This follows Unicode's "maximal subpart" rule, which is the one Rust follows**, so a malformed
+// sequence costs exactly one replacement character and not one per byte. The difference is visible:
+// `61 E2 82` (an "a" then a truncated three-byte sequence) is `a\u{FFFD}` under this rule and
+// `a\u{FFFD}\u{FFFD}` under the naive one. Checked against the reference algorithm over twelve
+// inputs -- ASCII, multibyte, a lone 0xFF, truncations, an overlong form, a surrogate, a value past
+// U+10FFFF, a leading continuation byte and a PNG header, plus a pseudo-random battery. The only
+// input the two disagree on is one containing a **NUL byte**; see the `width == 1` branch.
+pub fn lossy_text(data: [byte]) -> string {
+    // Fast path, and the only one that matters for a JSON or text response.
+    switch bytes_to_string(data) {
+        Ok(text) { return text }
+        Err(_) {}
+    }
+    val out = mutable_string_new()
+    val bad = replacement()
+    var i = 0
+    while i < len(data) {
+        val width = utf8_width(data[i])
+        if width == 0 {
+            // A continuation byte with nothing to continue, or a lead byte no sequence may use.
+            append(out, bad)
+            i = i + 1
+            continue
+        }
+        if width == 1 {
+            // **A NUL lands here and becomes a replacement character**, which is the one place this
+            // cannot match Rust: a Ziman string may not contain NUL (`bytes_to_string` refuses
+            // outright), where Rust's `String` carries it happily. It costs nothing that matters --
+            // a NUL is not displayable, `body` exists to be displayed, and `body_bytes` keeps the
+            // response exactly for anything that reproduces it -- but it does mean a binary body's
+            // `body` string differs between the two implementations, so it is written down rather
+            // than discovered later.
+            append(out, switch bytes_to_string([data[i]]) {
+                Ok(c) { c }
+                Err(_) { bad }
+            })
+            i = i + 1
+            continue
+        }
+        // How much of the claimed sequence is actually there and well-formed. **This is the
+        // maximal subpart**: the lead plus every byte that could still belong to it.
+        var taken = 1
+        while taken < width && i + taken < len(data) {
+            if !continuation_ok(data[i] as int, taken, data[i + taken] as int) {
+                break
+            }
+            taken = taken + 1
+        }
+        if taken == width {
+            switch bytes_to_string(slice(data, i, i + width)) {
+                Ok(piece) {
+                    append(out, piece)
+                    i = i + width
+                    continue
+                }
+                Err(_) {}
+            }
+        }
+        // One replacement for the whole subpart, and skip what it covered.
+        append(out, bad)
+        i = i + taken
+    }
+    return snapshot(out)
+}
+
+// How many bytes the sequence starting with this lead byte claims, or 0 if it cannot start one.
+fn utf8_width(lead: byte) -> int {
+    val b = lead as int
+    if b < 128 {
+        return 1
+    }
+    if b >= 194 && b <= 223 {
+        return 2
+    }
+    if b >= 224 && b <= 239 {
+        return 3
+    }
+    if b >= 240 && b <= 244 {
+        return 4
+    }
+    // A continuation byte, or one of the lead bytes no valid sequence uses (192, 193, 245..255).
+    return 0
+}
+
+// Whether `b` may be the byte at `position` of a sequence led by `lead`.
+//
+// **The second byte's range depends on the lead**, which is what keeps overlong forms, UTF-16
+// surrogates and values past U+10FFFF out without a second validation pass: `E0` must be followed
+// by `A0..BF` (anything lower would be an overlong three-byte form), `ED` by `80..9F` (higher is a
+// surrogate), `F0` by `90..BF` (lower is overlong) and `F4` by `80..8F` (higher is past the last
+// code point). Every later byte is a plain continuation.
+fn continuation_ok(lead: int, position: int, b: int) -> bool {
+    if position > 1 {
+        return b >= 128 && b <= 191
+    }
+    if lead == 224 {
+        return b >= 160 && b <= 191
+    }
+    if lead == 237 {
+        return b >= 128 && b <= 159
+    }
+    if lead == 240 {
+        return b >= 144 && b <= 191
+    }
+    if lead == 244 {
+        return b >= 128 && b <= 143
+    }
+    return b >= 128 && b <= 191
+}

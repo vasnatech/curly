@@ -1,0 +1,120 @@
+// `core/substitution.substitute`, held to the same cases as Rust's
+// `crates/curly-core/src/substitution.rs` `mod tests` -- one test per test, same names where the
+// name still reads in Ziman, so a disagreement between the two implementations shows up here rather
+// than in a request sent to somebody's server.
+use core/substitution.substitute
+use test
+
+fn vars(pairs: Map<string, string>) -> Map<string, string> {
+    return pairs
+}
+
+fn resolved(input: string, pairs: Map<string, string>) -> string {
+    return switch substitute(input, pairs) {
+        Ok(out) { out }
+        Err(why) { concat("ERR: ", why) }
+    }
+}
+
+fn refusal(input: string, pairs: Map<string, string>) -> string {
+    return switch substitute(input, pairs) {
+        Ok(out) { concat("no refusal: ", out) }
+        Err(why) { why }
+    }
+}
+
+#[test]
+fn replaces_a_single_variable() {
+    test.assert_eq(
+        "https://example.com/get",
+        resolved("https://{{host}}/get", Map<string, string> { "host": "example.com" })
+    )
+}
+
+#[test]
+fn replaces_multiple_variables() {
+    test.assert_eq(
+        "https://example.com/get",
+        resolved("{{scheme}}://{{host}}/{{path}}", Map<string, string> {
+            "scheme": "https",
+            "host": "example.com",
+            "path": "get"
+        })
+    )
+}
+
+#[test]
+fn trims_whitespace_inside_braces() {
+    test.assert_eq("example.com", resolved("{{ host }}", Map<string, string> { "host": "example.com" }))
+}
+
+#[test]
+fn no_variables_is_a_no_op() {
+    test.assert_eq("https://example.com/get", resolved("https://example.com/get", Map<string, string> {}))
+}
+
+#[test]
+fn an_undefined_variable_is_refused_and_named() {
+    // The name matters: "undefined variable(s)" alone would leave the caller grepping their own
+    // collection for which token was wrong.
+    test.assert_contains(refusal("https://{{host}}/get", Map<string, string> {}), "host")
+}
+
+#[test]
+fn every_undefined_variable_is_reported_not_just_the_first() {
+    val why = refusal("{{a}}-{{b}}-{{a}}", Map<string, string> {})
+    test.assert_contains(why, "a")
+    test.assert_contains(why, "b")
+    // `a` appears twice in the input and once in the message: a repeated token is one problem.
+    test.assert_eq("undefined variable(s): a, b", why)
+}
+
+#[test]
+fn unterminated_braces_are_left_literal() {
+    test.assert_eq("no closing {{here", resolved("no closing {{here", Map<string, string> {}))
+}
+
+// -- cases Rust covers through `resolve`'s tests or not at all, pinned here because this port is
+//    where they would drift first --
+
+#[test]
+fn a_defined_variable_whose_value_is_empty_substitutes_to_nothing() {
+    // Not the same as undefined: an environment may legitimately set a variable to "".
+    test.assert_eq("a//b", resolved("a/{{gap}}/b", Map<string, string> { "gap": "" }))
+}
+
+#[test]
+fn a_value_that_itself_looks_like_a_token_is_not_substituted_again() {
+    // One pass, deliberately: a recursive pass would make a value containing `{{` a way to read
+    // another variable, and an environment file is not meant to be a program.
+    test.assert_eq("{{b}}", resolved("{{a}}", Map<string, string> { "a": "{{b}}", "b": "deep" }))
+}
+
+#[test]
+fn text_with_no_tokens_either_side_survives_intact() {
+    test.assert_eq(
+        "prefix-VALUE-suffix",
+        resolved("prefix-{{x}}-suffix", Map<string, string> { "x": "VALUE" })
+    )
+}
+
+#[test]
+fn several_unterminated_opens_are_all_left_literal() {
+    // **The one place this port's control flow differs from Rust's.** Rust sets `rest` and loops,
+    // so it meets each later `{{` in turn; this breaks and appends the remainder whole. The two
+    // agree because an unterminated `{{` means there is no `}}` anywhere after it, so every later
+    // `{{` is literal too and copying the rest verbatim is the same answer -- but "equivalent by
+    // argument" is what a test is for.
+    test.assert_eq("a {{b {{c", resolved("a {{b {{c", Map<string, string> {}))
+    test.assert_eq("{{{{", resolved("{{{{", Map<string, string> {}))
+}
+
+#[test]
+fn an_unterminated_open_after_a_resolved_token_keeps_both() {
+    test.assert_eq("v then {{rest", resolved("{{x}} then {{rest", Map<string, string> { "x": "v" }))
+}
+
+#[test]
+fn a_lone_closing_brace_pair_is_literal() {
+    test.assert_eq("nothing }} here", resolved("nothing }} here", Map<string, string> {}))
+}

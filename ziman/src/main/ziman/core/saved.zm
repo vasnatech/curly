@@ -1,0 +1,553 @@
+// The persisted model: what a `.curly/` collection, environment or request *is* on disk, and the
+// codecs that read and write it.
+//
+// **The file format is a contract with the Rust implementation, not a choice this port gets to
+// make.** Both binaries read and write the same `.curly/` tree, so every key name, every tag value
+// and every absent-field default below is copied from what serde produces in
+// `crates/curly-core/src/storage.rs` -- verified against a live 245-request collection rather than
+// inferred from the attributes. Three consequences worth stating once:
+//
+//   * **The tagged enums are hand-written.** Serde writes `{"type":"raw","content":".."}` -- tag
+//     value in snake_case, payload fields *inlined*. `#[derive(Json)]` writes the variant name as
+//     declared with the payload nested under `"value"`, so it cannot produce this and is not used
+//     for `SavedBody`, `SavedMultipartField` or `SavedAuth`.
+//   * **An absent field is not the same as a missing one.** `enabled` defaults to **true** when
+//     absent (so hand-written JSON need not say it), while `secret` and every list default to
+//     false/empty. Getting `enabled` wrong the other way would silently disable every header in a
+//     file written by hand.
+//   * **`body` and `auth` are written as explicit `null`, not omitted**, because serde has no
+//     `skip_serializing_if` on them. Omitting them would re-write every file in the tree on first
+//     save and bury a real change in the diff.
+//
+// This module also holds `resolve`, which Rust keeps in `substitution.rs`. Rust's modules are
+// mutually referential; a module graph cannot be, and `resolve` is about a `SavedRequest`, so it
+// lives with one.
+use core/extraction.Extraction
+use core/extraction.extraction_from_json
+use core/extraction.extraction_to_json
+use core/extraction.optional_bool
+use core/model.BasicAuth
+use core/model.Pair
+use core/substitution.substitute
+use json
+use json.Json
+use uuid
+use uuid.Uuid
+use uuid.uuid_new
+
+// A name/value pair that can be switched off without being deleted, as Postman lets you toggle a
+// header or parameter. `enabled` is true when the key is absent.
+pub struct KvPair {
+    name: string
+    value: string
+    enabled: bool
+}
+
+pub fn kv_pair_of(name: string, value: string) -> KvPair {
+    return KvPair { name: name, value: value, enabled: true }
+}
+
+// `name` and the file it names, for a multipart file part. Not `Pair`, because `path` is a path and
+// calling it `value` in the codec would be the kind of near-miss that reads as correct.
+pub struct NamedPath {
+    name: string
+    path: string
+}
+
+pub enum SavedMultipartField {
+    Text(Pair)
+    File(NamedPath)
+}
+
+pub enum SavedBody {
+    Raw(string)
+    // The file is named, not read: a collection holding a path should not pin the file's bytes from
+    // the moment it is loaded. `into_request` reads it at send time.
+    Binary(string)
+    Form([Pair])
+    Multipart([SavedMultipartField])
+}
+
+pub enum SavedAuth {
+    Basic(BasicAuth)
+    Bearer(string)
+}
+
+// A saved, reusable request template. May carry `{{variable}}` tokens in `url`, in header and query
+// values, and in a `Raw` or `Form` body -- resolved against an environment at run time by `resolve`.
+//
+// `method` is text rather than an `HttpMethod` for the reason Rust gives: the method is not
+// serialisable as a type, so it is stored as written and validated when the request is built.
+pub struct SavedRequest {
+    id: Uuid
+    name: string
+    method: string
+    url: string
+    query_params: [KvPair]
+    headers: [KvPair]
+    body: Option<SavedBody>
+    auth: Option<SavedAuth>
+    extract: [Extraction]
+}
+
+// A named group of sub-folders and requests. Requests are addressed by slash-separated path from
+// the collection root, `Auth/OAuth/refresh`.
+pub struct Folder {
+    id: Uuid
+    name: string
+    folders: [Folder]
+    requests: [SavedRequest]
+}
+
+pub struct Collection {
+    id: Uuid
+    name: string
+    // Absent in collections saved before folders existed, which is why it defaults to empty rather
+    // than failing the parse.
+    folders: [Folder]
+    requests: [SavedRequest]
+}
+
+pub struct Variable {
+    key: string
+    value: string
+    secret: bool
+}
+
+pub struct Environment {
+    name: string
+    variables: [Variable]
+}
+
+// Sets a variable, replacing one of the same key in place rather than appending a second. **The
+// position is kept** on a replace, so re-setting a value does not reshuffle the file and turn a
+// one-line change into a whole-file diff.
+pub fn environment_set(env: Environment, key: string, value: string, secret: bool) -> Environment {
+    val out = mutable_array_new<Variable>()
+    var replaced = false
+    for v in env.variables {
+        if v.key == key {
+            push(out, Variable { key: key, value: value, secret: secret })
+            replaced = true
+        } else {
+            push(out, v)
+        }
+    }
+    if !replaced {
+        push(out, Variable { key: key, value: value, secret: secret })
+    }
+    return with env { variables: snapshot(out) }
+}
+
+// What `unset` answers: Ziman has no tuple type, so Rust's `(Environment, bool)` is a named pair.
+pub struct UnsetOutcome {
+    environment: Environment
+    removed: bool
+}
+
+pub fn environment_unset(env: Environment, key: string) -> UnsetOutcome {
+    val out = mutable_array_new<Variable>()
+    for v in env.variables {
+        if v.key != key {
+            push(out, v)
+        }
+    }
+    val kept = snapshot(out)
+    return UnsetOutcome {
+        environment: with env { variables: kept },
+        removed: len(kept) != len(env.variables)
+    }
+}
+
+// ---------------------------------------------------------------- reading
+
+fn optional_string(j: Json, key: string) -> Option<string> {
+    return switch json.get(j, key) {
+        Some(found) {
+            switch json.string_from_json(found) {
+                Ok(s) { Some(s) }
+                Err(_) { None }
+            }
+        }
+        None { None }
+    }
+}
+
+// A `[T]` field that serde writes always but `#[serde(default)]` lets a hand-written file leave out.
+fn array_at<T>(j: Json, key: string, decode: fn(Json) -> Result<T, string>) -> Result<[T], string> {
+    val found = switch json.get(j, key) {
+        Some(v) { v }
+        None { return ok([]) }
+    }
+    if Json.is_JNull(found) {
+        return ok([])
+    }
+    if !Json.is_JArray(found) {
+        return err(concat("expected an array for \"", key, "\""))
+    }
+    val out = mutable_array_new<T>()
+    for entry in Json.unwrap_JArray(found) {
+        push(out, try decode(entry))
+    }
+    return ok(snapshot(out))
+}
+
+fn uuid_at(j: Json, key: string) -> Result<Uuid, string> {
+    val text = switch optional_string(j, key) {
+        Some(s) { s }
+        // Serde's `#[serde(default = "Uuid::new_v4")]` mints one for a folder or collection written
+        // without an id, so a hand-written file is still loadable.
+        None { return ok(uuid_new()) }
+    }
+    return switch uuid.parse(text) {
+        Ok(u) { ok(u) }
+        Err(_) { err(concat("not a UUID: ", text)) }
+    }
+}
+
+pub fn kv_pair_from_json(j: Json) -> Result<KvPair, string> {
+    return ok(KvPair {
+        name: try json.require_string(j, "name"),
+        value: try json.require_string(j, "value"),
+        // **True when absent**, which is the one default here that is not a zero value.
+        enabled: optional_bool(j, "enabled", true)
+    })
+}
+
+pub fn pair_from_json(j: Json) -> Result<Pair, string> {
+    // Serde writes `Vec<(String, String)>` as an array of two-element arrays, so a form field is
+    // `["name", "value"]` on disk and not an object.
+    if !Json.is_JArray(j) {
+        return err("expected a [name, value] array for a form field")
+    }
+    val cells = Json.unwrap_JArray(j)
+    if len(cells) != 2 {
+        return err(concat("a form field needs exactly two cells, found ", str(len(cells))))
+    }
+    return ok(Pair {
+        name: try json.string_from_json(cells[0]),
+        value: try json.string_from_json(cells[1])
+    })
+}
+
+pub fn saved_multipart_field_from_json(j: Json) -> Result<SavedMultipartField, string> {
+    val kind = try json.require_string(j, "type")
+    if kind == "text" {
+        return ok(SavedMultipartField.Text(Pair {
+            name: try json.require_string(j, "name"),
+            value: try json.require_string(j, "value")
+        }))
+    }
+    if kind == "file" {
+        return ok(SavedMultipartField.File(NamedPath {
+            name: try json.require_string(j, "name"),
+            path: try json.require_string(j, "path")
+        }))
+    }
+    return err(concat("unknown multipart field type: ", kind))
+}
+
+pub fn saved_body_from_json(j: Json) -> Result<SavedBody, string> {
+    val kind = try json.require_string(j, "type")
+    if kind == "raw" {
+        return ok(SavedBody.Raw(try json.require_string(j, "content")))
+    }
+    if kind == "binary" {
+        return ok(SavedBody.Binary(try json.require_string(j, "path")))
+    }
+    if kind == "form" {
+        return ok(SavedBody.Form(try array_at<Pair>(j, "fields", pair_from_json)))
+    }
+    if kind == "multipart" {
+        return ok(SavedBody.Multipart(
+            try array_at<SavedMultipartField>(j, "fields", saved_multipart_field_from_json)
+        ))
+    }
+    return err(concat("unknown body type: ", kind))
+}
+
+pub fn saved_auth_from_json(j: Json) -> Result<SavedAuth, string> {
+    val kind = try json.require_string(j, "type")
+    if kind == "basic" {
+        return ok(SavedAuth.Basic(BasicAuth {
+            username: try json.require_string(j, "username"),
+            password: try json.require_string(j, "password")
+        }))
+    }
+    if kind == "bearer" {
+        return ok(SavedAuth.Bearer(try json.require_string(j, "token")))
+    }
+    return err(concat("unknown auth type: ", kind))
+}
+
+pub fn saved_request_from_json(j: Json) -> Result<SavedRequest, string> {
+    val body = switch json.get(j, "body") {
+        Some(found) {
+            if Json.is_JNull(found) {
+                Option<SavedBody>.None
+            } else {
+                Option<SavedBody>.Some(try saved_body_from_json(found))
+            }
+        }
+        None { Option<SavedBody>.None }
+    }
+    val auth = switch json.get(j, "auth") {
+        Some(found) {
+            if Json.is_JNull(found) {
+                Option<SavedAuth>.None
+            } else {
+                Option<SavedAuth>.Some(try saved_auth_from_json(found))
+            }
+        }
+        None { Option<SavedAuth>.None }
+    }
+    return ok(SavedRequest {
+        id: try uuid_at(j, "id"),
+        name: try json.require_string(j, "name"),
+        method: try json.require_string(j, "method"),
+        url: try json.require_string(j, "url"),
+        query_params: try array_at<KvPair>(j, "query_params", kv_pair_from_json),
+        headers: try array_at<KvPair>(j, "headers", kv_pair_from_json),
+        body: body,
+        auth: auth,
+        extract: try array_at<Extraction>(j, "extract", extraction_from_json)
+    })
+}
+
+pub fn folder_from_json(j: Json) -> Result<Folder, string> {
+    return ok(Folder {
+        id: try uuid_at(j, "id"),
+        name: try json.require_string(j, "name"),
+        folders: try array_at<Folder>(j, "folders", folder_from_json),
+        requests: try array_at<SavedRequest>(j, "requests", saved_request_from_json)
+    })
+}
+
+pub fn collection_from_json(j: Json) -> Result<Collection, string> {
+    return ok(Collection {
+        id: try uuid_at(j, "id"),
+        name: try json.require_string(j, "name"),
+        folders: try array_at<Folder>(j, "folders", folder_from_json),
+        requests: try array_at<SavedRequest>(j, "requests", saved_request_from_json)
+    })
+}
+
+pub fn variable_from_json(j: Json) -> Result<Variable, string> {
+    return ok(Variable {
+        key: try json.require_string(j, "key"),
+        value: try json.require_string(j, "value"),
+        secret: optional_bool(j, "secret", false)
+    })
+}
+
+pub fn environment_from_json(j: Json) -> Result<Environment, string> {
+    return ok(Environment {
+        name: try json.require_string(j, "name"),
+        variables: try array_at<Variable>(j, "variables", variable_from_json)
+    })
+}
+
+// ---------------------------------------------------------------- writing
+
+fn array_of<T>(items: [T], encode: fn(T) -> Json) -> Json {
+    val out = mutable_array_new<Json>()
+    for one in items {
+        push(out, encode(one))
+    }
+    return Json.JArray(snapshot(out))
+}
+
+pub fn kv_pair_to_json(p: KvPair) -> Json {
+    return Json.JObject(Map<string, Json> {
+        "name": Json.JString(p.name),
+        "value": Json.JString(p.value),
+        "enabled": Json.JBool(p.enabled)
+    })
+}
+
+pub fn pair_to_json(p: Pair) -> Json {
+    return Json.JArray([Json.JString(p.name), Json.JString(p.value)])
+}
+
+pub fn saved_multipart_field_to_json(f: SavedMultipartField) -> Json {
+    return switch f {
+        Text(p) {
+            Json.JObject(Map<string, Json> {
+                "type": Json.JString("text"),
+                "name": Json.JString(p.name),
+                "value": Json.JString(p.value)
+            })
+        }
+        File(p) {
+            Json.JObject(Map<string, Json> {
+                "type": Json.JString("file"),
+                "name": Json.JString(p.name),
+                "path": Json.JString(p.path)
+            })
+        }
+    }
+}
+
+pub fn saved_body_to_json(b: SavedBody) -> Json {
+    return switch b {
+        Raw(content) {
+            Json.JObject(Map<string, Json> {
+                "type": Json.JString("raw"),
+                "content": Json.JString(content)
+            })
+        }
+        Binary(path) {
+            Json.JObject(Map<string, Json> {
+                "type": Json.JString("binary"),
+                "path": Json.JString(path)
+            })
+        }
+        Form(fields) {
+            Json.JObject(Map<string, Json> {
+                "type": Json.JString("form"),
+                "fields": array_of<Pair>(fields, pair_to_json)
+            })
+        }
+        Multipart(fields) {
+            Json.JObject(Map<string, Json> {
+                "type": Json.JString("multipart"),
+                "fields": array_of<SavedMultipartField>(fields, saved_multipart_field_to_json)
+            })
+        }
+    }
+}
+
+pub fn saved_auth_to_json(a: SavedAuth) -> Json {
+    return switch a {
+        Basic(b) {
+            Json.JObject(Map<string, Json> {
+                "type": Json.JString("basic"),
+                "username": Json.JString(b.username),
+                "password": Json.JString(b.password)
+            })
+        }
+        Bearer(token) {
+            Json.JObject(Map<string, Json> {
+                "type": Json.JString("bearer"),
+                "token": Json.JString(token)
+            })
+        }
+    }
+}
+
+pub fn saved_request_to_json(r: SavedRequest) -> Json {
+    return Json.JObject(Map<string, Json> {
+        "id": Json.JString(uuid.format(r.id)),
+        "name": Json.JString(r.name),
+        "method": Json.JString(r.method),
+        "url": Json.JString(r.url),
+        "query_params": array_of<KvPair>(r.query_params, kv_pair_to_json),
+        "headers": array_of<KvPair>(r.headers, kv_pair_to_json),
+        // `null` rather than absent, as serde writes an `Option` with no `skip_serializing_if`.
+        "body": switch r.body {
+            Some(b) { saved_body_to_json(b) }
+            None { Json.JNull }
+        },
+        "auth": switch r.auth {
+            Some(a) { saved_auth_to_json(a) }
+            None { Json.JNull }
+        },
+        "extract": array_of<Extraction>(r.extract, extraction_to_json)
+    })
+}
+
+pub fn folder_to_json(f: Folder) -> Json {
+    return Json.JObject(Map<string, Json> {
+        "id": Json.JString(uuid.format(f.id)),
+        "name": Json.JString(f.name),
+        "folders": array_of<Folder>(f.folders, folder_to_json),
+        "requests": array_of<SavedRequest>(f.requests, saved_request_to_json)
+    })
+}
+
+pub fn collection_to_json(c: Collection) -> Json {
+    return Json.JObject(Map<string, Json> {
+        "id": Json.JString(uuid.format(c.id)),
+        "name": Json.JString(c.name),
+        "folders": array_of<Folder>(c.folders, folder_to_json),
+        "requests": array_of<SavedRequest>(c.requests, saved_request_to_json)
+    })
+}
+
+pub fn variable_to_json(v: Variable) -> Json {
+    return Json.JObject(Map<string, Json> {
+        "key": Json.JString(v.key),
+        "value": Json.JString(v.value),
+        "secret": Json.JBool(v.secret)
+    })
+}
+
+pub fn environment_to_json(e: Environment) -> Json {
+    return Json.JObject(Map<string, Json> {
+        "name": Json.JString(e.name),
+        "variables": array_of<Variable>(e.variables, variable_to_json)
+    })
+}
+
+// ---------------------------------------------------------------- resolving
+
+// Substitutes `{{variable}}` throughout a saved request -- the URL, enabled header and query
+// values, and a `Raw` or `Form` body's content, plus the auth fields -- producing a fully resolved
+// copy ready to become a `Request`.
+//
+// **`Multipart` and `Binary` bodies are not substituted**, as in Rust: a file path and a file's
+// contents are not meaningful places for an environment variable.
+pub fn resolve(saved: SavedRequest, variables: Map<string, string>) -> Result<SavedRequest, string> {
+    // **The URL is substituted first, and the order is load-bearing.** A request with several
+    // undefined variables reports only the first field that fails, so field order decides which
+    // name the caller is shown; Rust's `substitution::resolve` does the URL, then headers, then
+    // query, then body, then auth, and a port that reordered them would answer a different error
+    // for the same collection. `saved_test.zm` pins it.
+    val url = try substitute(saved.url, variables)
+    val headers = mutable_array_new<KvPair>()
+    for h in saved.headers {
+        push(headers, with h { value: try substitute(h.value, variables) })
+    }
+    val params = mutable_array_new<KvPair>()
+    for p in saved.query_params {
+        push(params, with p { value: try substitute(p.value, variables) })
+    }
+    val body = switch saved.body {
+        Some(b) {
+            switch b {
+                Raw(content) { Option<SavedBody>.Some(SavedBody.Raw(try substitute(content, variables))) }
+                Form(fields) {
+                    val out = mutable_array_new<Pair>()
+                    for f in fields {
+                        push(out, with f { value: try substitute(f.value, variables) })
+                    }
+                    Option<SavedBody>.Some(SavedBody.Form(snapshot(out)))
+                }
+                Binary(_) { Option<SavedBody>.Some(b) }
+                Multipart(_) { Option<SavedBody>.Some(b) }
+            }
+        }
+        None { Option<SavedBody>.None }
+    }
+    val auth = switch saved.auth {
+        Some(a) {
+            switch a {
+                Basic(b) {
+                    Option<SavedAuth>.Some(SavedAuth.Basic(BasicAuth {
+                        username: try substitute(b.username, variables),
+                        password: try substitute(b.password, variables)
+                    }))
+                }
+                Bearer(token) { Option<SavedAuth>.Some(SavedAuth.Bearer(try substitute(token, variables))) }
+            }
+        }
+        None { Option<SavedAuth>.None }
+    }
+    return ok(with saved {
+        url: url,
+        headers: snapshot(headers),
+        query_params: snapshot(params),
+        body: body,
+        auth: auth
+    })
+}

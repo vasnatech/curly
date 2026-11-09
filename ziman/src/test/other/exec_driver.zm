@@ -1,0 +1,151 @@
+// Drives `core/exec.send` for `exec_test.py`, which starts a stub server that echoes back whatever
+// it received. One case per `CURLY_CASE`; the result is printed as a single JSON line so the test
+// can assert on it without parsing prose.
+//
+// This mirrors Rust's `crates/curly-core/tests/exec_test.rs`, which does the same thing against a
+// wiremock server -- a real socket, because the parts of `send` worth testing are the ones that put
+// bytes on one.
+use core/exec
+use core/exec.ResponseSummary
+use core/model.Auth
+use core/model.BasicAuth
+use core/model.Body
+use core/model.MultipartField
+use core/model.MultipartFile
+use core/model.MultipartText
+use core/model.Pair
+use core/model.Request
+use core/model.request_of
+use http.Header
+use http.HttpMethod
+use json
+use json.Json
+use os
+
+fn base() -> string {
+    return switch os.get_env("CURLY_BASE") {
+        Some(u) { u }
+        None { "http://127.0.0.1:1" }
+    }
+}
+
+fn plan(case: string) -> Request {
+    if case == "get" {
+        return request_of(HttpMethod.Get, concat(base(), "/hello"))
+    }
+    if case == "headers" {
+        return with request_of(HttpMethod.Get, concat(base(), "/echo")) {
+            headers: [Header { name: "X-Test", value: "abc" }]
+        }
+    }
+    if case == "query" {
+        // Two parameters of the same name and a value needing encoding -- the case
+        // `client.form_encode` could not express, since it takes a `Map`.
+        return with request_of(HttpMethod.Get, concat(base(), "/echo")) {
+            query_params: [
+                Pair { name: "a", value: "1" },
+                Pair { name: "b", value: "two words&x=y" },
+                Pair { name: "a", value: "2" }
+            ]
+        }
+    }
+    if case == "query-appends" {
+        return with request_of(HttpMethod.Get, concat(base(), "/echo?already=here")) {
+            query_params: [Pair { name: "added", value: "yes" }]
+        }
+    }
+    if case == "raw" {
+        return with request_of(HttpMethod.Post, concat(base(), "/echo")) {
+            body: Some(Body.Raw("{\"a\":1}")),
+            headers: [Header { name: "Content-Type", value: "application/json" }]
+        }
+    }
+    if case == "raw-no-content-type" {
+        // `builder.body(..)` sets no Content-Type, and neither does this.
+        return with request_of(HttpMethod.Post, concat(base(), "/echo")) {
+            body: Some(Body.Raw("plain"))
+        }
+    }
+    if case == "form" {
+        return with request_of(HttpMethod.Post, concat(base(), "/echo")) {
+            body: Some(Body.Form([
+                Pair { name: "grant_type", value: "password" },
+                Pair { name: "note", value: "a b" }
+            ]))
+        }
+    }
+    if case == "form-explicit-content-type" {
+        // An explicit header wins over the one the body would imply.
+        return with request_of(HttpMethod.Post, concat(base(), "/echo")) {
+            body: Some(Body.Form([Pair { name: "x", value: "1" }])),
+            headers: [Header { name: "Content-Type", value: "application/x-custom" }]
+        }
+    }
+    if case == "basic" {
+        return with request_of(HttpMethod.Get, concat(base(), "/echo")) {
+            auth: Some(Auth.Basic(BasicAuth { username: "ann", password: "s3cret" }))
+        }
+    }
+    if case == "bearer" {
+        return with request_of(HttpMethod.Get, concat(base(), "/echo")) {
+            auth: Some(Auth.Bearer("abc123"))
+        }
+    }
+    if case == "multipart" {
+        val path = switch os.get_env("CURLY_UPLOAD") {
+            Some(p) { p }
+            None { "" }
+        }
+        return with request_of(HttpMethod.Post, concat(base(), "/echo")) {
+            body: Some(Body.Multipart([
+                MultipartField.Text(MultipartText { name: "caption", value: "a photo" }),
+                MultipartField.File(MultipartFile { name: "file", path: path })
+            ]))
+        }
+    }
+    if case == "binary" {
+        return request_of(HttpMethod.Get, concat(base(), "/binary"))
+    }
+    if case == "status500" {
+        return request_of(HttpMethod.Get, concat(base(), "/boom"))
+    }
+    if case == "unreachable" {
+        return request_of(HttpMethod.Get, "http://127.0.0.1:9/nothing")
+    }
+    return request_of(HttpMethod.Get, concat(base(), "/hello"))
+}
+
+fn header_pairs(headers: [Header]) -> Json {
+    val out = mutable_array_new<Json>()
+    for h in headers {
+        push(out, Json.JArray([Json.JString(h.name), Json.JString(h.value)]))
+    }
+    return Json.JArray(snapshot(out))
+}
+
+fn main() {
+    val case = switch os.get_env("CURLY_CASE") {
+        Some(c) { c }
+        None { "get" }
+    }
+    switch exec.send(plan(case)) {
+        Ok(r) {
+            print(json.format(Json.JObject(Map<string, Json> {
+                "ok": Json.JBool(true),
+                "status": json.int_to_json(r.status),
+                "body": Json.JString(r.body),
+                "body_byte_count": json.int_to_json(len(r.body_bytes)),
+                // Proof `body_bytes` is the exact bytes rather than a re-encoding of `body`.
+                "body_byte_sum": json.int_to_json(sum(r.body_bytes)),
+                "headers": header_pairs(r.headers),
+                "elapsed_is_sane": Json.JBool(r.elapsed_millis >= 0 && r.elapsed_millis < 60000)
+            })))
+        }
+        Err(why) {
+            print(json.format(Json.JObject(Map<string, Json> {
+                "ok": Json.JBool(false),
+                "error": Json.JString(why)
+            })))
+        }
+    }
+}

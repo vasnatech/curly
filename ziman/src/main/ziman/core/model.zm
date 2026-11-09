@@ -1,0 +1,86 @@
+// One HTTP request, independent of how it was built -- CLI flags, a saved collection entry, or a
+// scenario step. **No `{{variable}}` substitution happens here**: by the time a `Request` exists,
+// `url`, the headers and the body are final strings. `core/substitution.zm` is what resolves a
+// `SavedRequest` into one of these.
+//
+// Ported from `crates/curly-core/src/model.rs`, with two shape changes Ziman forces and one it
+// invites:
+//
+//   * **Ziman has no tuple type**, and "a variant holds zero or one payload value, never a tuple or
+//     inline struct-shaped one" (`docs/syntax/functions-and-types.md`). Rust's
+//     `Body::Form(Vec<(String, String)>)` and `Auth::Basic { username, password }` therefore become
+//     `Form([Pair])` and `Basic(BasicAuth)` -- a companion struct per multi-field variant.
+//   * `Vec<(String, String)>` for query params and form fields becomes `[Pair]`, one named type
+//     instead of two anonymous positions. The JSON codec in `core/saved.zm` still reads and writes
+//     the pair-of-arrays shape serde produces, because the files on disk are shared.
+//   * `http.Header` already exists and is exactly this pair, so headers use it rather than a second
+//     identical type -- it is also what `client.request` takes, so nothing has to convert.
+use http.Header
+use http.HttpMethod
+
+// A name/value pair: a query parameter, or a field of a urlencoded body.
+pub struct Pair {
+    name: string
+    value: string
+}
+
+pub struct BasicAuth {
+    username: string
+    password: string
+}
+
+pub enum Auth {
+    Basic(BasicAuth)
+    Bearer(string)
+}
+
+pub struct MultipartText {
+    name: string
+    value: string
+}
+
+// The file is named rather than read here: a multipart body is built at send time, so that a
+// scenario holding a path does not pin the file's bytes in memory from the moment it is loaded.
+pub struct MultipartFile {
+    name: string
+    path: string
+}
+
+pub enum MultipartField {
+    Text(MultipartText)
+    File(MultipartFile)
+}
+
+pub enum Body {
+    // Sent as-is: a JSON string from `-d`, for instance.
+    Raw(string)
+    // Raw bytes, as `--data-binary` reads from a file.
+    Binary([byte])
+    // `application/x-www-form-urlencoded`.
+    Form([Pair])
+    // `multipart/form-data`.
+    Multipart([MultipartField])
+}
+
+pub struct Request {
+    method: HttpMethod
+    url: string
+    query_params: [Pair]
+    headers: [Header]
+    body: Option<Body>
+    auth: Option<Auth>
+}
+
+// A request with nothing but a method and a URL. Rust spells this `Request::new` plus a chain of
+// `with_header`/`with_query`/`with_body`/`with_auth` builders; Ziman has `with`, so a caller writes
+// `with request_of(Get, url) { headers: [..] }` and needs no builder methods at all.
+pub fn request_of(method: HttpMethod, url: string) -> Request {
+    return Request {
+        method: method,
+        url: url,
+        query_params: [],
+        headers: [],
+        body: None,
+        auth: None
+    }
+}

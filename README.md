@@ -14,7 +14,7 @@ M1 (core + CLI one-shot mode), M2 (local storage — saved requests, collections
 See [docs/CLI.md](docs/CLI.md) for the full user guide (install/build steps, every flag explained, examples).
 
 ```sh
-cargo build --release
+cd rust && cargo build --release
 ./target/release/curly https://httpbin.org/get
 ```
 
@@ -32,13 +32,22 @@ npm run tauri dev
 
 ```
 curly/
-├── crates/
-│   ├── curly-core/   # shared HTTP client, data model, storage
-│   ├── curly-cli/    # CLI binary ("curly")
-│   └── curly-gui/    # egui/eframe GUI — parked/frozen, superseded by curly-gui-tauri/ (see DESIGN.md's M9 entry)
-├── curly-gui-tauri/  # the current GUI: Tauri (Rust) + React/TypeScript, its own Cargo workspace
-│   ├── src-tauri/    # Rust shell — Tauri commands wrapping curly-core
-│   └── src/          # React frontend
+├── rust/              # the Rust implementation — the reference while the port runs
+│   ├── Cargo.toml     #   workspace root
+│   └── crates/
+│       ├── curly-core/   # lib: HTTP execution, data model, storage, import, substitution
+│       └── curly-cli/    # bin "curly": the clap-based CLI
+├── ziman/             # the Ziman implementation (in progress — see docs/ZIMAN.md)
+│   └── src/{main,test}/ziman/
+├── curly-gui-tauri/   # the GUI: Tauri (Rust shell) + React/TypeScript, its own Cargo workspace
+│   ├── src-tauri/     #   Rust shell — Tauri commands wrapping curly-core
+│   └── src/           #   React frontend
 ├── docs/
-└── Cargo.toml         # workspace root (crates/ only — curly-gui-tauri/src-tauri is deliberately its own workspace)
+├── run-all.sh         # every check, both implementations, plus the cross-check between them
+└── parity.sh          # the cross-check on its own
 ```
+
+**One component is being reimplemented, not two.** The Rust implementation is the reference the
+Ziman one is measured against — `parity.sh` asks both the same questions over the same `.curly/`
+tree and diffs the answers, which is what makes "replaces" a claim a test can fail on. The React
+frontend is shared and is not being rewritten.

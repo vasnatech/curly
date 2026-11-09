@@ -1,0 +1,250 @@
+// `core/extraction.apply` and the JSON path it walks, held to the cases in
+// `crates/curly-core/src/extraction.rs`'s own `mod tests` -- same cases, same names where they
+// still read, so the two implementations cannot drift on what a collection's `extract` rules mean.
+//
+// The cases that matter most are the failures. A rule that silently extracts nothing would put an
+// empty token into the next request and produce a 401 three steps later, so every unsatisfiable
+// rule has to fail where it happened and say which path or header it wanted.
+use core/exec.ResponseSummary
+use core/extraction.BodyRule
+use core/extraction.Extracted
+use core/extraction.Extraction
+use core/extraction.HeaderRule
+use core/extraction.TemplateRule
+use core/extraction.apply
+use core/extraction.json_at_path
+use http.Header
+use json
+use json.Json
+use test
+
+fn response_of(body: string, headers: [Header]) -> ResponseSummary {
+    return ResponseSummary {
+        status: 200,
+        headers: headers,
+        body: body,
+        body_bytes: to_bytes(body),
+        elapsed_millis: 1
+    }
+}
+
+fn body_rule(name: string, path: string, secret: bool) -> Extraction {
+    return Extraction.Body(BodyRule { name: name, path: path, secret: secret })
+}
+
+fn header_rule(name: string, header: string) -> Extraction {
+    return Extraction.Header(HeaderRule { name: name, header: header, secret: false })
+}
+
+fn template_rule(name: string, template: string, secret: bool) -> Extraction {
+    return Extraction.Template(TemplateRule { name: name, template: template, secret: secret })
+}
+
+fn extracted(rules: [Extraction], response: ResponseSummary, known: Map<string, string>) -> [Extracted] {
+    val out = apply(rules, response, known)
+    if Err(why) = out {
+        test.fail(concat("apply refused: ", why))
+        return []
+    }
+    return unwrap(out)
+}
+
+fn refusal(rules: [Extraction], response: ResponseSummary) -> string {
+    return switch apply(rules, response, Map<string, string> {}) {
+        Ok(found) { concat("no refusal: ", str(len(found)), " extracted") }
+        Err(why) { why }
+    }
+}
+
+fn parsed(text: string) -> Json {
+    return switch json.parse(text) {
+        Ok(j) { j }
+        Err(_) { Json.JNull }
+    }
+}
+
+fn at(text: string, path: string) -> string {
+    return switch json_at_path(parsed(text), path) {
+        Some(found) { json.format(found) }
+        None { "(none)" }
+    }
+}
+
+// ---------------------------------------------------------------- the path
+
+#[test]
+fn json_path_reads_a_top_level_string() {
+    test.assert_eq("\"abc\"", at("{\"token\":\"abc\"}", "token"))
+}
+
+#[test]
+fn json_path_reads_a_nested_object() {
+    test.assert_eq("42", at("{\"data\":{\"user\":{\"id\":42}}}", "data.user.id"))
+}
+
+#[test]
+fn json_path_reads_an_array_index() {
+    test.assert_eq("\"b\"", at("{\"items\":[{\"id\":\"a\"},{\"id\":\"b\"}]}", "items[1].id"))
+}
+
+#[test]
+fn json_path_accepts_a_leading_index() {
+    // A response whose top level is an array.
+    test.assert_eq("\"a\"", at("[{\"id\":\"a\"}]", "[0].id"))
+}
+
+#[test]
+fn json_path_answers_nothing_for_a_missing_key() {
+    test.assert_eq("(none)", at("{\"token\":\"abc\"}", "nope"))
+}
+
+#[test]
+fn json_path_answers_nothing_for_an_index_past_the_end() {
+    test.assert_eq("(none)", at("{\"items\":[]}", "items[0]"))
+}
+
+#[test]
+fn json_path_answers_nothing_when_the_container_is_the_wrong_kind() {
+    // A key used on an array and an index used on an object: `serde_json`'s own `get` answers None
+    // for both, so this does too rather than reaching into the wrong shape.
+    test.assert_eq("(none)", at("{\"items\":[1,2]}", "items.id"))
+    test.assert_eq("(none)", at("{\"data\":{\"a\":1}}", "data[0]"))
+}
+
+#[test]
+fn json_path_skips_malformed_brackets_rather_than_refusing() {
+    // `[abc]` contributes no segment because it is not a number, so the path is just `items` --
+    // Rust's behaviour, and a path that then resolves to nothing fails in `apply` with the path
+    // quoted, which reads better than a complaint about undocumented syntax.
+    test.assert_eq("[1,2]", at("{\"items\":[1,2]}", "items[abc]"))
+    // An unterminated bracket ends that part.
+    test.assert_eq("[1,2]", at("{\"items\":[1,2]}", "items[0"))
+}
+
+#[test]
+fn json_path_reads_a_chain_of_indices() {
+    test.assert_eq("3", at("{\"grid\":[[1,2],[3,4]]}", "grid[1][0]"))
+}
+
+// ---------------------------------------------------------------- apply
+
+#[test]
+fn apply_extracts_from_the_body() {
+    val found = extracted(
+        [body_rule("TOKEN", "token", true)],
+        response_of("{\"token\":\"tok123\"}", []),
+        Map<string, string> {}
+    )
+    test.assert_len(1, found)
+    test.assert_eq("TOKEN", found[0].name)
+    test.assert_eq("tok123", found[0].value)
+    test.assert_eq(true, found[0].secret)
+}
+
+#[test]
+fn apply_extracts_from_a_header_case_insensitively() {
+    // The rule says `x-request-id`, the response says `X-Request-Id`.
+    val found = extracted(
+        [header_rule("REQ_ID", "x-request-id")],
+        response_of("{}", [Header { name: "X-Request-Id", value: "req-42" }]),
+        Map<string, string> {}
+    )
+    test.assert_eq("req-42", found[0].value)
+}
+
+#[test]
+fn apply_lets_a_template_see_an_earlier_extraction_and_the_known_scope() {
+    // The feature's reason for existing: pull a token out, then build a header from it.
+    val found = extracted(
+        [body_rule("TOKEN", "token", false), template_rule("AUTH_HEADER", "Bearer {{TOKEN}} for {{HOST}}", true)],
+        response_of("{\"token\":\"abc\"}", []),
+        Map<string, string> { "HOST": "example.com" }
+    )
+    test.assert_len(2, found)
+    test.assert_eq("AUTH_HEADER", found[1].name)
+    test.assert_eq("Bearer abc for example.com", found[1].value)
+    test.assert_eq(true, found[1].secret)
+}
+
+#[test]
+fn apply_uses_the_json_text_of_a_value_that_is_not_a_string() {
+    // 42 extracts as "42" and not as "42" with quotes round it, which would break every request
+    // that interpolated it.
+    val found = extracted(
+        [body_rule("COUNT", "count", false)],
+        response_of("{\"count\":42}", []),
+        Map<string, string> {}
+    )
+    test.assert_eq("42", found[0].value)
+}
+
+#[test]
+fn apply_uses_compact_json_for_a_structured_value() {
+    val found = extracted(
+        [body_rule("USER", "user", false), body_rule("OK", "ok", false), body_rule("NOTHING", "nil", false)],
+        response_of("{\"user\":{\"id\":1,\"name\":\"a\"},\"ok\":true,\"nil\":null}", []),
+        Map<string, string> {}
+    )
+    test.assert_eq("{\"id\":1,\"name\":\"a\"}", found[0].value)
+    test.assert_eq("true", found[1].value)
+    test.assert_eq("null", found[2].value)
+}
+
+#[test]
+fn apply_answers_nothing_for_no_rules_even_when_the_body_is_not_json() {
+    // The empty check comes **before** the body is parsed: a response that is not JSON is no
+    // reason to fail a request that asked for nothing.
+    val found = extracted([], response_of("not even json", []), Map<string, string> {})
+    test.assert_len(0, found)
+}
+
+// ---------------------------------------------------------------- the refusals
+
+#[test]
+fn apply_refuses_a_body_path_that_is_not_there_and_quotes_it() {
+    val why = refusal([body_rule("TOKEN", "nope", false)], response_of("{\"token\":\"abc\"}", []))
+    test.assert_contains(why, "nope")
+    test.assert_contains(why, "TOKEN")
+}
+
+#[test]
+fn apply_refuses_a_body_rule_when_the_body_is_not_json() {
+    val why = refusal([body_rule("TOKEN", "token", false)], response_of("not json", []))
+    test.assert_contains(why, "not JSON")
+    test.assert_contains(why, "TOKEN")
+}
+
+#[test]
+fn apply_refuses_a_header_that_is_not_there_and_names_it() {
+    val why = refusal([header_rule("X", "Nope")], response_of("{}", []))
+    test.assert_contains(why, "Nope")
+}
+
+#[test]
+fn apply_refuses_a_template_naming_a_variable_nothing_defined() {
+    val why = refusal([template_rule("OUT", "{{MISSING}}", false)], response_of("{}", []))
+    test.assert_contains(why, "MISSING")
+}
+
+#[test]
+fn apply_stops_at_the_first_rule_that_fails() {
+    // The second rule fails, so nothing is returned at all -- not the first rule's result with the
+    // failure swallowed, which would leave a half-populated session.
+    val why = refusal(
+        [body_rule("FIRST", "token", false), body_rule("SECOND", "nope", false)],
+        response_of("{\"token\":\"abc\"}", [])
+    )
+    test.assert_contains(why, "SECOND")
+    test.assert_not_contains(why, "FIRST")
+}
+
+#[test]
+fn apply_does_not_let_a_later_rule_see_a_variable_from_a_failed_run() {
+    // A template that would have resolved had the earlier rule run is still refused, since the
+    // earlier rule's failure returns before it.
+    val why = refusal(
+        [body_rule("TOKEN", "missing", false), template_rule("AUTH", "Bearer {{TOKEN}}", false)],
+        response_of("{\"token\":\"abc\"}", [])
+    )
+    test.assert_contains(why, "missing")
+}

@@ -1,0 +1,320 @@
+// `core/saved`: the codecs that have to agree with the Rust implementation byte for byte, because
+// both binaries read and write the same `.curly/` tree.
+//
+// **The round-trip test is the one that matters.** `serde_json::to_string_pretty` plus `fs::write`
+// is what `storage.rs:703` does, so the canonical form is two-space indent, raw UTF-8 and **no
+// trailing newline** -- all three confirmed by having the Rust binary rewrite a real collection and
+// diffing. The fixture here carries one request per codec branch (every body kind, both auth kinds,
+// all three extraction sources, an enabled and a disabled pair, a nested folder), so a branch that
+// stops matching shows up as a diff rather than as a collection that silently loses a field.
+//
+// Two encoding details were found by exactly this test and are worth not re-learning: serde writes
+// non-ASCII **raw**, not as `\uXXXX` escapes, and it writes `Vec<(String, String)>` as an array of
+// two-element arrays, so a form field is `["name", "value"]` and not an object.
+use core/extraction.Extraction
+use core/model.Pair
+use core/saved.Collection
+use core/saved.KvPair
+use core/saved.SavedAuth
+use core/saved.SavedBody
+use core/saved.SavedMultipartField
+use core/saved.SavedRequest
+use core/saved.collection_from_json
+use core/saved.collection_to_json
+use core/saved.kv_pair_from_json
+use core/saved.resolve
+use core/saved.saved_auth_from_json
+use core/saved.saved_body_from_json
+use core/saved.saved_request_from_json
+use core/saved.saved_request_to_json
+use core/saved.variable_from_json
+use fs
+use json
+use json.Json
+use test
+
+// Found through `ZIMAN_RESOURCE_PATH`, the same way the application resolves its own resources, so
+// the test does not care what the working directory is.
+fn fixture_text() -> string {
+    val found = fs.resolve("fixture-collection.json")
+    if None = found {
+        test.fail("fixture-collection.json is not on ZIMAN_RESOURCE_PATH")
+        return ""
+    }
+    return switch fs.read_text(unwrap(found)) {
+        Ok(t) { t }
+        Err(_) { "" }
+    }
+}
+
+fn parsed(text: string) -> Json {
+    return switch json.parse(text) {
+        Ok(j) { j }
+        Err(_) { Json.JNull }
+    }
+}
+
+fn decoded_fixture() -> Collection {
+    val c = collection_from_json(parsed(fixture_text()))
+    if Err(why) = c {
+        test.fail(concat("the fixture did not decode: ", why))
+    }
+    return unwrap(c)
+}
+
+fn one_request(name: string) -> SavedRequest {
+    val c = decoded_fixture()
+    for folder in c.folders {
+        for r in folder.requests {
+            if r.name == name {
+                return r
+            }
+        }
+    }
+    test.fail(concat("no request named ", name))
+    return unwrap(saved_request_from_json(Json.JNull))
+}
+
+// ---------------------------------------------------------------- payload accessors
+//
+// A function's declared return type is what gives an empty-array arm its element type, which an
+// inline `switch` in an argument position cannot get. They also keep the assertions readable.
+
+fn raw_of(b: SavedBody) -> string {
+    return switch b {
+        Raw(content) { content }
+        Binary(_) { "(not raw)" }
+        Form(_) { "(not raw)" }
+        Multipart(_) { "(not raw)" }
+    }
+}
+
+fn binary_of(b: SavedBody) -> string {
+    return switch b {
+        Binary(path) { path }
+        Raw(_) { "(not binary)" }
+        Form(_) { "(not binary)" }
+        Multipart(_) { "(not binary)" }
+    }
+}
+
+fn form_of(b: SavedBody) -> [Pair] {
+    return switch b {
+        Form(fields) { fields }
+        Raw(_) { [] }
+        Binary(_) { [] }
+        Multipart(_) { [] }
+    }
+}
+
+fn parts_of(b: SavedBody) -> [SavedMultipartField] {
+    return switch b {
+        Multipart(fields) { fields }
+        Raw(_) { [] }
+        Binary(_) { [] }
+        Form(_) { [] }
+    }
+}
+
+fn basic_username_of(a: SavedAuth) -> string {
+    return switch a {
+        Basic(b) { b.username }
+        Bearer(_) { "(not basic)" }
+    }
+}
+
+fn bearer_of(a: SavedAuth) -> string {
+    return switch a {
+        Bearer(token) { token }
+        Basic(_) { "(not bearer)" }
+    }
+}
+
+fn part_value_of(f: SavedMultipartField) -> string {
+    return switch f {
+        Text(p) { p.value }
+        File(p) { p.path }
+    }
+}
+
+fn rule_path_of(e: Extraction) -> string {
+    return switch e {
+        Body(r) { r.path }
+        Header(r) { r.header }
+        Template(r) { r.template }
+    }
+}
+
+fn rule_is_secret(e: Extraction) -> bool {
+    return switch e {
+        Body(r) { r.secret }
+        Header(r) { r.secret }
+        Template(r) { r.secret }
+    }
+}
+
+#[test]
+fn a_collection_round_trips_byte_for_byte() {
+    // The whole contract in one assertion: decode, re-encode, compare to the exact bytes the Rust
+    // implementation writes.
+    val original = fixture_text()
+    test.assert_ne("", original)
+    test.assert_eq(original, json.format(collection_to_json(decoded_fixture()), 2))
+}
+
+#[test]
+fn every_body_kind_survives_the_round_trip() {
+    val raw = one_request("raw")
+    test.assert_eq("{\"a\":1}", raw_of(unwrap(raw.body)))
+    test.assert_eq("/tmp/payload.bin", binary_of(unwrap(one_request("binary").body)))
+    // A form field is a two-element array on disk, not an object.
+    val form = form_of(unwrap(one_request("form").body))
+    test.assert_len(2, form)
+    test.assert_eq("grant_type", form[0].name)
+    test.assert_eq("password", form[0].value)
+    test.assert_len(2, parts_of(unwrap(one_request("multipart").body)))
+}
+
+#[test]
+fn both_auth_kinds_survive_the_round_trip() {
+    test.assert_eq("{{USER}}", basic_username_of(unwrap(one_request("basic").auth)))
+    test.assert_eq("{{TOKEN}}", bearer_of(unwrap(one_request("bearer").auth)))
+}
+
+#[test]
+fn all_three_extraction_sources_survive_the_round_trip() {
+    val rules = one_request("basic").extract
+    test.assert_len(3, rules)
+    test.assert_eq("data.id", rule_path_of(rules[0]))
+    test.assert_eq("X-Request-Id", rule_path_of(rules[1]))
+    // `secret: true` on the template rule, which is the only one that sets it.
+    test.assert_eq(true, rule_is_secret(rules[2]))
+    test.assert_eq(false, rule_is_secret(rules[0]))
+}
+
+#[test]
+fn a_disabled_pair_keeps_its_flag() {
+    val params = one_request("basic").query_params
+    test.assert_len(2, params)
+    test.assert_eq(true, params[0].enabled)
+    test.assert_eq(false, params[1].enabled)
+}
+
+// ---------------------------------------------------------------- absent-field defaults
+
+#[test]
+fn an_absent_enabled_reads_as_true_not_false() {
+    // **The one default here that is not a zero value.** A hand-written file need not say
+    // `enabled`, and reading it as false would silently drop every header in that file.
+    val p = kv_pair_from_json(parsed("{\"name\":\"A\",\"value\":\"b\"}"))
+    test.assert_eq(true, unwrap(p).enabled)
+}
+
+#[test]
+fn an_absent_secret_reads_as_false() {
+    val v = variable_from_json(parsed("{\"key\":\"K\",\"value\":\"v\"}"))
+    test.assert_eq(false, unwrap(v).secret)
+}
+
+#[test]
+fn absent_lists_read_as_empty_rather_than_failing() {
+    // Collections saved before folders existed have no `folders` key at all.
+    val c = collection_from_json(parsed("{\"id\":\"11111111-1111-4111-8111-111111111111\",\"name\":\"old\"}"))
+    test.assert_len(0, unwrap(c).folders)
+    test.assert_len(0, unwrap(c).requests)
+    val r = saved_request_from_json(parsed(
+        "{\"id\":\"11111111-1111-4111-8111-111111111111\",\"name\":\"r\",\"method\":\"GET\",\"url\":\"u\"}"
+    ))
+    test.assert_len(0, unwrap(r).headers)
+    test.assert_len(0, unwrap(r).query_params)
+    test.assert_len(0, unwrap(r).extract)
+}
+
+#[test]
+fn a_null_body_and_auth_read_as_absent_and_write_back_as_null() {
+    val text = "{\"id\":\"11111111-1111-4111-8111-111111111111\",\"name\":\"r\",\"method\":\"GET\",\"url\":\"u\",\"query_params\":[],\"headers\":[],\"body\":null,\"auth\":null,\"extract\":[]}"
+    val r = unwrap(saved_request_from_json(parsed(text)))
+    test.assert_eq(true, is_None(r.body))
+    test.assert_eq(true, is_None(r.auth))
+    // Written back as explicit `null`, not omitted: serde has no `skip_serializing_if` on either,
+    // so omitting them would rewrite every file in the tree on the next save.
+    val written = json.format(saved_request_to_json(r))
+    test.assert_contains(written, "\"body\":null")
+    test.assert_contains(written, "\"auth\":null")
+}
+
+#[test]
+fn an_unknown_tag_is_refused_by_name() {
+    // A format this reader does not know must fail loudly: silently dropping the body would send a
+    // request that looks fine and is not the one that was saved.
+    test.assert_contains(refusal_of_body("{\"type\":\"graphql\",\"query\":\"{x}\"}"), "graphql")
+    test.assert_contains(refusal_of_auth("{\"type\":\"oauth2\"}"), "oauth2")
+}
+
+fn refusal_of_body(text: string) -> string {
+    return switch saved_body_from_json(parsed(text)) {
+        Ok(_) { "no refusal" }
+        Err(why) { why }
+    }
+}
+
+fn refusal_of_auth(text: string) -> string {
+    return switch saved_auth_from_json(parsed(text)) {
+        Ok(_) { "no refusal" }
+        Err(why) { why }
+    }
+}
+
+// ---------------------------------------------------------------- resolve
+
+fn scope() -> Map<string, string> {
+    return Map<string, string> {
+        "BASE": "https://api.example.com",
+        "Q": "all",
+        "USER": "ann",
+        "PASS": "s3cret",
+        "TOKEN": "abc123",
+        "CAPTION": "a photo"
+    }
+}
+
+#[test]
+fn resolve_substitutes_url_headers_query_and_auth() {
+    val r = unwrap(resolve(one_request("basic"), scope()))
+    test.assert_eq("https://api.example.com/me", r.url)
+    test.assert_eq("all", r.query_params[0].value)
+    test.assert_eq("ann", basic_username_of(unwrap(r.auth)))
+}
+
+#[test]
+fn resolve_substitutes_a_form_body_but_leaves_a_binary_path_alone() {
+    val form = form_of(unwrap(unwrap(resolve(one_request("form"), scope())).body))
+    test.assert_eq("ann", form[1].value)
+    // **Not substituted, deliberately**: a file path is not a meaningful place for an environment
+    // variable, and Rust's `resolve` leaves `Binary` and `Multipart` untouched for that reason.
+    test.assert_eq(
+        "/tmp/payload.bin",
+        binary_of(unwrap(unwrap(resolve(one_request("binary"), scope())).body))
+    )
+}
+
+#[test]
+fn resolve_leaves_a_multipart_text_part_unsubstituted() {
+    // Rust substitutes neither half of a multipart body. Pinned because substituting only the text
+    // parts would look like an improvement and would be a divergence.
+    val parts = parts_of(unwrap(unwrap(resolve(one_request("multipart"), scope())).body))
+    test.assert_eq("{{CAPTION}}", part_value_of(parts[0]))
+}
+
+#[test]
+fn resolve_refuses_an_undefined_variable_and_names_the_first_field_to_fail() {
+    // **Only `BASE` is named, not `TOKEN`.** `substitute` reports every undefined name within one
+    // string, but `resolve` stops at the first *field* that fails -- and the field order is Rust's:
+    // url, headers, query, body, auth. This test caught the port doing auth first and reporting
+    // `TOKEN` for a request whose URL was equally unresolved.
+    val why = switch resolve(one_request("bearer"), Map<string, string> {}) {
+        Ok(_) { "no refusal" }
+        Err(message) { message }
+    }
+    test.assert_eq("undefined variable(s): BASE", why)
+}

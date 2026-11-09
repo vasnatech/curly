@@ -1,6 +1,6 @@
 # Curly GUI — User Guide
 
-> Status: the GUI is now a **Tauri + React + TypeScript** app, living in `curly-gui-tauri/` (sibling to `crates/`), replacing the earlier Rust/egui implementation (`crates/curly-gui`, still present but frozen/parked, not developed further — see `DESIGN.md`'s M9 entry for why). It reaches the same feature set the M8 design pass specified: a sidebar Project/History switcher, a Collections tree with hover "⋯" menus (rename/duplicate/delete; new-folder/new-request/delete-folder; new-folder/new-request/save-all on the collection root), an Environments list with create/edit/delete, multiple request tabs with dirty `"*"` tracking, an editable breadcrumb for renaming, Save/Save As, Variables (ad-hoc overrides)/Authorization/Headers/Body/Extraction sub-tabs, dedicated Collection/Folder/Environment main tabs plus an "Active environment" selector, and a Response pane with Body/Headers/History sub-tabs, JSON syntax highlighting, and search with match navigation. Like the GUI it replaces, it shares the exact same `.curly` storage the CLI reads and writes (NFR-5) — nothing here is a separate data store.
+> Status: the GUI is now a **Tauri + React + TypeScript** app, living in `curly-gui-tauri/` (a sibling of `rust/`), replacing the earlier Rust/egui implementation (`crates/curly-gui`, **deleted 2026-11-09** after a period frozen and parked — see `DESIGN.md`'s M8 and M9 entries). It reaches the same feature set the M8 design pass specified: a sidebar Project/History switcher, a Collections tree with hover "⋯" menus (rename/duplicate/delete; new-folder/new-request/delete-folder; new-folder/new-request/save-all on the collection root), an Environments list with create/edit/delete, multiple request tabs with dirty `"*"` tracking, an editable breadcrumb for renaming, Save/Save As, Variables (ad-hoc overrides)/Authorization/Headers/Body/Extraction sub-tabs, dedicated Collection/Folder/Environment main tabs plus an "Active environment" selector, and a Response pane with Body/Headers/History sub-tabs, JSON syntax highlighting, and search with match navigation. Like the GUI it replaces, it shares the exact same `.curly` storage the CLI reads and writes (NFR-5) — nothing here is a separate data store.
 
 ## Launching it
 
@@ -123,7 +123,7 @@ Three sub-tabs:
 
 ## What's not there yet
 
-- **A frontend automated test suite** (Vitest/Playwright) — this milestone's TypeScript side was verified by `tsc --noEmit` plus manual exercise of every feature in the running window, not automated tests. `curly-core`/`curly-cli`/the parked `curly-gui` keep their existing `cargo test` coverage untouched.
+- **A frontend automated test suite** (Vitest/Playwright) — this milestone's TypeScript side was verified by `tsc --noEmit` plus manual exercise of every feature in the running window, not automated tests. `curly-core`/`curly-cli` keep their existing `cargo test` coverage untouched. (The parked `curly-gui` kept its own until it was deleted on 2026-11-09 -- see DESIGN.md's M8 entry.)
 - **Multiple simultaneously-open projects** (M7 — see `DESIGN.md` §9) — unaffected by this rewrite; still one project open at a time.
 - **A GUI scenario editor** — scenarios (`curly scenario`) stay CLI/JSON-file-only, same as before this rewrite.
 - Loading a form/multipart/binary body into the editor isn't supported (same limitation the egui GUI had).

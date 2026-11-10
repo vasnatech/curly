@@ -12,8 +12,7 @@
 //   - a command must arrive as `POST` with `Content-Type: application/json`, which is not a CORS
 //     "simple request" and therefore cannot be sent cross-origin without a preflight;
 //   - no CORS headers are written and `OPTIONS` is not answered, so that preflight fails;
-//   - a request carrying an `Origin` header at all is refused outright, since the frontend served
-//     from this same server sends none on a same-origin `fetch`.
+//   - an `Origin` header that does not match the request's own `Host` is refused.
 //
 // Each of those alone is weak. Together they mean a page at evil.example cannot reach these
 // commands even knowing the port. **In development the frontend must therefore be proxied, not
@@ -182,11 +181,54 @@ fn starts_with_api(path: string) -> bool {
     return starts_with(path, api_prefix)
 }
 
+// The authority in an `Origin` header -- "http://localhost:1420" is "localhost:1420" -- so it can be
+// compared with a `Host`, which carries the authority and nothing else.
+fn origin_authority(origin: string) -> string {
+    val after_scheme = switch split_once(origin, "://") {
+        Some(parts) { parts[1] }
+        // `Origin: null`, which a sandboxed frame or a `file://` page sends. It matches no `Host`,
+        // which is the right answer.
+        None { origin }
+    }
+    return after_scheme
+}
+
+// **Whether this request came from the page this server served**, by comparing `Origin` against
+// `Host` -- the ordinary CSRF check, and the only one available to a server that does not know its
+// own public address: in development it is reached through Vite's proxy on another port, in
+// production directly, and nothing on the command line says which.
+//
+// **A missing `Origin` is same-origin.** A browser omits it on a `GET`, which is every static file.
+//
+// It would be simpler to refuse any request carrying the header at all, and that was the first
+// attempt -- but it is wrong, and wrong in the direction that breaks everything: a browser appends
+// `Origin` to a **same-origin** request whose method is not GET or HEAD (Fetch, "append a request
+// Origin header"), so every command the frontend sent would have been refused. Nothing caught it,
+// because a cross-origin header is what the tests sent and plain `curl` sends none at all.
+//
+// This is also why a proxy in front must not rewrite `Host`: Vite's `changeOrigin` defaults to
+// false and has to stay that way, or the browser's `Origin` and the forwarded `Host` disagree.
+fn same_origin(req: Request) -> bool {
+    val origin = switch http.header(req, "Origin") {
+        Some(value) { value }
+        None { return true }
+    }
+    val host = switch http.header(req, "Host") {
+        Some(value) { value }
+        // No `Host` at all is HTTP/1.0; there is nothing to compare, so the header cannot be
+        // trusted and the request is refused.
+        None { return false }
+    }
+    // A host is case-insensitive, so the comparison is too.
+    return equals_ignore_case(origin_authority(origin), host)
+}
+
 pub fn handle(ctx: Context, web_root: Option<string>, req: Request) -> Response {
-    // A same-origin `fetch` from the page this server served sends no `Origin`; a cross-origin one
-    // always does. So the presence of the header is the refusal, with no list of allowed origins to
-    // keep in step with anything.
-    if Some(origin) = http.header(req, "Origin") {
+    if !same_origin(req) {
+        val origin = switch http.header(req, "Origin") {
+            Some(value) { value }
+            None { "" }
+        }
         return server.text_response(403, concat(concat("cross-origin requests are refused: ", origin), "\n"))
     }
     if starts_with_api(req.path) {

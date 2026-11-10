@@ -101,32 +101,39 @@ HTTP server on the same machine is new risk that the port itself created. Four t
 - a command must be `POST` with `Content-Type: application/json`, which is not a CORS *simple
   request* and so cannot be sent cross-origin without a preflight;
 - no CORS headers are written and `OPTIONS` is not answered, so that preflight fails;
-- a request carrying an `Origin` header **at all** is refused, since the frontend served from this
-  same server sends none on a same-origin `fetch`.
+- an `Origin` header that does not match the request's own `Host` is refused.
 
 Each alone is weak; together they mean a page at `evil.example` cannot reach these commands even
 knowing the port. Turning CORS on instead would hand every open tab a file-writing API.
 
-### The frontend change this needs
+**`Origin` is compared with `Host`, not merely required to be absent** — and the simpler rule was
+tried first and is wrong in the direction that breaks everything. A browser appends `Origin` to a
+**same-origin** request whose method is not GET or HEAD (Fetch, "append a request `Origin` header"),
+so every command the frontend sends carries one, and refusing the header outright refused the whole
+frontend. A cross-origin header is what the tests sent and plain `curl` sends none at all, so
+nothing caught it until a config question did.
 
-Not yet made — `curly-gui-tauri/src/api.ts` still calls Tauri's `invoke`. The whole change is that
-one file: replace the `invoke` import with a `post` helper of the same shape, and every one of the
-24 wrappers below it stays as it is.
+That is also why **the proxy must not rewrite `Host`**: Vite's `changeOrigin` defaults to false and
+has to stay that way, or the browser's `Origin` and the forwarded `Host` disagree and every command
+is refused.
 
-```ts
-const post = async <T>(command: string, args: unknown = {}): Promise<T> => {
-  const answer = await fetch(`/api/${command}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(args),
-  });
-  // A refusal's body IS the message, exactly as a rejected `invoke` carried a plain string.
-  if (!answer.ok) throw new Error((await answer.text()).trim());
-  return answer.json() as Promise<T>;
-};
-```
+### The frontend
 
-`saveBytes` is the exception: it has no endpoint and becomes a download in the browser.
+**Done.** `curly-gui-tauri/src/api.ts` calls the server, not Tauri: the `invoke` import became a
+`post` helper of the same shape, and all 21 wrappers below it are unchanged, because the server kept
+`invoke`'s shape precisely so they could be. `vite.config.ts` proxies `/api` (set `CURLY_PORT` to
+match a `curly serve --port`).
+
+`saveBytes` is the exception — no endpoint, so it is now a **download**: a `Blob` and a synthesised
+`<a download>`, still byte-exact from `body_bytes`. Its first argument is therefore a *name* rather
+than a path, and `ResponsePane.tsx` no longer opens a native save dialog to produce one.
+
+**One Tauri dependency is left, and it is a product decision rather than an oversight**: `App.tsx`'s
+"Open Project…" uses `@tauri-apps/plugin-dialog`'s folder picker. A browser has no equivalent that
+yields an absolute path — `<input webkitdirectory>` gives paths relative to the chosen directory —
+so the honest options are a text field for a path (the app's existing `PathDialog` is the pattern),
+or dropping the in-app switcher and letting `curly serve --data-dir` decide. The `open_project`
+command itself works over HTTP; only the picker does not.
 
 ## The tests
 

@@ -204,8 +204,24 @@ def main():
         check("a command sent with no Content-Type is refused", status == 415, status)
 
         status, text = call(base, "list_collections", {}, origin="http://evil.example")
-        check("a command carrying an Origin header is refused",
+        check("a command from another origin is refused",
               status == 403 and "evil.example" in text, f"{status} {text}")
+
+        # **The other half, and the one that matters more.** A browser appends `Origin` to a
+        # same-origin request whose method is not GET or HEAD, so every command the frontend sends
+        # carries one -- refusing the header outright (the first attempt) refused the whole
+        # frontend. Only this pair shows the difference: the first check passes either way.
+        status, text = call(base, "list_collections", {}, origin=f"http://127.0.0.1:{port}")
+        check("a command from this server's own origin is accepted",
+              (status, text.strip()) == (200, "[]"), f"{status} {text}")
+
+        # Same host, different port: a different origin, and the port is the only thing saying so.
+        status, _ = call(base, "list_collections", {}, origin=f"http://127.0.0.1:{port + 1}")
+        check("a command from the same host on another port is refused", status == 403, status)
+
+        # `Origin: null` -- a sandboxed frame or a `file://` page. It matches no Host.
+        status, _ = call(base, "list_collections", {}, origin="null")
+        check("a command with Origin: null is refused", status == 403, status)
 
         status, text = call(base, "load_collection", {"name": "nope"})
         check("a refused command answers its message as the whole body",

@@ -22,6 +22,7 @@ use cli/commands/init as init_command
 use cli/commands/one_shot as one_shot_command
 use cli/commands/run as run_command
 use cli/commands/scenario as scenario_command
+use cli/commands/serve as serve_command
 use cli/commands/session as session_command
 use cli/commands/ui as ui_command
 use core/storage.Storage
@@ -36,7 +37,7 @@ val global_values = ["--data-dir"]
 // should be a request to a host that does not resolve, not a complaint about an unknown command.
 fn is_subcommand(word: string) -> bool {
     return contains(
-        ["init", "env", "collections", "scenario", "session", "history", "run", "gui", "ui"],
+        ["init", "env", "collections", "scenario", "session", "history", "run", "gui", "ui", "serve"],
         word
     )
 }
@@ -59,6 +60,9 @@ fn flags_for(command: string, action: string) -> [string] {
     }
     if command == "history" {
         return concat(global_values, ["--limit"])
+    }
+    if command == "serve" {
+        return concat(global_values, serve_command.value_flags())
     }
     return global_values
 }
@@ -96,6 +100,9 @@ fn help() {
     print("  scenario      Inspect and run multi-request scenarios")
     print("  session       Inspect or clear variables a run extracted")
     print("  history       Show recorded requests")
+    print("  run           Execute a saved request: curly run <collection>/<request-name>")
+    print("  ui            Browse collections and send requests in the terminal")
+    print("  serve         Serve the HTTP API the web frontend talks to")
     print("")
     print("Options:")
     print("      --data-dir <DATA_DIR>  Where to store collections/environments/history")
@@ -203,6 +210,10 @@ fn main() {
     }
     if command == "ui" {
         finish(ui_command.run(store))
+        return
+    }
+    if command == "serve" {
+        finish(serve_command.run(rest, store))
         return
     }
     // `gui` is in the subcommand list and had no branch until 2026-11-09, so it fell through to

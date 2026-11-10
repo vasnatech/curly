@@ -1,0 +1,256 @@
+// The HTTP layer: `POST /api/<command>` onto `server/api`, and the built frontend as static files.
+//
+// This module holds no knowledge of the command surface -- it reads a name out of the path and
+// hands it to `api.call` -- so the two can be read and changed independently.
+//
+// **It binds to the loopback interface and refuses a cross-origin caller, and that is not
+// optional.** The Tauri bridge reached `curly-core` over Tauri's own IPC, which no web page can
+// address; an HTTP server on the same machine is addressable by every page the user has open, and
+// these commands read and write files and send requests from the user's machine. So:
+//
+//   - the listener binds 127.0.0.1 by default, not 0.0.0.0, so nothing off the machine reaches it;
+//   - a command must arrive as `POST` with `Content-Type: application/json`, which is not a CORS
+//     "simple request" and therefore cannot be sent cross-origin without a preflight;
+//   - no CORS headers are written and `OPTIONS` is not answered, so that preflight fails;
+//   - a request carrying an `Origin` header at all is refused outright, since the frontend served
+//     from this same server sends none on a same-origin `fetch`.
+//
+// Each of those alone is weak. Together they mean a page at evil.example cannot reach these
+// commands even knowing the port. **In development the frontend must therefore be proxied, not
+// CORS-enabled**: Vite's `server.proxy` forwards `/api` from the dev server's own origin, which is
+// how health-record's React frontend already reaches its Ziman backend. Turning CORS on instead
+// would hand every open tab a file-writing API.
+use core/storage.Storage
+use fs
+use http
+use http.HttpMethod
+use http.Request
+use http.Response
+use json
+use mime
+use net
+use server
+use server/api
+use server/api.Context
+use url
+
+pub struct Options {
+    host: string
+    port: int
+    // Where the built frontend is -- `dist/` from `npm run build`. `None` serves the API alone,
+    // which is what the integration tests and a Vite dev session both want: in development Vite
+    // serves the frontend itself and proxies `/api` here.
+    web_root: Option<string>
+    log_requests: bool
+}
+
+pub fn options_of(port: int) -> Options {
+    return Options { host: "127.0.0.1", port: port, web_root: None, log_requests: false }
+}
+
+val api_prefix = "/api/"
+
+// --------------------------------------------------------------- the API
+
+// A refused command answers **500 with the message as the whole body**, and the status carries no
+// further meaning.
+//
+// That is a deliberate refusal to invent an error taxonomy. Every one of these commands is
+// `Result<T, String>` on the Rust side -- the bridge has no error kinds, so there is nothing here
+// to map onto 404 and 409 but guesswork, and a guess would be worse than nothing: a frontend that
+// branched on a status this module made up would be coupled to that guess. The message is the
+// answer, exactly as it is through Tauri, where a rejected `invoke` carries a plain string.
+//
+// 500 rather than 400 because the request was well-formed and understood: "no such collection" is
+// the server reporting its own state, not the caller having malformed anything. A 4xx would invite
+// a proxy or a devtools pane to present the user's own click as their mistake.
+fn command_response(ctx: Context, name: string, req: Request) -> Response {
+    // Not a CORS simple request, so it cannot arrive cross-origin without a preflight this server
+    // never answers.
+    val sent = switch http.content_type(req.headers) {
+        Some(m) { m }
+        None { return server.text_response(415, "a command must be sent as application/json\n") }
+    }
+    if !mime.is_json(sent) {
+        return server.text_response(415, "a command must be sent as application/json\n")
+    }
+    val body = switch http.body_bytes(req.body) {
+        Ok(data) { data }
+        Err(_) { return server.text_response(400, "the request body could not be read\n") }
+    }
+    // An argument-less command may be called with no body at all, which is what `invoke(name)`
+    // with no second argument becomes.
+    val args = if len(body) == 0 {
+        json.Json.JObject(Map<string, json.Json> {})
+    } else {
+        switch json.parse(body) {
+            Ok(j) { j }
+            Err(why) { return server.text_response(400, concat(why, "\n")) }
+        }
+    }
+    return switch api.call(ctx, name, args) {
+        Ok(answer) { server.json_response(200, json.format(answer)) }
+        Err(why) { server.text_response(500, concat(why, "\n")) }
+    }
+}
+
+// --------------------------------------------------------------- static files
+
+// One path segment of a request, decoded and checked, or `None` for a path no file may be served
+// for.
+//
+// **The order is decode-then-check, and it is the whole guard.** `req.path` is the raw target: the
+// library leaves it percent-encoded, because only the caller knows what its own encoding meant. So
+// a segment is decoded first and judged afterwards -- `%2e%2e` becomes ".." and is refused, and
+// `%2f` becomes a "/" *inside* a segment, which is refused for the same reason. Checking before
+// decoding would pass both; refusing to decode at all would also be safe, since the filesystem
+// does not decode either, but then a file with a space in its name could never be served.
+fn safe_segment(raw: string) -> Option<string> {
+    val decoded = switch url.percent_decode(raw, false) {
+        Ok(text) { text }
+        Err(_) { return Option<string>.None }
+    }
+    if decoded == "" || decoded == "." || decoded == ".." {
+        return Option<string>.None
+    }
+    if contains(decoded, "/") {
+        return Option<string>.None
+    }
+    return Option<string>.Some(decoded)
+}
+
+// The file a request path names under `root`, or `None` if it names none that may be served.
+fn resolved_path(root: string, path: string) -> Option<string> {
+    val out = mutable_array_new<string>()
+    for raw in split(path, "/") {
+        // An empty piece is the leading slash, a trailing slash, or a `//` -- all of which name no
+        // segment rather than a bad one, so they are skipped and not refused.
+        if raw != "" {
+            val segment = switch safe_segment(raw) {
+                Some(s) { s }
+                None { return Option<string>.None }
+            }
+            push(out, segment)
+        }
+    }
+    if len(out) == 0 {
+        return Option<string>.Some(fs.path_join(root, "index.html"))
+    }
+    var joined = root
+    for segment in snapshot(out) {
+        joined = fs.path_join(joined, segment)
+    }
+    return Option<string>.Some(joined)
+}
+
+fn file_response(path: string, data: [byte]) -> Response {
+    val media = switch mime.of_path(path) {
+        Some(m) { m }
+        None { mime.application_octet_stream() }
+    }
+    return server.media_response(200, data, media)
+}
+
+// A built single-page app: the file when there is one, and `index.html` when the path is one of the
+// app's own routes.
+//
+// **The fallback is only for a path with no extension.** A missing `/assets/main-a1b2c3.js` must be
+// a 404 and not a page of HTML: handing the browser `index.html` with a `text/javascript` label
+// turns a failed deploy into a syntax error in the console, which says nothing about the real
+// problem. A path with no extension is a route; a path with one is a file that is simply not there.
+fn static_response(root: string, path: string) -> Response {
+    val file = switch resolved_path(root, path) {
+        Some(p) { p }
+        None { return server.not_found() }
+    }
+    if Ok(data) = fs.read_bytes(file) {
+        return file_response(file, data)
+    }
+    if fs.extension(file) != "" {
+        return server.not_found()
+    }
+    val index = fs.path_join(root, "index.html")
+    if Ok(data) = fs.read_bytes(index) {
+        return file_response(index, data)
+    }
+    return server.not_found()
+}
+
+// --------------------------------------------------------------- the handler
+
+fn starts_with_api(path: string) -> bool {
+    return starts_with(path, api_prefix)
+}
+
+pub fn handle(ctx: Context, web_root: Option<string>, req: Request) -> Response {
+    // A same-origin `fetch` from the page this server served sends no `Origin`; a cross-origin one
+    // always does. So the presence of the header is the refusal, with no list of allowed origins to
+    // keep in step with anything.
+    if Some(origin) = http.header(req, "Origin") {
+        return server.text_response(403, concat(concat("cross-origin requests are refused: ", origin), "\n"))
+    }
+    if starts_with_api(req.path) {
+        val name = substring(req.path, len(api_prefix), len(req.path))
+        if req.method != HttpMethod.Post {
+            return server.method_not_allowed("POST")
+        }
+        if name == "" {
+            return server.not_found()
+        }
+        return command_response(ctx, name, req)
+    }
+    if req.method != HttpMethod.Get && req.method != HttpMethod.Head {
+        return server.method_not_allowed("GET", "HEAD")
+    }
+    return switch web_root {
+        Some(root) { static_response(root, req.path) }
+        None { server.not_found() }
+    }
+}
+
+// --------------------------------------------------------------- running
+
+// Binds, and serves until the process is stopped. Answers the refusal rather than exiting, so a
+// caller can report a taken port in its own words.
+pub fn run(store: Storage, options: Options) -> Result<unit, string> {
+    val ctx = api.context_of(store)
+    val listener = switch net.listen(options.host, options.port) {
+        Ok(l) { l }
+        Err(e) {
+            return err(prelude.format(
+                "cannot listen on {}:{}: {}",
+                options.host,
+                str(options.port),
+                net.net_error_message(e)
+            ))
+        }
+    }
+    val web_root = options.web_root
+    val serve_options = with server.serve_options() { log_requests: options.log_requests }
+    server.serve(listener, fn(req: Request) -> Response { return handle(ctx, web_root, req) }, serve_options)
+    return ok(unit)
+}
+
+// The port a listener ended up on -- needed when `port` was 0, which is what a test asks for so
+// that two tests never collide.
+pub fn bind(options: Options) -> Result<net.Listener, string> {
+    return switch net.listen(options.host, options.port) {
+        Ok(l) { ok(l) }
+        Err(e) {
+            err(prelude.format(
+                "cannot listen on {}:{}: {}",
+                options.host,
+                str(options.port),
+                net.net_error_message(e)
+            ))
+        }
+    }
+}
+
+// Serves an already-bound listener, so a caller that needed the port first can hand it over.
+pub fn serve_bound(store: Storage, listener: net.Listener, options: Options) {
+    val ctx = api.context_of(store)
+    val web_root = options.web_root
+    val serve_options = with server.serve_options() { log_requests: options.log_requests }
+    server.serve(listener, fn(req: Request) -> Response { return handle(ctx, web_root, req) }, serve_options)
+}

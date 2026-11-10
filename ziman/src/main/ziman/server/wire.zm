@@ -1,0 +1,186 @@
+// The five JSON shapes the frontend exchanges with the server that nothing else in curly already
+// encodes.
+//
+// **Every other shape on this API is a saved-file shape**, and those codecs already exist in
+// `core/saved`, `core/storage`, `core/scenario` and `core/extraction` -- written byte-for-byte
+// against what the Rust binary writes to `.curly/`. The API inherits that work for free, because
+// the Tauri bridge hands the frontend `serde_json` of the very same structs it writes to disk. So
+// this module is only the shapes that exist *nowhere on disk*: a project's label, a response
+// summary, an extracted variable, the pair of those two that a send answers with, and a scenario
+// run's verdict.
+//
+// **The bridge's JSON is the spec, not the frontend's `types.ts`.** That file is a hand-written
+// TypeScript mirror of these shapes and therefore a second-hand account; two of the shapes here
+// cannot be read off curly's own source at all, since they are serde's conventions rather than
+// curly's -- a `Duration` is `{"secs","nanos"}`, a `Vec<u8>` is an array of numbers, and an enum
+// with no serde attributes is externally tagged, so `StepOutcome::Ok` is the bare string "Ok"
+// while `Halted(why)` is `{"Halted": why}`. They were
+// pinned by running `cargo run --example wire_shapes -p curly-core`, which prints serde's own
+// output for these structs, and `parity.sh` diffs this module against it so neither can drift.
+use core/exec.ResponseSummary
+use core/extraction.Extracted
+use core/scenario_run.ScenarioRun
+use core/scenario_run.StepLog
+use core/scenario_run.StepOutcome
+use core/storage.Storage
+use core/storage.is_default_location
+use core/storage.root_of
+use fs
+use http
+use json
+use json.Json
+
+// A storage root plus a label to show for it -- not a new concept on disk, just what `curly init`
+// already makes. Mirrors `curly-gui-tauri/src-tauri/src/project.rs`.
+pub struct ProjectInfo {
+    label: string
+    root: string
+}
+
+// What a send answers: the response, and whatever the request's extraction rules pulled out of it.
+pub struct SendOutcome {
+    response: ResponseSummary
+    extracted: [Extracted]
+}
+
+// "Default" for the OS-wide default location, otherwise the name of the directory the `.curly` sits
+// **inside** -- `/home/user/my-api/.curly` is "my-api", because the `.curly` segment is the same for
+// every project and labelling them all ".curly" would name none of them.
+//
+// A root that is not itself named `.curly` is labelled by its own last segment: that is the
+// `--data-dir`/`CURLY_DATA_DIR` case, where the directory the user named is the project.
+pub fn project_label(store: Storage) -> string {
+    if is_default_location(store) {
+        return "Default"
+    }
+    val root = root_of(store)
+    val named = if fs.file_name(root) == ".curly" { fs.parent_dir(root) } else { root }
+    val label = fs.file_name(named)
+    // `fs.file_name` answers "/" for the filesystem root and "." for a bare relative name, neither
+    // of which labels anything -- fall back to the path, as Rust's `unwrap_or_else` does.
+    if label == "" || label == "/" || label == "." {
+        return root
+    }
+    return label
+}
+
+pub fn project_info_of(store: Storage) -> ProjectInfo {
+    return ProjectInfo { label: project_label(store), root: root_of(store) }
+}
+
+pub fn project_info_to_json(p: ProjectInfo) -> Json {
+    return Json.JObject(Map<string, Json> { "label": Json.JString(p.label), "root": Json.JString(p.root) })
+}
+
+// `Vec<(String, String)>`, so a pair of arrays rather than an object -- the same shape
+// `core/storage` writes history headers in, and for the same reason.
+fn header_pairs_to_json(headers: [http.Header]) -> Json {
+    val out = mutable_array_new<Json>()
+    for h in headers {
+        push(out, Json.JArray([Json.JString(h.name), Json.JString(h.value)]))
+    }
+    return Json.JArray(snapshot(out))
+}
+
+fn bytes_to_json(data: [byte]) -> Json {
+    val out = mutable_array_new<Json>()
+    for b in data {
+        push(out, json.int_to_json(b as int))
+    }
+    return Json.JArray(snapshot(out))
+}
+
+// **A `std::time::Duration` is `{"secs","nanos"}`**, and this is the one field on the whole API
+// where the two implementations carry different precision: Rust holds nanoseconds and Ziman's
+// client measures in milliseconds, so `nanos` here is always a whole number of millions. The
+// *shape* is identical, which is what the frontend reads; a sub-millisecond difference in a figure
+// the UI prints as "123 ms" is not observable, and `parity.sh` already treats an elapsed time as
+// non-deterministic because it is a measurement.
+fn elapsed_to_json(millis: int) -> Json {
+    return Json.JObject(Map<string, Json> {
+        "secs": json.int_to_json(millis / 1000),
+        "nanos": json.int_to_json((millis % 1000) * 1000000)
+    })
+}
+
+pub fn response_summary_to_json(r: ResponseSummary) -> Json {
+    return Json.JObject(Map<string, Json> {
+        "status": json.int_to_json(r.status),
+        "headers": header_pairs_to_json(r.headers),
+        "body": Json.JString(r.body),
+        "body_bytes": bytes_to_json(r.body_bytes),
+        "elapsed": elapsed_to_json(r.elapsed_millis)
+    })
+}
+
+pub fn extracted_to_json(e: Extracted) -> Json {
+    return Json.JObject(Map<string, Json> {
+        "name": Json.JString(e.name),
+        "value": Json.JString(e.value),
+        "secret": Json.JBool(e.secret)
+    })
+}
+
+pub fn extracted_list_to_json(list: [Extracted]) -> Json {
+    val out = mutable_array_new<Json>()
+    for e in list {
+        push(out, extracted_to_json(e))
+    }
+    return Json.JArray(snapshot(out))
+}
+
+pub fn send_outcome_to_json(o: SendOutcome) -> Json {
+    return Json.JObject(Map<string, Json> {
+        "response": response_summary_to_json(o.response),
+        "extracted": extracted_list_to_json(o.extracted)
+    })
+}
+
+// --- a scenario run ---
+
+// **Serde's default external tagging, which the three variants do not spell the same way**: a unit
+// variant is the bare string `"Ok"`, and a variant with a payload is a one-key object. Nothing in
+// curly's source says so -- `StepOutcome` carries no serde attributes at all, which is exactly what
+// makes the default apply.
+fn step_outcome_to_json(o: StepOutcome) -> Json {
+    return switch o {
+        Ok { Json.JString("Ok") }
+        HttpFailure { Json.JString("HttpFailure") }
+        Halted(why) { Json.JObject(Map<string, Json> { "Halted": Json.JString(why) }) }
+    }
+}
+
+fn step_log_to_json(s: StepLog) -> Json {
+    val extracted = mutable_array_new<Json>()
+    for name in s.extracted {
+        push(extracted, Json.JString(name))
+    }
+    return Json.JObject(Map<string, Json> {
+        "reference": Json.JString(s.reference),
+        "method": Json.JString(s.method),
+        "url": Json.JString(s.url),
+        // Written as explicit `null` when absent rather than omitted: neither field carries
+        // `skip_serializing_if`, and the pair of them is how a caller tells a network-level failure
+        // (no status, an error) from an HTTP one (a status, no error).
+        "status": switch s.status {
+            Some(code) { json.int_to_json(code) }
+            None { Json.JNull }
+        },
+        "error": switch s.error {
+            Some(why) { Json.JString(why) }
+            None { Json.JNull }
+        },
+        "extracted": Json.JArray(snapshot(extracted))
+    })
+}
+
+pub fn scenario_run_to_json(r: ScenarioRun) -> Json {
+    val steps = mutable_array_new<Json>()
+    for s in r.steps {
+        push(steps, step_log_to_json(s))
+    }
+    return Json.JObject(Map<string, Json> {
+        "outcome": step_outcome_to_json(r.outcome),
+        "steps": Json.JArray(snapshot(steps))
+    })
+}

@@ -1,0 +1,524 @@
+// Every operation the frontend needs, as one named command taking a JSON object of arguments and
+// answering JSON -- the Ziman side of `curly-gui-tauri/src-tauri/src/commands.rs`.
+//
+// **Command-shaped, not REST, and that is the point.** The frontend calls these through Tauri's
+// `invoke(name, args)` today, where `args` is an object of named arguments and the answer is the
+// serde JSON of a return value. Keeping that exact shape means the frontend's whole move from a
+// desktop shell to this server is `invoke` becoming one `fetch` in `api.ts` -- one function, not 26
+// new URLs to design, argue about and then get wrong. A REST surface would be a second API to keep
+// in step with the first for no gain: nothing but curly's own frontend will ever call this, it is
+// not a public contract, and the resource-shaped version of `resolve_default_project` is a fiction.
+//
+// **An argument name here is the JavaScript spelling, so `envName` and not `env_name`.** Tauri
+// converts a camelCase key from JS to its snake_case Rust parameter; there is no such layer here,
+// so the wire name is what `api.ts` already writes. Renaming them to snake_case would be a second
+// change to the frontend on top of the transport, in the one file this port must not churn.
+//
+// **`save_bytes` is deliberately absent.** It writes bytes to a path the user picked in a native
+// save dialog -- an affordance of a desktop shell, not of a server, and a server that wrote to an
+// arbitrary path on the host because a web page asked it to would be a straightforward hole. In a
+// browser that operation is a download, which is the frontend's job (a Blob and an `<a download>`),
+// so there is nothing for this module to expose. `docs/GUI.md` records it as the one bridge command
+// with no server equivalent.
+//
+// Each command is a plain function from arguments to an answer, so the whole surface is testable
+// against a temporary storage root without binding a socket -- `server/serve` is the only part that
+// needs one. Shapes `core/` does not already encode live in `server/wire`.
+use core/collection.add_folder
+use core/collection.add_request
+use core/collection.duplicate_request
+use core/collection.remove_folder
+use core/collection.remove_request
+use core/collection.rename_or_move_request
+use core/exec
+use core/extraction.Extracted
+use core/extraction.apply
+use core/model.Pair
+use core/saved.Collection
+use core/saved.collection_from_json
+use core/saved.collection_to_json
+use core/saved.environment_from_json
+use core/saved.environment_set
+use core/saved.environment_to_json
+use core/saved.into_request
+use core/saved.pair_from_json
+use core/saved.resolve as resolve_request
+use core/saved.saved_request_from_json
+use core/scenario.scenario_from_json
+use core/scenario.scenario_to_json
+use core/scenario_run
+use core/scenario_run.merged_variables
+use core/storage.Storage
+use core/storage.append_history
+use core/storage.clear_session
+use core/storage.delete_collection
+use core/storage.delete_environment
+use core/storage.delete_scenario
+use core/storage.history_entry_of
+use core/storage.history_entry_to_json
+use core/storage.init_project_local
+use core/storage.list_collections
+use core/storage.list_environments
+use core/storage.list_history
+use core/storage.list_scenarios
+use core/storage.load_collection
+use core/storage.load_collection_opt
+use core/storage.load_environment
+use core/storage.load_scenario
+use core/storage.load_session
+use core/storage.save_collection
+use core/storage.save_environment
+use core/storage.save_scenario
+use core/storage.save_session
+use json
+use json.Json
+use server/wire.SendOutcome
+use server/wire.project_info_of
+use server/wire.project_info_to_json
+use server/wire.scenario_run_to_json
+use server/wire.send_outcome_to_json
+use uuid.uuid_new
+
+// The open project, and nothing else. It has to be *changeable* because two commands replace it:
+// `open_project` and `resolve_default_project` are how the user changes projects without restarting
+// the app, exactly as the bridge's `Mutex<Storage>` is.
+//
+// **It is a thread owning the value, reached over a channel, and it cannot be a `Mutable`.** That
+// was the first thing tried and it fails at run time, not at compile time: "a Mutable belongs to
+// the thread that made it and was used from another thread". `server.serve` runs a thread per
+// connection, and a `Mutable` made on the main thread is unusable from any of them -- so the whole
+// API answered the server's generic 500 while an unknown command, which never touches the cell,
+// answered correctly. Ziman's model is immutable values plus channels, and `core/thread`'s own
+// guidance for state that must outlive a connection is exactly this: a thread that owns it,
+// reached over a channel.
+//
+// The keeper hands out a copy and takes a replacement; it never does I/O. So a command reads the
+// root once and then works on its own value, and a project opened by another request half way
+// through cannot change which root this one writes to.
+enum Ask {
+    // Reply with the open project, on the channel the asker brought.
+    Read(Channel<Storage>)
+    // Make this the open project from now on.
+    Write(Storage)
+}
+
+pub struct Context {
+    asks: Channel<Ask>
+}
+
+fn keeper(asks: Channel<Ask>, initial: Storage) {
+    var current = initial
+    while true {
+        switch receive(asks) {
+            Read(reply) { send(reply, current) }
+            Write(next) { current = next }
+        }
+    }
+}
+
+pub fn context_of(store: Storage) -> Context {
+    val asks: Channel<Ask> = channel_new()
+    spawn keeper(asks, store)
+    return Context { asks: asks }
+}
+
+pub fn current_storage(ctx: Context) -> Storage {
+    // A reply channel per ask, so two threads asking at once cannot be handed each other's answer.
+    val reply: Channel<Storage> = channel_new()
+    send(ctx.asks, Ask.Read(reply))
+    return receive(reply)
+}
+
+fn open(ctx: Context, store: Storage) {
+    send(ctx.asks, Ask.Write(store))
+}
+
+// One command: the name the frontend calls it by, and what it does.
+pub struct Command {
+    name: string
+    run: fn(Context, Json) -> Result<Json, string>
+}
+
+// ------------------------------------------------------------------ arguments
+
+// A command's arguments arrive as one JSON object, the same one `invoke`'s second parameter is.
+// These are the four shapes of argument the whole surface uses.
+fn arg_string(args: Json, key: string) -> Result<string, string> {
+    return json.require_string(args, key)
+}
+
+fn arg_bool(args: Json, key: string) -> Result<bool, string> {
+    return json.require_bool(args, key)
+}
+
+fn arg_int(args: Json, key: string) -> Result<int, string> {
+    return json.require_int(args, key)
+}
+
+fn arg_object(args: Json, key: string) -> Result<Json, string> {
+    return json.require(args, key)
+}
+
+// An argument that may be absent **or** explicitly `null`: `envName` is `string | null` on the
+// frontend, where null means "no environment selected" rather than "I forgot to pass it". Both have
+// to mean the same thing, because `JSON.stringify` drops an `undefined` value and keeps a `null`
+// one -- so the same frontend call arrives either way depending on how the caller spelled it.
+fn arg_optional_string(args: Json, key: string) -> Result<Option<string>, string> {
+    return switch json.get(args, key) {
+        None { ok(Option<string>.None) }
+        Some(found) {
+            if Json.is_JNull(found) {
+                ok(Option<string>.None)
+            } else {
+                switch json.string_from_json(found) {
+                    Ok(text) { ok(Option<string>.Some(text)) }
+                    Err(why) { err(concat(concat(key, ": "), why)) }
+                }
+            }
+        }
+    }
+}
+
+// `Vec<(String, String)>` -- an array of two-element arrays, the same shape a form field takes on
+// disk, so `core/saved`'s own pair decoder does the work.
+fn arg_pairs(args: Json, key: string) -> Result<[Pair], string> {
+    val found = switch json.get(args, key) {
+        Some(j) { j }
+        None { return ok([]) }
+    }
+    if Json.is_JNull(found) {
+        return ok([])
+    }
+    val out = mutable_array_new<Pair>()
+    for one in try json_array(found, key) {
+        push(out, try pair_from_json(one))
+    }
+    return ok(snapshot(out))
+}
+
+// `Json` has no `_` arm to fall through to -- a variant pattern must name a variant -- so a
+// one-armed `if` and a refusal underneath is how a shape is tested.
+fn json_array(j: Json, what: string) -> Result<[Json], string> {
+    if JArray(list) = j {
+        return ok(list)
+    }
+    return err(concat(what, ": expected an array of [name, value] pairs"))
+}
+
+// ------------------------------------------------------------------ answers
+
+val null_answer = Json.JNull
+
+fn string_list_answer(r: Result<[string], string>) -> Result<Json, string> {
+    val names = try r
+    val out = mutable_array_new<Json>()
+    for name in names {
+        push(out, Json.JString(name))
+    }
+    return ok(Json.JArray(snapshot(out)))
+}
+
+// ------------------------------------------------------------------ the project
+
+fn do_open_project(ctx: Context, args: Json) -> Result<Json, string> {
+    val path = try arg_string(args, "path")
+    val outcome = try init_project_local(path)
+    open(ctx, outcome.storage)
+    return ok(project_info_to_json(project_info_of(outcome.storage)))
+}
+
+// **Reports the project the server was started with; it does not re-resolve one.** The bridge
+// calls `Storage::resolve_default(None)` here because a desktop app has no other idea of where it
+// is, but this server was given a root on its command line and `curly`'s own `resolve` already did
+// that walk -- explicit `--data-dir`, then `CURLY_DATA_DIR`, then the nearest `.curly` above the
+// working directory, then the OS default. Re-running it per request would answer a *different*
+// question, from a process whose working directory is wherever the server happens to have been
+// started.
+//
+// This was caught by running it: with `--data-dir` given, a `resolve_default_project` -- which the
+// frontend calls first thing on startup -- silently moved the whole session to the OS-wide default,
+// and every command after it read the wrong tree. Where no `--data-dir` is in play the two answers
+// are identical, which is why it survived the unit tests.
+fn do_resolve_default_project(ctx: Context, args: Json) -> Result<Json, string> {
+    return ok(project_info_to_json(project_info_of(current_storage(ctx))))
+}
+
+// ------------------------------------------------------------------ collections
+
+fn do_list_collections(ctx: Context, args: Json) -> Result<Json, string> {
+    return string_list_answer(list_collections(current_storage(ctx)))
+}
+
+fn do_load_collection(ctx: Context, args: Json) -> Result<Json, string> {
+    val name = try arg_string(args, "name")
+    return ok(collection_to_json(try load_collection(current_storage(ctx), name)))
+}
+
+fn do_save_collection(ctx: Context, args: Json) -> Result<Json, string> {
+    val collection = try collection_from_json(try arg_object(args, "collection"))
+    try save_collection(current_storage(ctx), collection)
+    return ok(null_answer)
+}
+
+fn do_delete_collection(ctx: Context, args: Json) -> Result<Json, string> {
+    val name = try arg_string(args, "name")
+    try delete_collection(current_storage(ctx), name)
+    return ok(null_answer)
+}
+
+// **A collection the frontend adds to need not exist yet**, matching the bridge: adding the first
+// request to a new name creates the collection rather than refusing. Every other tree operation
+// requires it, because moving or removing something inside a collection that is not there is a
+// mistake worth reporting.
+fn loaded_or_new(store: Storage, name: string) -> Result<Collection, string> {
+    return switch try load_collection_opt(store, name) {
+        Some(found) { ok(found) }
+        None { ok(Collection { id: uuid_new(), name: name, folders: [], requests: [] }) }
+    }
+}
+
+fn do_add_request(ctx: Context, args: Json) -> Result<Json, string> {
+    val store = current_storage(ctx)
+    val name = try arg_string(args, "collection")
+    val path = try arg_string(args, "path")
+    val request = try saved_request_from_json(try arg_object(args, "request"))
+    val collection = try add_request(try loaded_or_new(store, name), path, request)
+    try save_collection(store, collection)
+    return ok(null_answer)
+}
+
+fn do_rename_or_move_request(ctx: Context, args: Json) -> Result<Json, string> {
+    val store = current_storage(ctx)
+    val name = try arg_string(args, "collection")
+    val old_path = try arg_string(args, "oldPath")
+    val new_path = try arg_string(args, "newPath")
+    val collection = try rename_or_move_request(try load_collection(store, name), old_path, new_path)
+    try save_collection(store, collection)
+    return ok(null_answer)
+}
+
+fn do_duplicate_request(ctx: Context, args: Json) -> Result<Json, string> {
+    val store = current_storage(ctx)
+    val name = try arg_string(args, "collection")
+    val path = try arg_string(args, "path")
+    val new_path = try arg_string(args, "newPath")
+    val collection = try duplicate_request(try load_collection(store, name), path, new_path)
+    try save_collection(store, collection)
+    return ok(null_answer)
+}
+
+// **Saved whether or not anything was removed**, as the bridge is: the answer is whether a request
+// was there, and writing the file back unchanged is how the two implementations stay byte-identical
+// on a no-op rather than one of them skipping the write.
+fn do_remove_request(ctx: Context, args: Json) -> Result<Json, string> {
+    val store = current_storage(ctx)
+    val name = try arg_string(args, "collection")
+    val path = try arg_string(args, "path")
+    val outcome = remove_request(try load_collection(store, name), path)
+    try save_collection(store, outcome.collection)
+    return ok(Json.JBool(outcome.removed))
+}
+
+fn do_add_folder(ctx: Context, args: Json) -> Result<Json, string> {
+    val store = current_storage(ctx)
+    val name = try arg_string(args, "collection")
+    val path = try arg_string(args, "path")
+    try save_collection(store, add_folder(try loaded_or_new(store, name), path))
+    return ok(null_answer)
+}
+
+fn do_remove_folder(ctx: Context, args: Json) -> Result<Json, string> {
+    val store = current_storage(ctx)
+    val name = try arg_string(args, "collection")
+    val path = try arg_string(args, "path")
+    val force = try arg_bool(args, "force")
+    val outcome = try remove_folder(try load_collection(store, name), path, force)
+    try save_collection(store, outcome.collection)
+    return ok(Json.JBool(outcome.removed))
+}
+
+// ------------------------------------------------------------------ environments
+
+fn do_list_environments(ctx: Context, args: Json) -> Result<Json, string> {
+    return string_list_answer(list_environments(current_storage(ctx)))
+}
+
+fn do_load_environment(ctx: Context, args: Json) -> Result<Json, string> {
+    val name = try arg_string(args, "name")
+    return ok(environment_to_json(try load_environment(current_storage(ctx), name)))
+}
+
+fn do_save_environment(ctx: Context, args: Json) -> Result<Json, string> {
+    val env = try environment_from_json(try arg_object(args, "environment"))
+    try save_environment(current_storage(ctx), env)
+    return ok(null_answer)
+}
+
+fn do_delete_environment(ctx: Context, args: Json) -> Result<Json, string> {
+    val name = try arg_string(args, "name")
+    try delete_environment(current_storage(ctx), name)
+    return ok(null_answer)
+}
+
+// ------------------------------------------------------------------ the session
+
+fn do_load_session(ctx: Context, args: Json) -> Result<Json, string> {
+    val env_name = try arg_string(args, "envName")
+    return ok(environment_to_json(try load_session(current_storage(ctx), env_name)))
+}
+
+fn do_save_session(ctx: Context, args: Json) -> Result<Json, string> {
+    val session = try environment_from_json(try arg_object(args, "session"))
+    try save_session(current_storage(ctx), session)
+    return ok(null_answer)
+}
+
+fn do_clear_session(ctx: Context, args: Json) -> Result<Json, string> {
+    val env_name = try arg_string(args, "envName")
+    try clear_session(current_storage(ctx), env_name)
+    return ok(null_answer)
+}
+
+// ------------------------------------------------------------------ history
+
+fn do_list_history(ctx: Context, args: Json) -> Result<Json, string> {
+    val limit = try arg_int(args, "limit")
+    val entries = try list_history(current_storage(ctx), limit)
+    val out = mutable_array_new<Json>()
+    for e in entries {
+        push(out, history_entry_to_json(e))
+    }
+    return ok(Json.JArray(snapshot(out)))
+}
+
+// ------------------------------------------------------------------ scenarios
+
+fn do_list_scenarios(ctx: Context, args: Json) -> Result<Json, string> {
+    return string_list_answer(list_scenarios(current_storage(ctx)))
+}
+
+fn do_load_scenario(ctx: Context, args: Json) -> Result<Json, string> {
+    val name = try arg_string(args, "name")
+    return ok(scenario_to_json(try load_scenario(current_storage(ctx), name)))
+}
+
+fn do_save_scenario(ctx: Context, args: Json) -> Result<Json, string> {
+    val scenario = try scenario_from_json(try arg_object(args, "scenario"))
+    try save_scenario(current_storage(ctx), scenario)
+    return ok(null_answer)
+}
+
+fn do_delete_scenario(ctx: Context, args: Json) -> Result<Json, string> {
+    val name = try arg_string(args, "name")
+    try delete_scenario(current_storage(ctx), name)
+    return ok(null_answer)
+}
+
+fn do_run_scenario(ctx: Context, args: Json) -> Result<Json, string> {
+    val store = current_storage(ctx)
+    val name = try arg_string(args, "name")
+    val env_name = try arg_optional_string(args, "envName")
+    val overrides = try arg_pairs(args, "overrides")
+    val scenario = try load_scenario(store, name)
+    return ok(scenario_run_to_json(try scenario_run.run(scenario, store, env_name, overrides)))
+}
+
+// ------------------------------------------------------------------ sending
+
+// Resolve variables, send, record history, and -- on a 2xx with extraction rules -- apply them and
+// write the session, in one round trip.
+//
+// **The request comes from the caller, not from storage.** It is either a saved request the
+// frontend loaded and possibly edited, or an ad-hoc one typed into the editor; this command cannot
+// tell and does not need to, because nothing here touches collection storage. That is why the whole
+// `SavedRequest` is an argument rather than a collection-and-path pair.
+//
+// Every step is `curly run`'s, in `curly run`'s order, through the same `core/` functions -- the
+// variable precedence especially, which is `scenario_run.merged_variables` and not a second copy.
+fn do_send_request(ctx: Context, args: Json) -> Result<Json, string> {
+    val store = current_storage(ctx)
+    val saved = try saved_request_from_json(try arg_object(args, "saved"))
+    val env_name = try arg_optional_string(args, "envName")
+    val overrides = try arg_pairs(args, "overrides")
+
+    val variables = try merged_variables(store, env_name, overrides)
+    val request = try into_request(try resolve_request(saved, variables))
+    val response = try exec.send(request)
+    // A failure to record history never fails the request: the exchange happened and the caller
+    // wants the response. The same rule, and the same `val _`, as `cli/execute` and `tui/app`.
+    val _ = append_history(store, history_entry_of(request, response))
+
+    val extracted = mutable_array_new<Extracted>()
+    // **Only a 2xx is extracted from**, matching `run` and the bridge: a failed login has no token
+    // to pull out, and that is an expected absence rather than a problem to report.
+    if response.status >= 200 && response.status < 300 && len(saved.extract) > 0 {
+        val scope = switch env_name {
+            Some(name) { name }
+            None { "global" }
+        }
+        val found = try apply(saved.extract, response, variables)
+        var session = try load_session(store, scope)
+        for one in found {
+            push(extracted, one)
+            session = environment_set(session, one.name, one.value, one.secret)
+        }
+        try save_session(store, session)
+    }
+    return ok(send_outcome_to_json(SendOutcome { response: response, extracted: snapshot(extracted) }))
+}
+
+// ------------------------------------------------------------------ the table
+
+// The whole surface, in the order `curly-gui-tauri/src-tauri/src/lib.rs` lists it in its
+// `invoke_handler`, so the two can be read side by side and a missing one is visible.
+pub fn commands() -> [Command] {
+    return [
+        Command { name: "open_project", run: do_open_project },
+        Command { name: "resolve_default_project", run: do_resolve_default_project },
+        Command { name: "list_collections", run: do_list_collections },
+        Command { name: "load_collection", run: do_load_collection },
+        Command { name: "save_collection", run: do_save_collection },
+        Command { name: "delete_collection", run: do_delete_collection },
+        Command { name: "add_request", run: do_add_request },
+        Command { name: "rename_or_move_request", run: do_rename_or_move_request },
+        Command { name: "duplicate_request", run: do_duplicate_request },
+        Command { name: "remove_request", run: do_remove_request },
+        Command { name: "add_folder", run: do_add_folder },
+        Command { name: "remove_folder", run: do_remove_folder },
+        Command { name: "list_environments", run: do_list_environments },
+        Command { name: "load_environment", run: do_load_environment },
+        Command { name: "save_environment", run: do_save_environment },
+        Command { name: "delete_environment", run: do_delete_environment },
+        Command { name: "load_session", run: do_load_session },
+        Command { name: "save_session", run: do_save_session },
+        Command { name: "clear_session", run: do_clear_session },
+        Command { name: "list_history", run: do_list_history },
+        Command { name: "list_scenarios", run: do_list_scenarios },
+        Command { name: "load_scenario", run: do_load_scenario },
+        Command { name: "save_scenario", run: do_save_scenario },
+        Command { name: "delete_scenario", run: do_delete_scenario },
+        Command { name: "run_scenario", run: do_run_scenario },
+        Command { name: "send_request", run: do_send_request }
+    ]
+}
+
+pub fn find_command(name: string) -> Option<Command> {
+    for one in commands() {
+        if one.name == name {
+            return Option<Command>.Some(one)
+        }
+    }
+    return Option<Command>.None
+}
+
+// Run a command by name, or say that there is no such command -- the one entry point the HTTP layer
+// needs, so that layer holds no knowledge of the surface at all.
+pub fn call(ctx: Context, name: string, args: Json) -> Result<Json, string> {
+    return switch find_command(name) {
+        Some(one) {
+            val go = one.run
+            go(ctx, args)
+        }
+        None { err(concat("no such command: ", name)) }
+    }
+}

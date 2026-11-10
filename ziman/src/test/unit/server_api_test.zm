@@ -1,0 +1,340 @@
+// `server/api`: the 26 commands the frontend calls, against a real `.curly/` under `fs.temp_dir()`.
+//
+// Every command is a plain function from a JSON object to JSON, which is why these need no socket
+// and no browser -- the HTTP layer in `server/serve` adds a request line and nothing else, so the
+// behaviour worth testing is all here.
+//
+// **The surface itself is asserted**, name by name against the bridge's `invoke_handler` list: a
+// command quietly renamed or dropped is a frontend that fails at the one click that calls it, which
+// no other test here would notice.
+use core/saved.Collection
+use core/saved.Environment
+use core/saved.SavedRequest
+use core/saved.Variable
+use core/saved.collection_to_json
+use core/saved.environment_to_json
+use core/saved.saved_request_to_json
+use core/storage.load_collection
+use core/storage.root_of
+use core/storage.storage_of
+use fs
+use json
+use json.Json
+use server/api.Context
+use server/api.call
+use server/api.commands
+use server/api.context_of
+use server/api.current_storage
+use test
+use uuid
+use uuid.uuid_new
+
+fn temp_root(name: string) -> string {
+    val dir = fs.path_join(fs.temp_dir(), concat("curly-api-test-", name, "-", uuid.format(uuid_new())))
+    if Err(e) = fs.make_dirs(dir) {
+        test.fail(concat("cannot make ", dir, ": ", fs.fs_error_message(e)))
+    }
+    return dir
+}
+
+fn fresh(name: string) -> Context {
+    return context_of(storage_of(fs.path_join(temp_root(name), ".curly")))
+}
+
+fn args(text: string) -> Json {
+    return switch json.parse(text) {
+        Ok(j) { j }
+        Err(why) {
+            test.fail(concat("the test's own arguments are not JSON: ", why))
+            Json.JNull
+        }
+    }
+}
+
+// What a command answered, as text -- or the refusal, prefixed, so a test that expected an answer
+// and got a refusal says which.
+fn answered(ctx: Context, name: string, text: string) -> string {
+    return switch call(ctx, name, args(text)) {
+        Ok(j) { json.format(j) }
+        Err(why) { concat("REFUSED: ", why) }
+    }
+}
+
+fn refusal(ctx: Context, name: string, text: string) -> string {
+    return switch call(ctx, name, args(text)) {
+        Ok(j) { concat("ANSWERED: ", json.format(j)) }
+        Err(why) { why }
+    }
+}
+
+// The one saved request these tests add, as the JSON an `add_request` call carries.
+fn request_json() -> Json {
+    return saved_request_to_json(a_request("Login"))
+}
+
+fn a_request(name: string) -> SavedRequest {
+    return SavedRequest {
+        id: uuid_new(),
+        name: name,
+        method: "GET",
+        url: "https://example.com/{{thing}}",
+        query_params: [],
+        headers: [],
+        body: None,
+        auth: None,
+        extract: []
+    }
+}
+
+// --------------------------------------------------------------- the surface
+
+#[test]
+fn the_table_is_the_bridges_invoke_handler_list() {
+    val names = mutable_array_new<string>()
+    for one in commands() {
+        push(names, one.name)
+    }
+    // In `curly-gui-tauri/src-tauri/src/lib.rs`'s order, minus `save_bytes` -- which writes to a
+    // path a native save dialog picked, and has no business on a server (see `server/api`).
+    test.assert_eq(
+        join(separator: " ", pieces: snapshot(names)),
+        concat(
+            "open_project resolve_default_project list_collections load_collection save_collection ",
+            concat(
+                "delete_collection add_request rename_or_move_request duplicate_request ",
+                concat(
+                    "remove_request add_folder remove_folder list_environments load_environment ",
+                    concat(
+                        "save_environment delete_environment load_session save_session clear_session ",
+                        "list_history list_scenarios load_scenario save_scenario delete_scenario run_scenario send_request"
+                    )
+                )
+            )
+        )
+    )
+}
+
+#[test]
+fn an_unknown_command_is_refused_by_name() {
+    test.assert_eq(refusal(fresh("unknown"), "send_requests", "{}"), "no such command: send_requests")
+}
+
+// --------------------------------------------------------------- collections
+
+#[test]
+fn a_collection_round_trips_through_save_and_load() {
+    val ctx = fresh("roundtrip")
+    val collection = Collection {
+        id: uuid_new(),
+        name: "api",
+        folders: [],
+        requests: [a_request("one")]
+    }
+    val as_json = json.format(collection_to_json(collection))
+    test.assert_eq(
+        answered(ctx, "save_collection", concat("{\"collection\":", concat(as_json, "}"))),
+        "null"
+    )
+    test.assert_eq(answered(ctx, "load_collection", "{\"name\":\"api\"}"), as_json)
+    test.assert_eq(answered(ctx, "list_collections", "{}"), "[\"api\"]")
+}
+
+// A void command answers `null`, because `invoke<void>` resolves with null and the frontend's
+// `Promise<void>` is that null.
+#[test]
+fn a_void_command_answers_null() {
+    val ctx = fresh("void")
+    test.assert_eq(answered(ctx, "add_folder", "{\"collection\":\"api\",\"path\":\"Auth\"}"), "null")
+}
+
+// **Adding to a collection that does not exist creates it**, matching the bridge's
+// `load_collection_opt(..).unwrap_or_else(Collection::new)`. A new project's first save would
+// otherwise fail on a collection the user is in the middle of making.
+#[test]
+fn adding_a_request_creates_a_missing_collection() {
+    val ctx = fresh("create")
+    val request = json.format(request_json())
+    test.assert_eq(
+        answered(
+            ctx,
+            "add_request",
+            concat("{\"collection\":\"new\",\"path\":\"Login\",\"request\":", concat(request, "}"))
+        ),
+        "null"
+    )
+    test.assert_eq(answered(ctx, "list_collections", "{}"), "[\"new\"]")
+}
+
+// Every other tree operation requires the collection: moving something inside one that is not there
+// is a mistake, not an empty case.
+#[test]
+fn moving_a_request_in_a_missing_collection_is_refused() {
+    val ctx = fresh("move-missing")
+    test.assert_contains(
+        refusal(ctx, "rename_or_move_request", "{\"collection\":\"nope\",\"oldPath\":\"a\",\"newPath\":\"b\"}"),
+        "nope"
+    )
+}
+
+#[test]
+fn remove_request_answers_whether_it_was_there() {
+    val ctx = fresh("remove")
+    val request = json.format(request_json())
+    val _ = answered(
+        ctx,
+        "add_request",
+        concat("{\"collection\":\"api\",\"path\":\"Login\",\"request\":", concat(request, "}"))
+    )
+    test.assert_eq(answered(ctx, "remove_request", "{\"collection\":\"api\",\"path\":\"Login\"}"), "true")
+    test.assert_eq(answered(ctx, "remove_request", "{\"collection\":\"api\",\"path\":\"Login\"}"), "false")
+}
+
+// A folder with something in it needs `force`, and the refusal says so rather than removing it.
+#[test]
+fn removing_a_full_folder_needs_force() {
+    val ctx = fresh("force")
+    val request = json.format(request_json())
+    val _ = answered(
+        ctx,
+        "add_request",
+        concat("{\"collection\":\"api\",\"path\":\"Auth/Login\",\"request\":", concat(request, "}"))
+    )
+    test.assert_contains(
+        refusal(ctx, "remove_folder", "{\"collection\":\"api\",\"path\":\"Auth\",\"force\":false}"),
+        "Auth"
+    )
+    test.assert_eq(answered(ctx, "remove_folder", "{\"collection\":\"api\",\"path\":\"Auth\",\"force\":true}"), "true")
+}
+
+#[test]
+fn duplicate_and_rename_both_land_in_the_saved_file() {
+    val ctx = fresh("dup")
+    val request = json.format(request_json())
+    val _ = answered(
+        ctx,
+        "add_request",
+        concat("{\"collection\":\"api\",\"path\":\"Login\",\"request\":", concat(request, "}"))
+    )
+    test.assert_eq(
+        answered(ctx, "duplicate_request", "{\"collection\":\"api\",\"path\":\"Login\",\"newPath\":\"Login copy\"}"),
+        "null"
+    )
+    test.assert_eq(
+        answered(
+            ctx,
+            "rename_or_move_request",
+            "{\"collection\":\"api\",\"oldPath\":\"Login\",\"newPath\":\"Auth/SignIn\"}"
+        ),
+        "null"
+    )
+    val saved = switch load_collection(current_storage(ctx), "api") {
+        Ok(c) { json.format(collection_to_json(c)) }
+        Err(why) { concat("REFUSED: ", why) }
+    }
+    test.assert_contains(saved, "Login copy")
+    test.assert_contains(saved, "SignIn")
+}
+
+// --------------------------------------------------------------- environments and the session
+
+#[test]
+fn an_environment_round_trips_and_lists() {
+    val ctx = fresh("env")
+    val env = Environment {
+        name: "local",
+        variables: [Variable { key: "BASE_URL", value: "https://local.example.com", secret: false }]
+    }
+    val as_json = json.format(environment_to_json(env))
+    test.assert_eq(answered(ctx, "save_environment", concat("{\"environment\":", concat(as_json, "}"))), "null")
+    test.assert_eq(answered(ctx, "load_environment", "{\"name\":\"local\"}"), as_json)
+    test.assert_eq(answered(ctx, "list_environments", "{}"), "[\"local\"]")
+    test.assert_eq(answered(ctx, "delete_environment", "{\"name\":\"local\"}"), "null")
+    test.assert_eq(answered(ctx, "list_environments", "{}"), "[]")
+}
+
+// A session that was never written is an empty one, not a refusal -- the frontend asks for it on
+// every project open.
+#[test]
+fn an_unwritten_session_loads_empty() {
+    test.assert_eq(
+        answered(fresh("session-empty"), "load_session", "{\"envName\":\"global\"}"),
+        "{\"name\":\"global\",\"variables\":[]}"
+    )
+}
+
+#[test]
+fn a_session_survives_a_save_and_is_cleared() {
+    val ctx = fresh("session")
+    val session = Environment {
+        name: "global",
+        variables: [Variable { key: "TOKEN", value: "abc", secret: true }]
+    }
+    val as_json = json.format(environment_to_json(session))
+    test.assert_eq(answered(ctx, "save_session", concat("{\"session\":", concat(as_json, "}"))), "null")
+    test.assert_eq(answered(ctx, "load_session", "{\"envName\":\"global\"}"), as_json)
+    test.assert_eq(answered(ctx, "clear_session", "{\"envName\":\"global\"}"), "null")
+    test.assert_eq(answered(ctx, "load_session", "{\"envName\":\"global\"}"), "{\"name\":\"global\",\"variables\":[]}")
+}
+
+// --------------------------------------------------------------- history and scenarios
+
+#[test]
+fn history_is_empty_on_a_fresh_project() {
+    test.assert_eq(answered(fresh("history"), "list_history", "{\"limit\":50}"), "[]")
+}
+
+#[test]
+fn scenarios_are_empty_on_a_fresh_project() {
+    val ctx = fresh("scenarios")
+    test.assert_eq(answered(ctx, "list_scenarios", "{}"), "[]")
+    test.assert_contains(refusal(ctx, "load_scenario", "{\"name\":\"nope\"}"), "nope")
+}
+
+// --------------------------------------------------------------- the project
+
+// `open_project` both answers the new project and switches the context to it, which is what makes
+// the next command read the directory the user just opened.
+#[test]
+fn open_project_switches_the_context() {
+    val ctx = fresh("open")
+    val dir = temp_root("opened")
+    val answer = answered(ctx, "open_project", concat("{\"path\":", concat(json.format(Json.JString(dir)), "}")))
+    test.assert_contains(answer, "\"root\":")
+    test.assert_contains(answer, ".curly")
+    test.assert_eq(current_storage(ctx), storage_of(fs.path_join(dir, ".curly")))
+}
+
+// --------------------------------------------------------------- arguments
+
+#[test]
+fn a_missing_argument_names_itself() {
+    test.assert_contains(refusal(fresh("missing"), "load_collection", "{}"), "name")
+}
+
+#[test]
+fn an_argument_of_the_wrong_type_is_refused() {
+    test.assert_contains(refusal(fresh("wrong-type"), "load_collection", "{\"name\":42}"), "name")
+}
+
+// `envName` is `string | null` on the frontend, and `JSON.stringify` keeps a `null` while dropping
+// an `undefined` -- so the same call arrives both ways and both have to mean "no environment".
+#[test]
+fn a_null_optional_argument_means_absent() {
+    val ctx = fresh("null-env")
+    val absent = refusal(ctx, "run_scenario", "{\"name\":\"nope\"}")
+    val explicit = refusal(ctx, "run_scenario", "{\"name\":\"nope\",\"envName\":null}")
+    test.assert_eq(absent, explicit)
+}
+
+// **The project the server was started with, not a freshly resolved one.** The bridge re-resolves
+// because a desktop app has nowhere else to look; this server was handed a root, and re-resolving
+// would move the session to the OS-wide default the moment the frontend asked -- which it does on
+// startup, before anything else.
+#[test]
+fn resolve_default_project_reports_the_root_the_server_was_given() {
+    val ctx = fresh("resolve-default")
+    val expected = current_storage(ctx)
+    val answer = answered(ctx, "resolve_default_project", "{}")
+    test.assert_contains(answer, json.format(Json.JString(root_of(expected))))
+    test.assert_eq(current_storage(ctx), expected)
+}

@@ -37,7 +37,7 @@ curly/
 │   └── crates/
 │       ├── curly-core/   # lib: HTTP execution, data model, storage, import, substitution
 │       └── curly-cli/    # bin "curly": the clap-based CLI
-├── ziman/             # the Ziman implementation (in progress — see docs/ZIMAN.md)
+├── ziman/             # the Ziman implementation — see docs/ZIMAN.md
 │   └── src/{main,test}/ziman/
 ├── curly-gui-tauri/   # the GUI: Tauri (Rust shell) + React/TypeScript, its own Cargo workspace
 │   ├── src-tauri/     #   Rust shell — Tauri commands wrapping curly-core
@@ -51,3 +51,8 @@ curly/
 Ziman one is measured against — `parity.sh` asks both the same questions over the same `.curly/`
 tree and diffs the answers, which is what makes "replaces" a claim a test can fail on. The React
 frontend is shared and is not being rewritten.
+
+The Ziman side now has the core, every CLI subcommand, a terminal interface (`curly ui`) and the
+HTTP API the React frontend talks to (`curly serve`) — which replaces the Tauri shell's bridge, the
+last piece of the port. The frontend's own switch from Tauri's `invoke` to `fetch` is one file and
+has not been made yet; [docs/ZIMAN.md](docs/ZIMAN.md) has the change and how to run the server.

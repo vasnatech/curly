@@ -243,8 +243,38 @@ else
   bad "the rust side could not import the curl command" "$(head -2 "$work/cl.err" 2>/dev/null | tr '\n' ' ')"
 fi
 
-# **One deliberate divergence, recorded here so it is a decision and not a gap**: `curly ui` is the
-# Ziman implementation's terminal interface and the Rust CLI has no such command. The project's
+# ---- the HTTP API's own JSON shapes ------------------------------------------------------------
+#
+# **The one part of the web API that cannot be checked by reading curly's source.** The React
+# frontend's wire format is serde's JSON for `curly-core`'s structs, and most of it is already
+# compared above because it is the same JSON the saved files hold. Five shapes are not on disk
+# anywhere, and three of those are serde's own conventions rather than curly's: a `Duration` is
+# `{"secs","nanos"}`, a `Vec<u8>` is an array of numbers, and an enum carrying no serde attributes
+# is externally tagged -- so `StepOutcome::Ok` is the bare string "Ok" while `Halted(why)` is
+# `{"Halted": why}`, two spellings in one enum.
+#
+# The frontend's `types.ts` asserts all of this, but it is hand-written and therefore a second-hand
+# account. `cargo run --example wire_shapes` prints it from the real structs, which is the only
+# source that cannot be wrong, and the Ziman encoders are diffed against that. A serde upgrade that
+# changed either convention would fail here rather than in somebody's browser.
+if cargo_shapes="$(cd "$ROOT/rust" && cargo run -q --offline --example wire_shapes -p curly-core 2>/dev/null)" \
+   && [ -n "$cargo_shapes" ]; then
+  zim_shapes="$(CURLY_CASE=wire-shapes zim env)"
+  if [ "$cargo_shapes" = "$zim_shapes" ]; then
+    ok "the web API's JSON shapes agree with serde ($(echo "$zim_shapes" | wc -l) shapes)"
+  else
+    bad "the web API's JSON shapes differ from serde" \
+        "$(diff <(echo "$cargo_shapes") <(echo "$zim_shapes") | head -6 | tr '\n' ' ')"
+  fi
+else
+  # Not a pass: the check did not run, and saying so is the point.
+  printf '  SKIP the web API JSON shapes (cargo run --example wire_shapes failed)\n'
+fi
+
+# **Two deliberate divergences, recorded here so they are decisions and not gaps**: `curly ui` is
+# the Ziman implementation's terminal interface, and `curly serve` is the HTTP API its web frontend
+# talks to -- the Rust CLI has neither, because its frontend is a Tauri shell that linked
+# `curly-core` into the desktop app directly, so there was nothing to serve. The project's
 # direction is that Ziman replaces Rust, so a capability only the replacement has is expected -- but
 # an unrecorded one is indistinguishable from an oversight, which is what this comment is for.
 # `gui` is compared above and must stay identical: it is about the *graphical* application, which

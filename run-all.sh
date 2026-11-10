@@ -37,6 +37,7 @@ phase "ziman formatting"
 unformatted="$(cd "$ROOT/ziman" && ZIMAN_MODULE_PATH=src/main/ziman "$ZIMAN" --fmt --check \
   src/main/ziman/*.zm src/main/ziman/core/*.zm src/main/ziman/core/import/*.zm \
   src/main/ziman/cli/*.zm src/main/ziman/cli/commands/*.zm \
+  src/main/ziman/tui/*.zm src/main/ziman/server/*.zm \
   src/test/unit/*.zm src/test/other/*.zm 2>&1)"
 if [ -n "$unformatted" ]; then
   fail "unformatted: $unformatted"

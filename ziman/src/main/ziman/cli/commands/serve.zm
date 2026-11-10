@@ -1,0 +1,72 @@
+// `curly serve` -- the HTTP API the React frontend talks to, replacing the Tauri bridge.
+//
+// **A command only this implementation has**, like `curly ui`: the Rust CLI's frontend is a Tauri
+// desktop shell that linked `curly-core` directly, so there was nothing to serve. `parity.sh`
+// records both as deliberate divergences.
+use cli/args.Parsed
+use cli/args.value_of
+use core/storage.Storage
+use core/storage.root_of
+use fs
+use server/serve
+
+// Nothing claims 8787 by convention, which is the whole requirement: a developer running this
+// alongside the backend they are testing must not have to think about whether the port is free.
+// `--port 0` asks the OS for any free port, which is what the integration tests use.
+val default_port = 8787
+
+pub fn value_flags() -> [string] {
+    return ["--port", "--host", "--web-root"]
+}
+
+pub fn run(rest: Parsed, store: Storage) -> Result<unit, string> {
+    val port = switch value_of(rest, "port") {
+        Some(text) {
+            switch parse_int(text) {
+                Ok(n) { n }
+                Err(_) { return err(concat("invalid --port value: ", text)) }
+            }
+        }
+        None { default_port }
+    }
+    if port < 0 || port > 65535 {
+        return err(concat("invalid --port value: ", str(port)))
+    }
+    // **Loopback by default, and changing it is the caller's explicit choice.** These commands read
+    // and write the user's files and send requests from their machine; a server that bound every
+    // interface by default would put that on the network of whatever coffee shop they were in.
+    val host = switch value_of(rest, "host") {
+        Some(text) { text }
+        None { "127.0.0.1" }
+    }
+    val web_root = switch value_of(rest, "web-root") {
+        Some(path) {
+            // Checked here rather than on the first request: a typo in the path would otherwise
+            // show up as a 404 in the browser, which looks like a broken build rather than a
+            // mistyped flag.
+            if Err(e) = fs.read_bytes(fs.path_join(path, "index.html")) {
+                return err(concat(
+                    "no index.html under --web-root ",
+                    path,
+                    ": ",
+                    fs.fs_error_message(e)
+                ))
+            }
+            Option<string>.Some(path)
+        }
+        None { Option<string>.None }
+    }
+
+    val options = with serve.options_of(port) { host: host, web_root: web_root }
+    // Printed before the listener is bound, so the line is in the log even if the port is taken and
+    // the next thing the user sees is the refusal naming it.
+    print(concat("curly: storage ", root_of(store)))
+    switch web_root {
+        Some(path) { print(concat("curly: serving ", path)) }
+        None {
+            print("curly: serving the API only (no --web-root) — run the frontend's dev server and proxy /api here")
+        }
+    }
+    print(prelude.format("curly: listening on http://{}:{}", host, str(port)))
+    return serve.run(store, options)
+}

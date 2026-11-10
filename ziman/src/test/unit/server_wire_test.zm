@@ -1,0 +1,200 @@
+// `server/wire`'s four shapes, held to the bytes serde actually writes.
+//
+// **The expected strings here are not hand-written.** They are the output of
+// `cargo run --example wire_shapes -p curly-core`, pasted in -- which is the only honest source for
+// them, since two of the shapes are serde's conventions rather than curly's and appear nowhere in
+// curly's own source: a `Duration` is `{"secs","nanos"}`, and a `Vec<u8>` is an array of numbers.
+// The frontend's `types.ts` says the same thing, but it is a hand-written mirror and so a
+// second-hand account; `parity.sh` re-runs that example and diffs it against this module, so a
+// serde upgrade that changed either convention would fail there rather than in the browser.
+use core/exec.ResponseSummary
+use core/extraction.Extracted
+use core/scenario_run.ScenarioRun
+use core/scenario_run.StepLog
+use core/scenario_run.StepOutcome
+use core/storage.default_location
+use core/storage.storage_of
+use http.Header
+use json
+use server/wire.SendOutcome
+use server/wire.extracted_to_json
+use server/wire.project_label
+use server/wire.response_summary_to_json
+use server/wire.scenario_run_to_json
+use server/wire.send_outcome_to_json
+use test
+
+fn header(name: string, value: string) -> Header {
+    return Header { name: name, value: value }
+}
+
+// The `cargo run --example wire_shapes` case: a body that is NOT valid UTF-8, so the lossy `body`
+// and the exact `body_bytes` are visibly different, and an elapsed time with a fractional second.
+fn sample() -> ResponseSummary {
+    return ResponseSummary {
+        status: 201,
+        headers: [header("content-type", "application/json"), header("x-request-id", "abc-123")],
+        // What serde printed: the 0xff decoded lossily to U+FFFD. Written as the character itself
+        // because Ziman has no `\u` escape and a string literal carries UTF-8 directly.
+        body: "{\"a\":�}",
+        body_bytes: [123b, 34b, 97b, 34b, 58b, 255b, 125b],
+        elapsed_millis: 1234
+    }
+}
+
+fn empty_response(status: int) -> ResponseSummary {
+    return ResponseSummary { status: status, headers: [], body: "", body_bytes: [], elapsed_millis: 0 }
+}
+
+#[test]
+fn response_summary_matches_serde() {
+    test.assert_eq(
+        json.format(response_summary_to_json(sample())),
+        "{\"status\":201,\"headers\":[[\"content-type\",\"application/json\"],[\"x-request-id\",\"abc-123\"]],\"body\":\"{\\\"a\\\":�}\",\"body_bytes\":[123,34,97,34,58,255,125],\"elapsed\":{\"secs\":1,\"nanos\":234000000}}"
+    )
+}
+
+// An empty header list is `[]` and not `{}` -- it is a `Vec` of pairs, not a map. An empty
+// `body_bytes` is `[]` and never omitted.
+#[test]
+fn response_summary_empty_edges_match_serde() {
+    test.assert_eq(
+        json.format(response_summary_to_json(empty_response(204))),
+        "{\"status\":204,\"headers\":[],\"body\":\"\",\"body_bytes\":[],\"elapsed\":{\"secs\":0,\"nanos\":0}}"
+    )
+}
+
+#[test]
+fn extracted_matches_serde() {
+    test.assert_eq(
+        json.format(extracted_to_json(Extracted { name: "TOKEN", value: "s3cret", secret: true })),
+        "{\"name\":\"TOKEN\",\"value\":\"s3cret\",\"secret\":true}"
+    )
+    test.assert_eq(
+        json.format(extracted_to_json(Extracted { name: "id", value: "42", secret: false })),
+        "{\"name\":\"id\",\"value\":\"42\",\"secret\":false}"
+    )
+}
+
+// A millisecond under a second, and exactly a second: the two sides of the `/ 1000` boundary, where
+// a `%`-for-`/` slip shows up as a second lost or a second invented.
+#[test]
+fn elapsed_splits_at_the_second_boundary() {
+    test.assert_contains(
+        json.format(response_summary_to_json(with sample() { elapsed_millis: 999 })),
+        "\"elapsed\":{\"secs\":0,\"nanos\":999000000}"
+    )
+    test.assert_contains(
+        json.format(response_summary_to_json(with sample() { elapsed_millis: 1000 })),
+        "\"elapsed\":{\"secs\":1,\"nanos\":0}"
+    )
+    test.assert_contains(
+        json.format(response_summary_to_json(with sample() { elapsed_millis: 61001 })),
+        "\"elapsed\":{\"secs\":61,\"nanos\":1000000}"
+    )
+}
+
+// Response first, then extracted: serde writes a struct in declaration order.
+#[test]
+fn send_outcome_nests_the_two() {
+    val outcome = SendOutcome {
+        response: empty_response(200),
+        extracted: [Extracted { name: "id", value: "42", secret: false }]
+    }
+    test.assert_eq(
+        json.format(send_outcome_to_json(outcome)),
+        "{\"response\":{\"status\":200,\"headers\":[],\"body\":\"\",\"body_bytes\":[],\"elapsed\":{\"secs\":0,\"nanos\":0}},\"extracted\":[{\"name\":\"id\",\"value\":\"42\",\"secret\":false}]}"
+    )
+}
+
+// Never `null`: a request with no extraction rules, or a non-2xx, answers an empty array, and a
+// frontend that maps over it must not have to test for absence first.
+#[test]
+fn send_outcome_with_nothing_extracted_is_an_empty_array() {
+    val outcome = SendOutcome { response: empty_response(200), extracted: [] }
+    test.assert_contains(json.format(send_outcome_to_json(outcome)), "\"extracted\":[]")
+}
+
+// --- the project label ---
+
+// `/home/user/my-api/.curly` is the "my-api" project: labelling it ".curly" would give every
+// project on the machine the same name.
+#[test]
+fn a_dot_curly_is_labelled_by_the_directory_it_sits_in() {
+    test.assert_eq(project_label(storage_of("/home/user/my-api/.curly")), "my-api")
+}
+
+// The `--data-dir`/`CURLY_DATA_DIR` case: the directory the user named *is* the project.
+#[test]
+fn a_root_not_named_dot_curly_is_labelled_by_its_own_name() {
+    test.assert_eq(project_label(storage_of("/home/user/scratch-storage")), "scratch-storage")
+}
+
+#[test]
+fn the_os_default_location_is_labelled_default() {
+    switch default_location() {
+        Ok(s) { test.assert_eq(project_label(s), "Default") }
+        Err(why) { test.fail(concat("no default location: ", why)) }
+    }
+}
+
+// `.curly` at the filesystem root -- `fs.file_name` answers "/", which labels nothing.
+#[test]
+fn a_root_with_no_nameable_directory_falls_back_to_the_path() {
+    test.assert_eq(project_label(storage_of("/.curly")), "/.curly")
+}
+
+// --- a scenario run ---
+
+fn step(reference: string, status: Option<int>, error: Option<string>, extracted: [string]) -> StepLog {
+    return StepLog {
+        reference: reference,
+        method: "POST",
+        url: "https://example.com/login",
+        status: status,
+        error: error,
+        extracted: extracted
+    }
+}
+
+// A unit variant is the bare string, which is serde's default external tagging and not something
+// curly's source states anywhere.
+#[test]
+fn a_completed_run_matches_serde() {
+    val run = ScenarioRun {
+        outcome: StepOutcome.Ok,
+        steps: [step("auth/login", Some(200), None, ["TOKEN"])]
+    }
+    test.assert_eq(
+        json.format(scenario_run_to_json(run)),
+        "{\"outcome\":\"Ok\",\"steps\":[{\"reference\":\"auth/login\",\"method\":\"POST\",\"url\":\"https://example.com/login\",\"status\":200,\"error\":null,\"extracted\":[\"TOKEN\"]}]}"
+    )
+}
+
+// The payload variant is a one-key object -- a different spelling from `Ok`'s, in the same enum.
+// And a step that never got a response: `status` null with `error` set, which is how a network
+// failure is told from an HTTP one.
+#[test]
+fn a_halted_run_matches_serde() {
+    val run = ScenarioRun {
+        outcome: StepOutcome.Halted("a step returned 500"),
+        steps: [
+            with step("health/check", None, Some("connection refused"), []) {
+                method: "GET",
+                url: "https://down.example.com/health"
+            }
+        ]
+    }
+    test.assert_eq(
+        json.format(scenario_run_to_json(run)),
+        "{\"outcome\":{\"Halted\":\"a step returned 500\"},\"steps\":[{\"reference\":\"health/check\",\"method\":\"GET\",\"url\":\"https://down.example.com/health\",\"status\":null,\"error\":\"connection refused\",\"extracted\":[]}]}"
+    )
+}
+
+#[test]
+fn an_http_failure_with_no_steps_matches_serde() {
+    test.assert_eq(
+        json.format(scenario_run_to_json(ScenarioRun { outcome: StepOutcome.HttpFailure, steps: [] })),
+        "{\"outcome\":\"HttpFailure\",\"steps\":[]}"
+    )
+}

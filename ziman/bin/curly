@@ -8,5 +8,22 @@
 #
 # Override the interpreter with ZIMAN=/path/to/ziman.
 set -euo pipefail
-here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# **Resolved through symlinks, because the usual way to install this is one.** A bare
+# `dirname "${BASH_SOURCE[0]}"` answers the *link's* directory, so a `curly` symlinked into
+# ~/.local/bin went looking for ~/.local/src/main/ziman/curly.zm and failed with a module error
+# naming a path nobody wrote. Walked by hand rather than with `readlink -f`, which is GNU-only and
+# absent on macOS; plain `readlink` is everywhere.
+target="${BASH_SOURCE[0]}"
+while [ -L "$target" ]; do
+  link_dir="$(cd -P "$(dirname "$target")" && pwd)"
+  target="$(readlink "$target")"
+  # A relative link is relative to the directory the link itself is in.
+  case $target in
+    /*) ;;
+    *) target="$link_dir/$target" ;;
+  esac
+done
+here="$(cd -P "$(dirname "$target")" && pwd)"
+
 exec "${ZIMAN:-ziman}" "$here/../src/main/ziman/curly.zm" -- "$@"

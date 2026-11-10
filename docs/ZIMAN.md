@@ -14,9 +14,14 @@ The Rust implementation is one native binary. This one is a Ziman program, so it
 interpreter — `ziman/bin/curly` wraps that:
 
 ```sh
-ZIMAN=/path/to/ziman ziman/bin/curly --help
-ZIMAN=/path/to/ziman ziman/bin/curly collections list
+ziman/bin/curly --help
+ziman/bin/curly collections list
 ```
+
+That is all, from any directory, as long as `ziman` is on `PATH`. If it is not, or you want a
+particular build, `ZIMAN=/path/to/ziman ziman/bin/curly ...` overrides it. `ZIMAN_MODULE_PATH` is
+**not** needed — the interpreter resolves `use core/...` relative to the main script — although the
+test runners set it because they run the modules from elsewhere.
 
 The wrapper is not a convenience. `ziman script.zm args` is rejected: the invocation is
 `ziman curly.zm -- <args>`, and `os.args()` answers only what follows the `--`. A shebang cannot

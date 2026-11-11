@@ -43,6 +43,7 @@ use core/storage.Storage
 use core/storage.append_history
 use core/storage.history_entry_of
 use core/storage.list_collections
+use core/storage.list_environments
 use core/storage.load_collection
 use core/storage.load_session
 use core/storage.save_collection
@@ -69,15 +70,22 @@ struct Item {
     saved: SavedRequest
 }
 
-// One header being edited. Four of these rather than a growable list, because `lib/ui` has no
-// control that adds and removes its own rows yet -- a real gap this application found, recorded in
-// the commit that added it. Four covers the ordinary request; a fifth needs the CLI for now.
+// One header being edited, with the button that removes it.
+//
+// **These grow and shrink, and doing so needed no new control** -- which is worth recording because
+// I said the opposite. The application owns the array: `push` adds a row and rebuilding without one
+// removes it, and the buttons are `controls.Button`. What `lib/ui` was actually missing was a
+// *picker* that announces itself as a value rather than a command, which is `controls.choice_of`
+// and is what the environment below uses.
 struct HeaderRow {
     name: controls.Entry
     value: controls.Entry
+    remove: controls.Button
 }
 
-val header_rows = 4
+// How many empty rows a request opens with, so there is always somewhere to type.
+val blank_header_rows = 2
+val global_scope = "(global)"
 // Tall enough for a small JSON document without crowding the response out of the window. The field
 // scrolls rather than growing, so a longer body is reachable and the layout does not move.
 val body_rows = 6
@@ -93,11 +101,13 @@ struct State {
     // one line is a REST client nobody would use. Enter inserts a newline here, Up and Down move by
     // line, and the whole body is drawn a line at a time.
     body: controls.Entry
-    // The environment to resolve `{{variables}}` against. Typed rather than picked, for the same
-    // reason: a dropdown is a control that does not exist yet. Empty means the global scope alone.
-    env: controls.Entry
+    // The environment to resolve `{{variables}}` against, picked from the ones on disk. The first
+    // item is "(global)", which is the absence of an environment rather than one named that -- a
+    // picker with no way back to "none" is a trap, and `merged_variables` takes an `Option`.
+    env: controls.Menu
     send: controls.Button
     save: controls.Button
+    add_header: controls.Button
     // The response as text, and how far it is scrolled.
     response: string
     scroll: float
@@ -133,9 +143,14 @@ fn view(s: State, style: controls.Style, m: widget.Metrics) -> widget.Widget {
     for row in s.headers {
         push(header_widgets, widget.fixed_of(0.0, row_height, widget.row_of(gap, [
             widget.fixed_of(220.0, 0.0, controls.entry_widget(row.name, style, m)),
-            widget.expand(controls.entry_widget(row.value, style, m))
+            widget.expand(controls.entry_widget(row.value, style, m)),
+            widget.fixed_of(28.0, 0.0, controls.button_widget(row.remove, style))
         ])))
     }
+    push(header_widgets, widget.fixed_of(0.0, row_height, widget.row_of(gap, [
+        widget.fixed_of(120.0, 0.0, controls.button_widget(s.add_header, style)),
+        widget.expand(widget.flex())
+    ])))
     val editors = widget.column_of(4.0, [
         widget.fixed_of(0.0, 16.0, mono_label("Headers", 11.0, style)),
         widget.column_of(4.0, snapshot(header_widgets)),
@@ -143,7 +158,8 @@ fn view(s: State, style: controls.Style, m: widget.Metrics) -> widget.Widget {
         widget.fixed_of(0.0, body_height, controls.entry_widget(s.body, style, m)),
         widget.fixed_of(0.0, row_height, widget.row_of(gap, [
             widget.fixed_of(110.0, 0.0, mono_label("Environment", 11.0, style)),
-            widget.expand(controls.entry_widget(s.env, style, m))
+            widget.fixed_of(200.0, 0.0, controls.menu_title_widget(s.env, style)),
+            widget.expand(widget.flex())
         ]))
     ])
     val response = widget.named_scroll(
@@ -152,7 +168,7 @@ fn view(s: State, style: controls.Style, m: widget.Metrics) -> widget.Widget {
         s.scroll,
         widget.column_of(2.0, body_lines(s.response, style))
     )
-    val editors_height = 16.0 + 4.0 + ((row_height + 4.0) * (header_rows as float)) + 16.0 + 4.0 + body_height + 4.0 + row_height + 8.0
+    val editors_height = 16.0 + 4.0 + ((row_height + 4.0) * ((len(s.headers) + 1) as float)) + 16.0 + 4.0 + body_height + 4.0 + row_height + 8.0
     val main = widget.column_of(gap, [
         widget.fixed_of(0.0, gap, widget.flex()),
         widget.fixed_of(0.0, row_height, bar),
@@ -220,17 +236,41 @@ fn kept(s: State) -> Step {
 
 // Builds the header rows for a request, padded out to `header_rows` so the layout does not change
 // shape with the request -- an empty row is how one is added.
+fn header_row(index: int, name: string, value: string) -> HeaderRow {
+    return HeaderRow {
+        name: controls.entry_of(concat("header", str(index), "name"), "Header name", name),
+        value: controls.entry_of(concat("header", str(index), "value"), "Header value", value),
+        remove: controls.button_of(concat("header", str(index), "remove"), "x")
+    }
+}
+
+// **The rows are renamed by position on every change**, which is the one thing to get right here:
+// a control is addressed by name, so a row removed from the middle must leave the rows after it
+// holding the names the layout will give them. Rebuilding beats patching -- the alternative is
+// stable ids and a map from id to control, which is a lot of machinery for a list of headers.
+fn renamed(rows: [HeaderRow]) -> [HeaderRow] {
+    val out = mutable_array_new<HeaderRow>()
+    var i = 0
+    while i < len(rows) {
+        push(out, header_row(i, rows[i].name.editor.text, rows[i].value.editor.text))
+        i = i + 1
+    }
+    return snapshot(out)
+}
+
 fn header_editors(pairs: [saved.KvPair]) -> [HeaderRow] {
     val out = mutable_array_new<HeaderRow>()
     var i = 0
-    while i < header_rows {
-        val name = if i < len(pairs) { pairs[i].name } else { "" }
-        val value = if i < len(pairs) { pairs[i].value } else { "" }
-        push(out, HeaderRow {
-            name: controls.entry_of(concat("header", str(i), "name"), "Header name", name),
-            value: controls.entry_of(concat("header", str(i), "value"), "Header value", value)
-        })
+    while i < len(pairs) {
+        push(out, header_row(i, pairs[i].name, pairs[i].value))
         i = i + 1
+    }
+    // Always somewhere to type: a request with no headers would otherwise show an empty section
+    // and a button, and the first thing anyone would do is press the button.
+    var blank = 0
+    while blank < blank_header_rows {
+        push(out, header_row(len(pairs) + blank, "", ""))
+        blank = blank + 1
     }
     return snapshot(out)
 }
@@ -319,11 +359,13 @@ fn selected_item(s: State) -> Option<Item> {
 }
 
 fn env_name(s: State) -> Option<string> {
-    val typed = trim(s.env.editor.text)
-    if len(typed) == 0 {
+    val chosen = controls.chosen_value(s.env)
+    // "(global)" is the absence of an environment rather than one named that, which is why it is
+    // tested here and not stored as an empty item: a picker with no way back to "none" is a trap.
+    if len(chosen) == 0 || chosen == global_scope {
         return Option<string>.None
     }
-    return Option<string>.Some(typed)
+    return Option<string>.Some(chosen)
 }
 
 fn bounds_of(laid: widget.Laid, name: string) -> geom.Rect {
@@ -390,9 +432,30 @@ fn step(s: State, input: controls.Input, laid: widget.Laid, style: controls.Styl
         val taken = controls.entry_input(after_click.body, input, bounds_of(laid, "body"), style, m)
         return kept(with after_click { body: taken.entry })
     }
-    if name == "env" {
-        val taken = controls.entry_input(after_click.env, input, bounds_of(laid, "env"), style, m)
-        return kept(with after_click { env: taken.entry })
+    if name == "env" || name == "env/items" {
+        // The popup is a layer of its own, so its box is asked for separately -- it is not inside
+        // the collapsed control and a hit test against that box would miss every item.
+        val taken = controls.menu_input(
+            after_click.env,
+            input,
+            bounds_of(laid, "env"),
+            bounds_of(laid, "env/items")
+        )
+        return kept(with after_click { env: taken.menu })
+    }
+    if name == "add-header" {
+        val taken = controls.button_input(after_click.add_header, input, bounds_of(laid, "add-header"))
+        val grown = if taken.activated {
+            val rows = mutable_array_new<HeaderRow>()
+            for row in after_click.headers {
+                push(rows, row)
+            }
+            push(rows, header_row(len(after_click.headers), "", ""))
+            snapshot(rows)
+        } else {
+            after_click.headers
+        }
+        return kept(with after_click { add_header: taken.button, headers: grown })
     }
     if name == "send" {
         val taken = controls.button_input(after_click.send, input, bounds_of(laid, "send"))
@@ -405,9 +468,28 @@ fn step(s: State, input: controls.Input, laid: widget.Laid, style: controls.Styl
     // The header rows are named by position, so one test finds the row and the field at once
     // rather than eight branches naming themselves.
     var row = 0
-    while row < header_rows {
+    while row < len(after_click.headers) {
         val name_field = concat("header", str(row), "name")
         val value_field = concat("header", str(row), "value")
+        val remove_field = concat("header", str(row), "remove")
+        if name == remove_field {
+            val taken = controls.button_input(after_click.headers[row].remove, input, bounds_of(laid, name))
+            if taken.activated {
+                val rows = mutable_array_new<HeaderRow>()
+                var at = 0
+                while at < len(after_click.headers) {
+                    if at != row {
+                        push(rows, after_click.headers[at])
+                    }
+                    at = at + 1
+                }
+                // Renamed, because the rows after this one have just moved up and a control is
+                // addressed by name. The focus follows them: it was on a row that is gone.
+                return kept(with after_click { headers: renamed(snapshot(rows)), focused: "requests" })
+            }
+            val held = with after_click.headers[row] { remove: taken.button }
+            return kept(with after_click { headers: header_row_set(after_click.headers, row, held) })
+        }
         if name == name_field || name == value_field {
             val editing_name = name == name_field
             val current = after_click.headers[row]
@@ -685,6 +767,14 @@ pub fn run(store: Storage) -> Result<unit, string> {
     val m = try widget.metrics_for(f)
     val style = controls.default_style()
     val items = try load_items(store)
+    // The environments on disk, with the absence of one first. Read once: a window that re-read
+    // them every frame would be asking the filesystem sixty times a second for an answer that
+    // changes when a user runs `curly env create`, which is not something this window does.
+    val scopes = mutable_array_new<string>()
+    push(scopes, global_scope)
+    for one in try list_environments(store) {
+        push(scopes, one)
+    }
     val labels = mutable_array_new<string>()
     for one in items {
         push(labels, one.label)
@@ -696,9 +786,10 @@ pub fn run(store: Storage) -> Result<unit, string> {
         url: controls.entry_of("url", "URL", ""),
         headers: header_editors([]),
         body: controls.text_area_of("body", "Body", "", body_rows),
-        env: controls.entry_of("env", "Environment", ""),
+        env: controls.choice_of("env", "Environment", snapshot(scopes), 0),
         send: controls.button_of("send", "Send"),
         save: controls.button_of("save", "Save"),
+        add_header: controls.button_of("add-header", "+ header"),
         response: "",
         scroll: 0.0,
         status: concat(str(len(items)), " request(s) loaded"),
@@ -732,7 +823,32 @@ pub fn run(store: Storage) -> Result<unit, string> {
                 // Laid out once per pass and used for both halves: the scene to draw and the
                 // geometry an input is routed by. Two layouts could disagree, and a press would
                 // land on where a control used to be.
-                val laid = widget.layout(view(st, style, m), geom.rect_of(0.0, 0.0, width_pt, height_pt), m)
+                // **Laid out twice when the dropdown is open, and only then.** The popup belongs
+                // under the collapsed control, and where that is cannot be known until the tree has
+                // been laid out -- so the first pass finds it and the second puts the popup there.
+                // Computing the position from the layout arithmetic instead would be a second copy
+                // of the layout, in a comment, drifting.
+                val whole = geom.rect_of(0.0, 0.0, width_pt, height_pt)
+                val base = view(st, style, m)
+                val first = widget.layout(base, whole, m)
+                val laid = if st.env.open {
+                    val at = bounds_of(first, "env")
+                    val rows = (len(st.env.items.items) as float) * st.env.items.row_height
+                    widget.layout(
+                        widget.layered_of([
+                            widget.base_layer(base),
+                            controls.menu_popup_layer(
+                                st.env,
+                                style,
+                                geom.rect_of(at.x, at.y + at.height, at.width, rows)
+                            )
+                        ]),
+                        whole,
+                        m
+                    )
+                } else {
+                    first
+                }
                 val painted = try desktop.repaint(painter, w, widget.paint(laid, m), options)
                 painter = painted.next
 

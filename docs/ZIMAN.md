@@ -68,9 +68,9 @@ headers, body and environment below them, the response under that, Send and Save
 | **Save** | `replace_request` back into the collection, **keeping the request's position** |
 
 Only a raw body is editable: a binary, form or multipart body is shown as what it is and left
-alone, rather than flattened into something that would save back wrong. Four header rows, fixed,
-because `lib/ui` has no control that adds and removes its own rows yet; the environment is typed for
-the same reason, and empty means the global scope.
+alone, rather than flattened into something that would save back wrong. Headers grow and shrink --
+`+ header` adds a row and each row's `x` removes it -- and the environment is picked from the ones
+on disk, with `(global)` meaning the absence of one rather than an environment named that.
 
 **It depends on no server.** `curly serve` exists so the React frontend can reach the same `.curly`
 storage over HTTP; this does not use it. The same collections are read from the same disk, variables
@@ -92,14 +92,25 @@ It is also **the first application built on ziman's `lib/ui`**. `curly ui` preda
 has its own rows-and-cells renderer; every part of the widget stack was until now exercised only by
 its own fixtures.
 
-**Three gaps in that layer were found here rather than by a wishlist**, which is the argument for
-having an application at all. Two are closed: nothing had noticed `lib/ui` drew to the edges of its
-own box, because every example did (a window has glass); and **the request body had to be a
-one-line field**, because no multi-line control existed -- `controls.text_area_of` is the answer to
-this application, and `edit` needed only line-aware Home/End and an up and a down to get there,
-since a newline had always been an ordinary character in its string. The third is open: there is no
-control that grows its own rows or offers a choice, which is why the headers are four and the
-environment is typed.
+**Four defects in that layer were found here rather than by a wishlist**, which is the argument for
+having an application at all, and all four are closed:
+
+1. **No margins.** Nothing had noticed `lib/ui` drew to the edges of its own box, because every
+   example did. A window has glass.
+2. **No multi-line text.** The request body had to be one line. `controls.text_area_of` is the
+   answer, and `edit` needed only line-aware Home/End plus an up and a down to get there -- a
+   newline had always been an ordinary character in its string.
+3. **A value picker announced itself as a menu.** There was no `ComboBox` role, so a reader would
+   have called the environment chooser a list of commands. `controls.choice_of` is a `Menu` that
+   announces a value.
+4. **Choosing from a menu with a mouse did not work at all.** A press on a row moved the selection
+   and nothing turned it into a choice, so a menu could be opened, an item clicked, and the menu
+   would sit there with the item highlighted. Every test in that module chose with Enter, so the
+   mouse path was uncovered. A release over a row chooses it now.
+
+A fifth was reported here and **was not a gap**: growable rows need no control. The application owns
+the array, `push` adds a row and a `Button` removes one. The four fixed header rows were a shortcut,
+not a limitation.
 
 ## `curly serve`
 

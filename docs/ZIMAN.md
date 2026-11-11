@@ -41,11 +41,44 @@ subcommand is read as a one-shot flag and refused.
 | `cli/` | every subcommand: `init`, `env`, `collections`, `scenario`, `session`, `history`, `run`, one-shot mode |
 | `tui/` | `curly ui` — a terminal runner: browse the saved tree, send a request, read the response |
 | `server/` | `curly serve` — the HTTP API the React frontend talks to |
+| `gui/` | `curly gui` — a desktop window, built on ziman's `lib/ui`, talking to nothing but the network |
 
-Two commands exist here and not in the Rust CLI, and both are deliberate rather than drift:
-`curly ui`, because a terminal interface is this implementation's own, and `curly serve`, because
-the Rust frontend is a Tauri desktop shell that linked `curly-core` into the app directly — there
-was nothing to serve. `parity.sh` records both where it would otherwise look like a gap.
+Three commands exist here and not in the Rust CLI, and all three are deliberate rather than drift:
+`curly ui`, because a terminal interface is this implementation's own; `curly serve`, because the
+Rust frontend is a Tauri desktop shell that linked `curly-core` into the app directly — there was
+nothing to serve; and `curly gui`, which **means the opposite of what it means in the Rust CLI**.
+There it prints "the graphical interface is a separate application", left behind when the egui crate
+was deleted in favour of the Tauri app. Here it opens a window.
+
+`parity.sh` records all three where they would otherwise look like a gap — and `gui` is the only one
+where the two implementations answer the *same* command differently, so it is asserted as a
+divergence rather than skipped: the Rust side must still print its sentence, and the Ziman side must
+not.
+
+## `curly gui`
+
+A desktop REST client in a window: the saved requests on the left, method and URL across the top,
+the response below, Send on the right.
+
+**It depends on no server.** `curly serve` exists so the React frontend can reach the same `.curly`
+storage over HTTP; this does not use it. The same collections are read from the same disk, variables
+are merged the same way, and `core/exec.send` runs in this process — so there is no port to choose,
+nothing to start first, and the window is as offline as `curly run` is. History is written and
+extractions are applied exactly as the terminal runner does them.
+
+**It needs a ziman with a window backend.** `lib/ui/desktop/window.zm` keeps X11 behind a compile
+flag so an ordinary `ziman` does not depend on a display, so the natives live only in the build
+`make gui` produces. `bin/curly` picks `ziman-gui` up automatically when it is on PATH; otherwise
+`ZIMAN=/path/to/ziman-gui curly gui`. Run without one it says so, and says what to do.
+
+**The font** comes from `CURLY_FONT` if set, then a copy vendored in `vendor/fonts/`, then a short
+list of system paths — `lib/graphics` has no notion of a system font, so something has to hand it
+bytes, and an application that asked the user to find a TrueType file before it would open is not
+standalone.
+
+It is also **the first application built on ziman's `lib/ui`**. `curly ui` predates that layer and
+has its own rows-and-cells renderer; every part of the widget stack was until now exercised only by
+its own fixtures.
 
 ## `curly serve`
 

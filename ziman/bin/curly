@@ -26,4 +26,18 @@ while [ -L "$target" ]; do
 done
 here="$(cd -P "$(dirname "$target")" && pwd)"
 
-exec "${ZIMAN:-ziman}" "$here/../src/main/ziman/curly.zm" -- "$@"
+# **`gui` needs an interpreter with a window backend, and the default one has none.**
+# `lib/ui/desktop/window.zm` keeps X11 behind a compile flag so that an ordinary `ziman` does not
+# depend on a display -- which is the right default and means the window natives live only in the
+# build `make gui` produces. So this prefers `ziman-gui` for that one subcommand when it can find
+# one, and otherwise leaves the choice alone and lets the program report it.
+interpreter="${ZIMAN:-ziman}"
+if [ "${1:-}" = "gui" ] && [ -z "${ZIMAN:-}" ] && command -v ziman-gui >/dev/null 2>&1; then
+  interpreter="ziman-gui"
+fi
+
+# Where the vendored font lives, for a standalone run. `gui/app.zm` prefers a system face and falls
+# back to this; `CURLY_FONT` overrides both.
+export CURLY_ROOT="${CURLY_ROOT:-$here/../..}"
+
+exec "$interpreter" "$here/../src/main/ziman/curly.zm" -- "$@"

@@ -335,11 +335,22 @@ if [ -x "$ZCLI" ]; then
   cli_refusal_both "env show, missing" env show no-such-env
   cli_refusal_both "scenario show, missing" scenario show no-such-scenario
   cli_refusal_both "env unset, no such variable" env unset global NO_SUCH_KEY
-  # **`gui` is in both implementations' subcommand lists and prints only a refusal**, which is
-  # exactly the shape nothing here was comparing: the ziman side had the word in its list and no
-  # branch for it, so it answered "unrecognised command: gui" with status 2 where rust answers its
-  # own sentence with status 1. Found 2026-11-09, while adding `ui`.
-  cli_refusal_both "gui, which moved out of the binary" gui
+  # **`gui` is the one command the two deliberately disagree about, so it is asserted as a
+  # disagreement rather than dropped.** Rust left the word behind when its egui crate was deleted
+  # and prints "the graphical interface is a separate application"; the ziman side opens a desktop
+  # window (`gui/app.zm`). Checking that they *differ* is what stops this quietly becoming parity
+  # again if someone wires the rust side to the same message -- a skipped case would not notice.
+  rust_gui="$("$RUST" gui --data-dir "$CURLY" 2>&1 | head -1)" || true
+  zim_gui="$(ZIMAN="$ZIMAN" "$ZCLI" gui --data-dir "$CURLY" 2>&1 | head -1)" || true
+  case "$rust_gui" in
+    *"separate application"*)
+      case "$zim_gui" in
+        *"separate application"*) bad "cli: gui diverges on purpose" "ziman still prints rust's sentence: [$zim_gui]" ;;
+        *) ok "cli: gui diverges on purpose (rust refuses, ziman has a window)" ;;
+      esac
+      ;;
+    *) bad "cli: gui diverges on purpose" "rust no longer prints its sentence: [$rust_gui]" ;;
+  esac
 
   # Round-tripping through the writing commands, then reading back with the *other* binary --
   # which is the real test of "these two share a storage root".

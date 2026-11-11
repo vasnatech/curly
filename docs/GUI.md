@@ -2,6 +2,13 @@
 
 > Status: the GUI is now a **Tauri + React + TypeScript** app, living in `curly-gui-tauri/` (a sibling of `rust/`), replacing the earlier Rust/egui implementation (`crates/curly-gui`, **deleted 2026-11-09** after a period frozen and parked — see `DESIGN.md`'s M8 and M9 entries). It reaches the same feature set the M8 design pass specified: a sidebar Project/History switcher, a Collections tree with hover "⋯" menus (rename/duplicate/delete; new-folder/new-request/delete-folder; new-folder/new-request/save-all on the collection root), an Environments list with create/edit/delete, multiple request tabs with dirty `"*"` tracking, an editable breadcrumb for renaming, Save/Save As, Variables (ad-hoc overrides)/Authorization/Headers/Body/Extraction sub-tabs, dedicated Collection/Folder/Environment main tabs plus an "Active environment" selector, and a Response pane with Body/Headers/History sub-tabs, JSON syntax highlighting, and search with match navigation. Like the GUI it replaces, it shares the exact same `.curly` storage the CLI reads and writes (NFR-5) — nothing here is a separate data store.
 
+> **There are two graphical front-ends now, and they are not rivals.** The Tauri app above is the
+> React one, and it reaches storage over HTTP through `curly serve`. `curly gui` is a desktop window
+> written in Ziman on ziman's own `lib/ui` (`ziman/src/main/ziman/gui/app.zm`), and it depends on no
+> server at all — it reads the same `.curly` storage from disk and sends through `core/exec` in
+> process. See `docs/ZIMAN.md` for what it does and what it needs. The Rust CLI's `gui` subcommand
+> still prints "the graphical interface is a separate application"; the Ziman CLI's opens the window.
+
 ## Launching it
 
 Unlike the CLI (a single `curly` binary), the GUI isn't bundled into that binary yet — it's a separate project you run directly:

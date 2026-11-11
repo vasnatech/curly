@@ -1,0 +1,580 @@
+// curly's desktop window: a REST client in a window, talking to nothing but the network.
+//
+// **Standalone, and that is the design rather than a feature.** `curly serve` exists so the React
+// frontend can reach the same `.curly` storage over HTTP; this does not use it. It loads the same
+// collections from disk, resolves variables the same way, and calls `core/exec.send` in this
+// process -- so there is no port to pick, no server to start, nothing to be running, and the window
+// is as offline as `curly run` is.
+//
+// **It is also the first application built on ziman's `lib/ui`.** `curly ui` -- the terminal one --
+// predates that layer and has its own rows-and-cells renderer; every part of the widget stack
+// (`widget`, `controls`, `focus`, `edit`) and the damage-driven repaint path was until now gated
+// only by its own fixtures. This drives all of them at once, which is the only way to find out
+// whether they compose.
+//
+// The loop is four steps and they are all pure except the last:
+//
+//     window.poll         -> [window.Event]
+//     desktop.input_of    -> controls.Input        (pixels become points here)
+//     step                -> a new State           (every control is a pure step function)
+//     view + widget.paint -> scene.Scene
+//     desktop.repaint     -> only what changed reaches the screen
+//
+// **Needs a ziman with a window backend.** `lib/ui/desktop/window.zm` keeps X11 behind `ZIMAN_X11`
+// so that an ordinary `ziman` does not depend on a display, which means `curly gui` needs the build
+// `make gui` produces. `bin/curly` prefers `ziman-gui` for this subcommand when it can find one,
+// and `run` says so by name when it cannot.
+use clock
+use controls
+use core/collection.find_request
+use core/exec
+use core/exec.ResponseSummary
+use core/extraction.apply
+use core/saved.Collection
+use core/saved.Folder
+use core/saved.SavedRequest
+use core/saved.environment_set
+use core/saved.into_request
+use core/saved.resolve as resolve_request
+use core/scenario_run.merged_variables
+use core/storage.Storage
+use core/storage.append_history
+use core/storage.history_entry_of
+use core/storage.list_collections
+use core/storage.load_collection
+use core/storage.load_session
+use core/storage.save_session
+use desktop
+use focus
+use font
+use fs
+use geom
+use os
+use paint
+use raster
+use scene
+use widget
+use window
+
+// ---- what the window is showing
+
+// One saved request, flattened out of the collection tree so the sidebar can be a plain list.
+struct Item {
+    collection: string
+    path: string
+    label: string
+    saved: SavedRequest
+}
+
+struct State {
+    items: [Item]
+    requests: controls.List
+    method: controls.Entry
+    url: controls.Entry
+    send: controls.Button
+    // The response as text, and how far it is scrolled.
+    body: string
+    scroll: float
+    // One line under everything: what just happened, or what went wrong.
+    status: string
+    focused: string
+}
+
+val sidebar_width = 280.0
+val row_height = 30.0
+val gap = 8.0
+
+// ---- building the view
+
+fn mono_label(text: string, size: float, style: controls.Style) -> widget.Widget {
+    return widget.label_of(text, size, style.ink)
+}
+
+fn view(s: State, style: controls.Style, m: widget.Metrics) -> widget.Widget {
+    val sidebar = widget.column_of(gap, [
+        widget.fixed_of(0.0, gap, widget.flex()),
+        widget.fixed_of(0.0, 18.0, mono_label("Requests", 12.0, style)),
+        widget.expand(controls.list_widget(s.requests, style))
+    ])
+    val bar = widget.row_of(gap, [
+        widget.fixed_of(90.0, 0.0, controls.entry_widget(s.method, style, m)),
+        widget.expand(controls.entry_widget(s.url, style, m)),
+        widget.fixed_of(90.0, 0.0, controls.button_widget(s.send, style))
+    ])
+    val response = widget.named_scroll(
+        "response",
+        0.0,
+        s.scroll,
+        widget.column_of(2.0, body_lines(s.body, style))
+    )
+    val main = widget.column_of(gap, [
+        widget.fixed_of(0.0, gap, widget.flex()),
+        widget.fixed_of(0.0, row_height, bar),
+        widget.expand(response),
+        widget.fixed_of(0.0, 18.0, mono_label(s.status, 11.0, style)),
+        widget.fixed_of(0.0, gap, widget.flex())
+    ])
+    // A margin all round, which a window needs and a fixture does not -- every `lib/ui` example so
+    // far laid out to the edges of its own box, so nothing had noticed.
+    return widget.row_of(gap, [
+        widget.fixed_of(gap, 0.0, widget.flex()),
+        widget.fixed_of(sidebar_width, 0.0, sidebar),
+        widget.expand(main),
+        widget.fixed_of(gap, 0.0, widget.flex())
+    ])
+}
+
+// The response body as one label per line.
+//
+// **One widget per line rather than one per response**, because a `label` is a single text run and a
+// run has no notion of a newline: a 200-line body as one label would draw 200 lines on top of each
+// other. Capped, because a megabyte of JSON is 20,000 widgets to lay out for a window that can show
+// forty of them -- and the cap is reported rather than silent.
+val max_lines = 400
+
+fn body_lines(body: string, style: controls.Style) -> [widget.Widget] {
+    val out = mutable_array_new<widget.Widget>()
+    // **Tested on the string, not on the line count.** `split("", "\n")` answers one empty string
+    // rather than none, so a "did we add any lines" counter is 1 for an empty body and the
+    // placeholder below never appeared -- the response pane was simply blank until the first send.
+    if len(body) == 0 {
+        return [widget.fixed_of(0.0, 15.0, mono_label("Pick a request on the left, then press Send.", 11.0, style))]
+    }
+    var shown = 0
+    for line in split(body, "\n") {
+        if shown < max_lines {
+            push(out, widget.fixed_of(0.0, 15.0, mono_label(line, 11.0, style)))
+            shown = shown + 1
+        }
+    }
+    if shown >= max_lines {
+        push(out, widget.fixed_of(0.0, 15.0, mono_label("... truncated", 11.0, style)))
+    }
+    return snapshot(out)
+}
+
+// ---- input
+
+// A step's outcome: the new state, and whether the user asked to send.
+//
+// **The send is returned rather than done**, because every control in `lib/ui` is a pure function
+// of its input and this keeps the same property one level up: `step` can be reasoned about and
+// tested without a socket, and the one place that touches the network is the loop.
+struct Step {
+    state: State
+    send: bool
+}
+
+fn kept(s: State) -> Step {
+    return Step { state: s, send: false }
+}
+
+fn bounds_of(laid: widget.Laid, name: string) -> geom.Rect {
+    return switch focus.node_of(laid, name) {
+        Some(node) { node.bounds }
+        // A control the layout does not hold cannot have been pressed, and an empty box makes every
+        // hit test miss rather than inventing a position.
+        None { geom.rect_of(0.0, 0.0, 0.0, 0.0) }
+    }
+}
+
+// Loads a saved request into the editable fields.
+fn show_request(s: State, item: Item) -> State {
+    return with s {
+        method: controls.entry_of("method", "Method", item.saved.method),
+        url: controls.entry_of("url", "URL", item.saved.url),
+        status: concat(item.collection, "/", item.path)
+    }
+}
+
+fn step(s: State, input: controls.Input, laid: widget.Laid, style: controls.Style, m: widget.Metrics) -> Step {
+    // Tab moves the focus and reaches no control, which is why it is taken before `target`: a field
+    // that saw Tab would type it.
+    if is_tab(input) {
+        val forward = !shift_held(input)
+        val moved = if forward { focus.next(laid, s.focused) } else { focus.previous(laid, s.focused) }
+        return kept(with s { focused: moved })
+    }
+    // A press moves the focus to whatever was pressed, before the press is delivered.
+    val after_click = switch input {
+        Press(at) { with s { focused: focus.clicked(laid, at, s.focused) } }
+        Wheel(_) { s }
+        Release(_) { s }
+        Move(_) { s }
+        KeyDown(_) { s }
+        KeyUp(_) { s }
+        Text(_) { s }
+        Paste(_) { s }
+    }
+    val name = controls.target(laid, input, after_click.focused)
+    if name == "requests" {
+        val taken = controls.list_input(after_click.requests, input, bounds_of(laid, "requests"))
+        val with_list = with after_click { requests: taken.list }
+        // **A moved selection loads the request, not only an activated one.** `ListStep` keeps the
+        // two apart on purpose -- selecting and opening are different intentions -- but for a
+        // request list they are the same one: a user arrowing down the list expects to see what
+        // they have landed on, and a pane still showing the previous request is a trap.
+        if (taken.moved || taken.activated) && taken.list.selected >= 0 && taken.list.selected < len(s.items) {
+            return kept(show_request(with_list, s.items[taken.list.selected]))
+        }
+        return kept(with_list)
+    }
+    if name == "method" {
+        val taken = controls.entry_input(after_click.method, input, bounds_of(laid, "method"), style, m)
+        return kept(with after_click { method: taken.entry })
+    }
+    if name == "url" {
+        val taken = controls.entry_input(after_click.url, input, bounds_of(laid, "url"), style, m)
+        return kept(with after_click { url: taken.entry })
+    }
+    if name == "send" {
+        val taken = controls.button_input(after_click.send, input, bounds_of(laid, "send"))
+        return Step { state: with after_click { send: taken.button }, send: taken.activated }
+    }
+    // The wheel over anything else scrolls the response, which is the only scrollable thing here.
+    return switch input {
+        Wheel(w) { kept(with after_click { scroll: scrolled(after_click, w.vertical) }) }
+        Press(_) { kept(after_click) }
+        Release(_) { kept(after_click) }
+        Move(_) { kept(after_click) }
+        KeyDown(_) { kept(after_click) }
+        KeyUp(_) { kept(after_click) }
+        Text(_) { kept(after_click) }
+        Paste(_) { kept(after_click) }
+    }
+}
+
+val line_height = 17.0
+val wheel_lines = 3.0
+
+fn scrolled(s: State, vertical: int) -> float {
+    var lines = 0
+    for _ in split(s.body, "\n") {
+        lines = lines + 1
+    }
+    val content = (lines as float) * line_height
+    // The viewport is not known here, so the content height stands in for it: `clamp_offset` wants
+    // both and over-scrolling is corrected on the next wheel either way.
+    return widget.clamp_offset(s.scroll - (vertical as float) * wheel_lines * line_height, 200.0, content)
+}
+
+fn is_tab(input: controls.Input) -> bool {
+    return switch input {
+        KeyDown(k) { controls.Key.is_Tab(k.key) }
+        KeyUp(_) { false }
+        Text(_) { false }
+        Paste(_) { false }
+        Press(_) { false }
+        Release(_) { false }
+        Move(_) { false }
+        Wheel(_) { false }
+    }
+}
+
+fn shift_held(input: controls.Input) -> bool {
+    return switch input {
+        KeyDown(k) { k.shift }
+        KeyUp(_) { false }
+        Text(_) { false }
+        Paste(_) { false }
+        Press(_) { false }
+        Release(_) { false }
+        Move(_) { false }
+        Wheel(_) { false }
+    }
+}
+
+// ---- sending, which is the only part that touches the network
+
+// Mirrors `tui/app.zm`'s `send_row` exactly, and deliberately: a request sent from the window and
+// the same request sent from the terminal must do the same thing, including writing history and
+// extracting into the session. The editable method and URL override what the collection holds, so a
+// user can change them without saving first.
+fn send_now(store: Storage, s: State) -> Result<ResponseSummary, string> {
+    if len(s.items) == 0 {
+        return err("no requests loaded")
+    }
+    val index = s.requests.selected
+    if index < 0 || index >= len(s.items) {
+        return err("no request selected")
+    }
+    val item = s.items[index]
+    val edited = with item.saved { method: s.method.editor.text, url: s.url.editor.text }
+    val variables = try merged_variables(store, Option<string>.None, [])
+    val request = try into_request(try resolve_request(edited, variables))
+    val response = try exec.send(request)
+    // A failure to record history never fails the request, as in the TUI and the CLI.
+    val _ = append_history(store, history_entry_of(request, response))
+    if response.status >= 200 && response.status < 300 && len(edited.extract) > 0 {
+        val extracted = try apply(edited.extract, response, variables)
+        var session = try load_session(store, "global")
+        for one in extracted {
+            session = environment_set(session, one.name, one.value, one.secret)
+        }
+        try save_session(store, session)
+    }
+    return ok(response)
+}
+
+fn response_text(r: ResponseSummary) -> string {
+    val out = mutable_array_new<string>()
+    push(out, concat("HTTP ", str(r.status), "  ", str(r.elapsed_millis), " ms"))
+    for h in r.headers {
+        push(out, concat(h.name, ": ", h.value))
+    }
+    push(out, "")
+    push(out, r.body)
+    return join(separator: "\n", pieces: snapshot(out))
+}
+
+// ---- the font
+//
+// **A window needs a face and `lib/graphics` has no notion of a system font** -- it says so itself:
+// there is no library to resolve a name against, so a caller hands it bytes. So this looks in three
+// places, in this order, and names all of them when it finds nothing: `CURLY_FONT` for an explicit
+// choice, the copy vendored beside this source for a standalone run, and a short list of paths the
+// common distributions use.
+val vendored = "vendor/fonts/Caladea-Regular.ttf"
+
+fn font_candidates() -> [string] {
+    val out = mutable_array_new<string>()
+    if Some(explicit) = os.get_env("CURLY_FONT") {
+        push(out, explicit)
+    }
+    if Some(root) = os.get_env("CURLY_ROOT") {
+        push(out, concat(root, "/", vendored))
+    }
+    push(out, vendored)
+    push(out, "/usr/share/fonts/liberation-sans-fonts/LiberationSans-Regular.ttf")
+    push(out, "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf")
+    push(out, "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf")
+    push(out, "/usr/share/fonts/TTF/DejaVuSans.ttf")
+    push(out, "/Library/Fonts/Arial.ttf")
+    return snapshot(out)
+}
+
+fn load_font() -> Result<font.FontRef, string> {
+    val tried = mutable_array_new<string>()
+    for path in font_candidates() {
+        push(tried, path)
+        if fs.exists(path) {
+            switch fs.read_bytes(path) {
+                Ok(data) {
+                    switch font.load(data) {
+                        Ok(f) { return ok(f) }
+                        Err(_) { unit }
+                    }
+                }
+                Err(_) { unit }
+            }
+        }
+    }
+    return err(concat(
+        "curly gui: no usable font. Set CURLY_FONT to a TrueType file. Tried: ",
+        join(separator: ", ", pieces: snapshot(tried))
+    ))
+}
+
+// ---- the collections, flattened
+
+fn walk_folder(items: MutableArray<Item>, collection: string, prefix: string, folder: Folder) {
+    for r in folder.requests {
+        push(items, Item {
+            collection: collection,
+            path: concat(prefix, r.name),
+            label: concat(prefix, r.name),
+            saved: r
+        })
+    }
+    for sub in folder.folders {
+        walk_folder(items, collection, concat(prefix, sub.name, "/"), sub)
+    }
+}
+
+fn load_items(store: Storage) -> Result<[Item], string> {
+    val items = mutable_array_new<Item>()
+    for name in try list_collections(store) {
+        val c = try load_collection(store, name)
+        for r in c.requests {
+            push(items, Item { collection: name, path: r.name, label: concat(name, "/", r.name), saved: r })
+        }
+        for folder in c.folders {
+            walk_folder(items, name, concat(folder.name, "/"), folder)
+        }
+    }
+    return ok(snapshot(items))
+}
+
+// ---- events this loop reads for itself
+//
+// `desktop.input_of` answers `None` for these on purpose -- its own comment says a control cannot
+// decide whether a window should close -- so they are the application's to handle, and this is the
+// application.
+
+fn is_close(e: window.Event) -> bool {
+    return switch e {
+        Close { true }
+        KeyDown(_) { false }
+        KeyUp(_) { false }
+        Char(_) { false }
+        PointerDown(_) { false }
+        PointerUp(_) { false }
+        PointerMove(_) { false }
+        Scroll(_) { false }
+        Resize(_) { false }
+        FocusIn { false }
+        FocusOut { false }
+        Exposed { false }
+    }
+}
+
+fn is_exposed(e: window.Event) -> bool {
+    return switch e {
+        Exposed { true }
+        Close { false }
+        KeyDown(_) { false }
+        KeyUp(_) { false }
+        Char(_) { false }
+        PointerDown(_) { false }
+        PointerUp(_) { false }
+        PointerMove(_) { false }
+        Scroll(_) { false }
+        Resize(_) { false }
+        FocusIn { false }
+        FocusOut { false }
+    }
+}
+
+fn resized_to(e: window.Event) -> Option<window.Size> {
+    return switch e {
+        Resize(size) { Option<window.Size>.Some(size) }
+        Exposed { Option<window.Size>.None }
+        Close { Option<window.Size>.None }
+        KeyDown(_) { Option<window.Size>.None }
+        KeyUp(_) { Option<window.Size>.None }
+        Char(_) { Option<window.Size>.None }
+        PointerDown(_) { Option<window.Size>.None }
+        PointerUp(_) { Option<window.Size>.None }
+        PointerMove(_) { Option<window.Size>.None }
+        Scroll(_) { Option<window.Size>.None }
+        FocusIn { Option<window.Size>.None }
+        FocusOut { Option<window.Size>.None }
+    }
+}
+
+// ---- the loop
+
+val start_width = 1100
+val start_height = 700
+
+pub fn run(store: Storage) -> Result<unit, string> {
+    val f = try load_font()
+    val m = try widget.metrics_for(f)
+    val style = controls.default_style()
+    val items = try load_items(store)
+    val labels = mutable_array_new<string>()
+    for one in items {
+        push(labels, one.label)
+    }
+    val begin = State {
+        items: items,
+        requests: controls.list_of("requests", "Saved requests", snapshot(labels)),
+        method: controls.entry_of("method", "Method", "GET"),
+        url: controls.entry_of("url", "URL", ""),
+        send: controls.button_of("send", "Send"),
+        body: "",
+        scroll: 0.0,
+        status: concat(str(len(items)), " request(s) loaded"),
+        focused: "requests"
+    }
+    // The list opens with its first row selected, so the fields open showing that row rather than
+    // blank -- a selection the pane disagrees with is the same trap as a stale one.
+    val opened = if len(items) > 0 { show_request(begin, items[0]) } else { begin }
+    val options = with raster.options() {
+        fonts: [f],
+        samples: 1,
+        background: Option<paint.Color>.Some(paint.rgb(0.98, 0.98, 0.99)),
+        max_pixels: 8000000
+    }
+    val density = widget.density_of(1.0)
+
+    // **Every mutable thing lives inside the closure.** A lambda in this language captures by
+    // value, so a `var` declared outside and assigned in here would not be the same variable -- the
+    // compiler says so rather than letting it drift, which is how this shape was arrived at.
+    val outcome = window.with_window<unit>(
+        "curly",
+        start_width,
+        start_height,
+        fn(w: window.Window) -> Result<unit, string> {
+            var painter = try desktop.painter_of(start_width as float, start_height as float, 1.0)
+            var st = opened
+            var width_pt = start_width as float
+            var height_pt = start_height as float
+            var closing = false
+            while !closing {
+                // Laid out once per pass and used for both halves: the scene to draw and the
+                // geometry an input is routed by. Two layouts could disagree, and a press would
+                // land on where a control used to be.
+                val laid = widget.layout(view(st, style, m), geom.rect_of(0.0, 0.0, width_pt, height_pt), m)
+                val painted = try desktop.repaint(painter, w, widget.paint(laid, m), options)
+                painter = painted.next
+
+                for e in try window.poll(w) {
+                    if is_close(e) {
+                        closing = true
+                    }
+                    // The contents are gone and the scene has not changed, so without this the
+                    // window would stay as the compositor left it.
+                    if is_exposed(e) {
+                        painter = desktop.forget(painter)
+                    }
+                    if Some(size) = resized_to(e) {
+                        width_pt = size.width as float
+                        height_pt = size.height as float
+                    }
+                    if Some(input) = desktop.input_of(e, density) {
+                        val stepped = step(st, input, laid, style, m)
+                        st = stepped.state
+                        if stepped.send {
+                            switch send_now(store, st) {
+                                Ok(r) {
+                                    st = with st {
+                                        body: response_text(r),
+                                        scroll: 0.0,
+                                        status: concat("HTTP ", str(r.status), " in ", str(r.elapsed_millis), " ms")
+                                    }
+                                }
+                                Err(why) { st = with st { body: "", scroll: 0.0, status: concat("error: ", why) } }
+                            }
+                        }
+                    }
+                }
+                // **A frame budget, not a frame rate.** `repaint` draws nothing when the scene has
+                // not changed, so an idle window costs this sleep and a poll; a busy one redraws
+                // only what moved.
+                clock.sleep_millis(16)
+            }
+            return ok(unit)
+        }
+    )
+    // **`window.open` fails on an ordinary `ziman`, and its message is ziman's rather than ours.**
+    // "build with `make gui`" is the right instruction for someone working on the language and the
+    // wrong one for someone who just typed `curly gui`, so the advice they need is added here
+    // rather than the message being replaced -- the original says what went wrong and this says
+    // what to do about it.
+    return switch outcome {
+        Ok(_) { ok(unit) }
+        Err(why) {
+            if contains(why, "no window backend") {
+                err(concat(
+                    why,
+                    "\n  curly gui needs a ziman built with a window backend. `bin/curly` picks ",
+                    "`ziman-gui` up automatically when it is on PATH; otherwise run ",
+                    "`ZIMAN=/path/to/ziman-gui curly gui`."
+                ))
+            } else {
+                err(why)
+            }
+        }
+    }
+}

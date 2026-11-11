@@ -27,6 +27,7 @@ use cli/commands/session as session_command
 use cli/commands/ui as ui_command
 use core/storage.Storage
 use core/storage.resolve
+use gui/app as gui_app
 use os
 
 // Flags every command accepts.
@@ -216,11 +217,12 @@ fn main() {
         finish(serve_command.run(rest, store))
         return
     }
-    // `gui` is in the subcommand list and had no branch until 2026-11-09, so it fell through to
-    // "unrecognised command" with status 2 where the Rust CLI answers its own message with status
-    // 1. The message is the contract for a user who types the old command.
+    // **`gui` is a window again, and this time it is ours.** It answered "the graphical interface
+    // is a separate application" from 2026-11-09, when the egui crate was deleted and the Tauri app
+    // became the GUI; `gui/app.zm` is a desktop client written in Ziman that needs no server and no
+    // webview, so the subcommand means something again.
     if command == "gui" {
-        finish(ui_command.gui_moved())
+        finish(gui_app.run(store))
         return
     }
 

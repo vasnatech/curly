@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import * as api from "../api";
+import { bytesToBase64, imageFileExtension, isImageContentType } from "../bytes";
 import { buildSegments, findMatches } from "../jsonHighlight";
 import type { RequestTabState } from "../tabState";
 import type { HistoryEntry } from "../types";
@@ -28,11 +29,24 @@ export function ResponsePane({ tab, onLoadHistoryEntry }: ResponsePaneProps) {
   const [search, setSearch] = useState("");
   const [currentMatch, setCurrentMatch] = useState(0);
   const [history, setHistory] = useState<HistoryEntry[] | null>(null);
+  const [saveNotice, setSaveNotice] = useState<string | null>(null);
   const currentMatchRef = useRef<HTMLElement | null>(null);
 
   const { response, responseError, inFlight } = tab;
 
-  const { text: bodyText, isJson } = useMemo(() => (response ? prettyBody(response.body) : { text: "", isJson: false }), [response]);
+  // A response's `Content-Type` decides Body's whole rendering path: an
+  // image renders as an <img>, everything else goes through the existing
+  // pretty-print/highlight/search pipeline.
+  const imageContentType = useMemo(() => (response ? isImageContentType(response.headers) : null), [response]);
+  const imageDataUrl = useMemo(
+    () => (response && imageContentType ? `data:${imageContentType};base64,${bytesToBase64(response.body_bytes)}` : null),
+    [response, imageContentType],
+  );
+
+  const { text: bodyText, isJson } = useMemo(
+    () => (response && !imageContentType ? prettyBody(response.body) : { text: "", isJson: false }),
+    [response, imageContentType],
+  );
 
   const searchLower = search.toLowerCase();
   const matches = useMemo(() => findMatches(bodyText, searchLower), [bodyText, searchLower]);
@@ -46,6 +60,10 @@ export function ResponsePane({ tab, onLoadHistoryEntry }: ResponsePaneProps) {
   useEffect(() => {
     currentMatchRef.current?.scrollIntoView({ block: "center" });
   }, [currentMatch, search]);
+
+  useEffect(() => {
+    setSaveNotice(null);
+  }, [response]);
 
   useEffect(() => {
     if (subtab !== "history") return;
@@ -62,6 +80,29 @@ export function ResponsePane({ tab, onLoadHistoryEntry }: ResponsePaneProps) {
   function advance(forward: boolean) {
     if (matches.length === 0) return;
     setCurrentMatch((c) => (forward ? (c + 1) % matches.length : (c - 1 + matches.length) % matches.length));
+  }
+
+  /** Hands the user `response.body_bytes` verbatim — byte-exact, including
+   * for an image, same as the egui GUI's own "Save Response…" (the naive
+   * alternative, writing the lossy UTF-8-decoded `body` string, would
+   * silently corrupt any binary response).
+   *
+   * **A download, not a path.** This used to open a native save dialog and
+   * ask the Rust side to write the bytes to the path it returned; the
+   * backend is an HTTP server now, which deliberately exposes no
+   * write-to-any-path command (see `api.saveBytes`). So the user gets the
+   * file through their browser and where it lands is between them and it —
+   * which is also why the notice no longer names a directory it cannot
+   * know. */
+  async function onSaveResponse() {
+    if (!response) return;
+    const filename = imageContentType ? `response.${imageFileExtension(imageContentType)}` : isJson ? "response.json" : "response.txt";
+    try {
+      await api.saveBytes(filename, response.body_bytes);
+      setSaveNotice(`downloading ${filename}`);
+    } catch (e) {
+      setSaveNotice(`failed to save: ${e}`);
+    }
   }
 
   return (
@@ -111,13 +152,29 @@ export function ResponsePane({ tab, onLoadHistoryEntry }: ResponsePaneProps) {
                   {response.elapsed.secs}s {Math.round(response.elapsed.nanos / 1e6)}ms
                 </span>
                 <span>{response.body_bytes.length} bytes</span>
+                <button className="btn-icon-labeled" onClick={onSaveResponse}>
+                  Save Response…
+                </button>
+                {saveNotice && <span className="weak">{saveNotice}</span>}
               </div>
 
               {subtab === "headers" && (
                 <pre className="response-body">{response.headers.map(([k, v]) => `${k}: ${v}`).join("\n")}</pre>
               )}
 
-              {subtab === "body" && (
+              {subtab === "body" && imageContentType && (
+                <>
+                  {imageDataUrl ? (
+                    <div className="response-image-wrap">
+                      <img className="response-image" src={imageDataUrl} alt="response" />
+                    </div>
+                  ) : (
+                    <div className="response-error">Content-Type looks like an image, but the body couldn't be decoded.</div>
+                  )}
+                </>
+              )}
+
+              {subtab === "body" && !imageContentType && (
                 <>
                   <div className="search-row">
                     <input

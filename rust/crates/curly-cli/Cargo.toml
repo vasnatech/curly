@@ -9,13 +9,8 @@ repository.workspace = true
 name = "curly"
 path = "src/main.rs"
 
-[features]
-default = ["gui"]
-gui = ["dep:curly-gui"]
-
 [dependencies]
 curly-core = { path = "../curly-core" }
-curly-gui = { path = "../curly-gui", optional = true }
 reqwest = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }

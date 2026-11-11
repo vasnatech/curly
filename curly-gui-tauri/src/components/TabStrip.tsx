@@ -42,7 +42,10 @@ export function TabStrip({
             className={isRequestActive && i === activeTabIdx ? "tab active" : "tab"}
             onClick={() => onSwitch(i)}
           >
-            <span className="tab-label">{tabLabel(tab)}</span>
+            <span className="tab-label">
+              {!(isRequestActive && i === activeTabIdx) && tab.hasUnseenResponse ? "● " : ""}
+              {tabLabel(tab)}
+            </span>
             <button
               className="tab-close"
               onClick={(e) => {

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { open as openFolderDialog } from "@tauri-apps/plugin-dialog";
 import * as api from "./api";
 import { centralViewEquals, extraTabKey, extraTabToCentralView, type CentralView, type ExtraTab } from "./centralView";
@@ -13,10 +13,16 @@ import { ResponsePane } from "./components/ResponsePane";
 import { SaveAsDialog, type SaveAsDialogState } from "./components/SaveAsDialog";
 import { Sidebar } from "./components/Sidebar";
 import { TabStrip } from "./components/TabStrip";
+import { Toolbar } from "./components/Toolbar";
+import { loadPersistedState, savePersistedState, tabsFromPersisted, type ThemeMode } from "./persistence";
 import { blankTab, isTabDirty, markSaved, tabFromHistoryEntry, tabFromSavedRequest, tabToSavedRequest } from "./tabState";
 import type { RequestTabState } from "./tabState";
 import type { HistoryEntry, ProjectInfo, SavedRequest } from "./types";
 import "./App.css";
+
+const MIN_ZOOM = 0.5;
+const MAX_ZOOM = 3;
+const ZOOM_STEP = 1.1;
 
 // Third slice of the Tauri+React rewrite: Collection/Folder/Environment
 // main tabs (with environment create/edit/delete, previously entirely
@@ -39,8 +45,21 @@ export default function App() {
   const [activeEnvironment, setActiveEnvironment] = useState<string | null>(null);
   const [sidebarTab, setSidebarTab] = useState<"project" | "history">("project");
   const [history, setHistory] = useState<HistoryEntry[]>([]);
-  const [tabs, setTabs] = useState<RequestTabState[]>([blankTab()]);
-  const [activeTabIdx, setActiveTabIdx] = useState(0);
+  // Restored from localStorage on first render if present (M9 gap-fill —
+  // the egui GUI's own zoom/theme/open-tabs persistence, see
+  // persistence.ts). `useState`'s lazy initializer runs exactly once, so
+  // this is cheap even though it means a redundant `loadPersistedState()`
+  // call across a few `useState`s below.
+  const [tabs, setTabs] = useState<RequestTabState[]>(() => {
+    const persisted = loadPersistedState();
+    return persisted ? tabsFromPersisted(persisted).tabs : [blankTab()];
+  });
+  const [activeTabIdx, setActiveTabIdx] = useState(() => {
+    const persisted = loadPersistedState();
+    return persisted ? tabsFromPersisted(persisted).activeTabIdx : 0;
+  });
+  const [zoom, setZoom] = useState(() => loadPersistedState()?.zoom ?? 1);
+  const [theme, setTheme] = useState<ThemeMode>(() => loadPersistedState()?.theme ?? "system");
   const [notice, setNotice] = useState<string | null>(null);
   const [saveAsDialog, setSaveAsDialog] = useState<SaveAsDialogState | null>(null);
   const [pathDialog, setPathDialog] = useState<PathDialogState | null>(null);
@@ -52,6 +71,15 @@ export default function App() {
 
   const activeTab = tabs[activeTabIdx];
 
+  // Read inside async closures (e.g. `onSend`, below) that must know which
+  // tab is *currently* active when a response lands, not which one was
+  // active when the send started — `activeTabIdx` itself would be a stale
+  // value captured at that earlier point.
+  const activeTabIdxRef = useRef(activeTabIdx);
+  useEffect(() => {
+    activeTabIdxRef.current = activeTabIdx;
+  }, [activeTabIdx]);
+
   function bumpCollectionsVersion() {
     setCollectionsVersion((v) => v + 1);
   }
@@ -60,6 +88,66 @@ export default function App() {
     if (sidebarTab === "history") {
       api.listHistory(50).then(setHistory).catch(() => {});
     }
+  }
+
+  function updateTabAt(idx: number, patch: Partial<RequestTabState>) {
+    setTabs((prev) => prev.map((t, i) => (i === idx ? { ...t, ...patch } : t)));
+  }
+
+  // Manual light/dark override — `null`/"system" defers entirely to
+  // `prefers-color-scheme` (see App.css); explicit here wins over it in
+  // both directions via the `data-theme` attribute.
+  useEffect(() => {
+    if (theme === "system") document.documentElement.removeAttribute("data-theme");
+    else document.documentElement.setAttribute("data-theme", theme);
+  }, [theme]);
+
+  // The non-standard `zoom` CSS property (supported by both Chromium and
+  // WebKitGTK, so it works in Tauri's Linux webview) scales the whole
+  // page's layout and paint uniformly, including fixed-position dialogs —
+  // unlike `transform: scale`, which doesn't reflow layout and behaves
+  // oddly with fixed-position descendants' own coordinate systems.
+  useEffect(() => {
+    (document.documentElement.style as unknown as { zoom: string }).zoom = String(zoom);
+  }, [zoom]);
+
+  // Debounced (so typing doesn't hammer localStorage on every keystroke)
+  // plus a `beforeunload` save as a safety net for a clean app close —
+  // mirrors the egui GUI's own on-exit persistence, just via two triggers
+  // instead of one real "on_exit" hook.
+  useEffect(() => {
+    const id = window.setTimeout(() => {
+      savePersistedState(zoom, theme, tabs, activeTabIdx);
+    }, 500);
+    return () => window.clearTimeout(id);
+  }, [zoom, theme, tabs, activeTabIdx]);
+
+  useEffect(() => {
+    const handler = () => savePersistedState(zoom, theme, tabs, activeTabIdx);
+    window.addEventListener("beforeunload", handler);
+    return () => window.removeEventListener("beforeunload", handler);
+  }, [zoom, theme, tabs, activeTabIdx]);
+
+  function isEffectivelyDark(): boolean {
+    if (theme === "dark") return true;
+    if (theme === "light") return false;
+    return window.matchMedia("(prefers-color-scheme: dark)").matches;
+  }
+
+  function toggleTheme() {
+    setTheme(isEffectivelyDark() ? "light" : "dark");
+  }
+
+  function zoomIn() {
+    setZoom((z) => Math.min(MAX_ZOOM, z * ZOOM_STEP));
+  }
+
+  function zoomOut() {
+    setZoom((z) => Math.max(MIN_ZOOM, z / ZOOM_STEP));
+  }
+
+  function zoomReset() {
+    setZoom(1);
   }
 
   useEffect(() => {
@@ -118,7 +206,7 @@ export default function App() {
   }
 
   function updateActiveTab(patch: Partial<RequestTabState>) {
-    setTabs((prev) => prev.map((t, i) => (i === activeTabIdx ? { ...t, ...patch } : t)));
+    updateTabAt(activeTabIdx, patch);
   }
 
   function openNewTab() {
@@ -144,6 +232,7 @@ export default function App() {
   function onSwitchTab(idx: number) {
     setActiveTabIdx(idx);
     setCentralView({ kind: "request" });
+    updateTabAt(idx, { hasUnseenResponse: false });
   }
 
   function openOrFocusExtraTab(tab: ExtraTab) {
@@ -174,21 +263,35 @@ export default function App() {
     setCentralView({ kind: "request" });
   }
 
+  /** Sends from whichever tab was active when Send was clicked (`tabIdx`,
+   * captured up front) — not necessarily whatever's active by the time the
+   * response lands, since the user may have switched tabs while it was in
+   * flight. If they have, the response still lands on the *sending* tab
+   * (never bleeds into whatever you switched to), and that tab gets
+   * `hasUnseenResponse` for the tab strip's "response ready" marker
+   * instead of a history refresh/extraction notice, which only make sense
+   * for whatever's actually on screen right now. */
   async function onSend() {
-    updateActiveTab({ inFlight: true, responseError: null });
+    const tabIdx = activeTabIdx;
+    const tabAtSend = tabs[tabIdx];
+    updateTabAt(tabIdx, { inFlight: true, responseError: null });
     try {
-      const saved = tabToSavedRequest(activeTab);
-      const overrides: [string, string][] = activeTab.overrides
+      const saved = tabToSavedRequest(tabAtSend);
+      const overrides: [string, string][] = tabAtSend.overrides
         .filter((o) => o.enabled && o.name.trim() !== "")
         .map((o) => [o.name, o.value]);
       const outcome = await api.sendRequest(saved, activeEnvironment, overrides);
-      updateActiveTab({ response: outcome.response, inFlight: false });
-      refreshHistoryIfShown();
-      if (outcome.extracted.length > 0) {
-        setNotice(`extracted ${outcome.extracted.map((e) => e.name).join(", ")}`);
+      const stillActive = activeTabIdxRef.current === tabIdx;
+      updateTabAt(tabIdx, { response: outcome.response, inFlight: false, hasUnseenResponse: !stillActive });
+      if (stillActive) {
+        refreshHistoryIfShown();
+        if (outcome.extracted.length > 0) {
+          setNotice(`extracted ${outcome.extracted.map((e) => e.name).join(", ")}`);
+        }
       }
     } catch (e) {
-      updateActiveTab({ inFlight: false, responseError: String(e), response: null });
+      const stillActive = activeTabIdxRef.current === tabIdx;
+      updateTabAt(tabIdx, { inFlight: false, responseError: String(e), response: null, hasUnseenResponse: !stillActive });
     }
   }
 
@@ -415,7 +518,16 @@ export default function App() {
   }
 
   return (
-    <div className="app">
+    <div className="app-root">
+      <Toolbar
+        zoom={zoom}
+        onZoomIn={zoomIn}
+        onZoomOut={zoomOut}
+        onZoomReset={zoomReset}
+        isDark={isEffectivelyDark()}
+        onToggleTheme={toggleTheme}
+      />
+      <div className="app">
       <Sidebar
         project={project}
         onOpenProject={onOpenProject}
@@ -540,6 +652,7 @@ export default function App() {
           onCancel={() => setFolderDialog(null)}
         />
       )}
+      </div>
     </div>
   );
 }

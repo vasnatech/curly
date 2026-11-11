@@ -6,7 +6,7 @@ mod one_shot;
 use std::path::PathBuf;
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use curly_core::storage::Storage;
 
 use one_shot::OneShotArgs;
@@ -31,7 +31,7 @@ struct Cli {
 enum Command {
     /// Create a project-local ./.curly storage directory (like `git init`)
     Init,
-    /// Launch the graphical interface (also launched by running curly with no arguments)
+    /// Where the graphical interface went (it is a separate application now)
     Gui,
     /// Execute a saved request: curly run <collection>/<request-name>
     Run(commands::run::RunArgs),
@@ -61,42 +61,38 @@ enum Command {
     },
 }
 
-/// Launch the GUI (DESIGN.md §3). Deliberately kept off the async runtime
-/// below — `eframe::run_native` blocks the calling thread until the window
-/// closes and spins up its own background tokio runtime for sends
-/// (curly-gui's `CurlyApp`), so it runs cleanest on a plain thread rather
-/// than nested inside `#[tokio::main]`'s runtime.
-fn launch_gui() -> Result<()> {
-    #[cfg(feature = "gui")]
-    {
-        curly_gui::run()
-    }
-    #[cfg(not(feature = "gui"))]
-    {
-        anyhow::bail!(
-            "this build of curly was compiled without the gui feature \
-             (--no-default-features); pass a URL or a subcommand instead — see --help"
-        )
-    }
+/// **The GUI is no longer part of this binary.** `crates/curly-gui` was an
+/// egui app linked in behind a default-on `gui` feature, and it was deleted
+/// once the Tauri + React app superseded it — `docs/GUI.md` had been calling
+/// it "the parked `curly-gui`" for a while, while `default = ["gui"]` kept
+/// building and shipping it, so the binary and the docs disagreed about what
+/// `curly` with no arguments did. It prints help now, and this says where the
+/// GUI went rather than failing with "unknown subcommand".
+fn gui_moved() -> Result<()> {
+    anyhow::bail!(
+        "the graphical interface is a separate application and is not part of this binary — \
+         see docs/GUI.md for how to run it"
+    )
 }
 
 fn main() -> Result<()> {
-    // A bare `curly` with nothing else at all launches the GUI, per
-    // DESIGN.md §3 — checked before clap even runs, since `curly gui` and
-    // one-shot mode's URL positional both need to stay optional at the
-    // clap level for that coexistence to parse (see one_shot.rs).
+    // A bare `curly` used to launch the bundled GUI; with that gone it prints
+    // help, which is what a CLI with no arguments should do. Checked before
+    // clap runs because one-shot mode's URL positional is optional, so clap
+    // itself would otherwise accept an empty invocation and try to send a
+    // request to no URL.
     if std::env::args().len() <= 1 {
-        return launch_gui();
+        return Cli::command().print_help().map_err(Into::into);
     }
 
     let cli = Cli::parse();
 
     // `init` creates the very directory storage resolution would otherwise
-    // look for, so it can't itself depend on a resolved Storage. `gui`
-    // doesn't touch storage in this first slice either — see launch_gui.
+    // look for, so it can't itself depend on a resolved Storage. `gui` needs
+    // no storage either, since it only reports where the GUI went.
     match cli.command {
         Some(Command::Init) => return commands::init::run(),
-        Some(Command::Gui) => return launch_gui(),
+        Some(Command::Gui) => return gui_moved(),
         _ => {}
     }
 

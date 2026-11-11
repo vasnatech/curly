@@ -27,8 +27,15 @@
   --match-current-fg: #1e1e1e;
 }
 
+/* Three-state theme (M9 gap-fill): "system" (no explicit choice — the
+   media query alone decides), or an explicit `data-theme="light"|"dark"`
+   on <html> set by the manual toggle, which wins over the OS preference
+   in both directions. Base :root above is already the dark palette, so
+   the only override needed is light — once under the media query
+   (system prefers light, no explicit dark override), and once under the
+   explicit attribute (covers system-dark + explicit-light). */
 @media (prefers-color-scheme: light) {
-  :root {
+  :root:not([data-theme="dark"]) {
     --bg: #ffffff;
     --bg-alt: #f2f2f2;
     --bg-hover: #e6e6e6;
@@ -47,6 +54,24 @@
   }
 }
 
+:root[data-theme="light"] {
+  --bg: #ffffff;
+  --bg-alt: #f2f2f2;
+  --bg-hover: #e6e6e6;
+  --border: #d5d5d5;
+  --text: #1a1a1a;
+  --text-weak: #6b6b6b;
+  --notice-bg: #e3f3e5;
+  --error-bg: #f7e3e3;
+  --json-string: #a31515;
+  --json-number: #098658;
+  --json-keyword: #0000ff;
+  --match-bg: #fff3b0;
+  --match-fg: #1a1a1a;
+  --match-current-bg: #f5a623;
+  --match-current-fg: #1a1a1a;
+}
+
 * {
   box-sizing: border-box;
 }
@@ -59,10 +84,50 @@ body {
   font-size: 14px;
 }
 
-.app {
+.app-root {
   display: flex;
+  flex-direction: column;
   height: 100vh;
   width: 100vw;
+}
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-alt);
+  flex-shrink: 0;
+}
+
+.toolbar-btn {
+  padding: 3px 8px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.toolbar-sep {
+  width: 1px;
+  height: 16px;
+  background: var(--border);
+  margin: 0 4px;
+}
+
+.zoom-pct {
+  min-width: 42px;
+  text-align: center;
+  font-size: 12px;
+}
+
+.app {
+  display: flex;
+  flex: 1;
+  min-height: 0;
 }
 
 .weak {
@@ -593,9 +658,35 @@ body {
 
 .response-meta {
   display: flex;
+  align-items: center;
   gap: 12px;
   margin-bottom: 6px;
   font-family: monospace;
+}
+
+.btn-icon-labeled {
+  font-family: inherit;
+  padding: 3px 10px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: var(--bg-alt);
+  color: var(--text);
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.response-image-wrap {
+  overflow: auto;
+  max-height: 60vh;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg-alt);
+  padding: 8px;
+}
+
+.response-image {
+  max-width: 100%;
+  display: block;
 }
 
 .status-ok {

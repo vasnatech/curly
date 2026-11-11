@@ -319,6 +319,21 @@ pub async fn send_request(
     Ok(SendOutcome { response, extracted })
 }
 
+// --- Save Response… (M9 gap-fill) ---
+
+/// Write `bytes` to `path` verbatim — the byte-exact save the egui GUI's
+/// own "Save Response…" already did (`resp.body_bytes`, never the lossy
+/// UTF-8-decoded `body` string), reimplemented here as a plain Rust
+/// command rather than via `@tauri-apps/plugin-fs`: a save-dialog-picked
+/// path is often outside that plugin's default filesystem-scope
+/// permissions, and a dedicated command sidesteps the whole scope-
+/// configuration question since it isn't gated by the JS-facing capability
+/// system at all.
+#[tauri::command]
+pub fn save_bytes(path: String, bytes: Vec<u8>) -> Result<(), String> {
+    std::fs::write(&path, bytes).map_err(err)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

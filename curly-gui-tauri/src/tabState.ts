@@ -116,6 +116,10 @@ export interface RequestTabState {
   response: import("./types").ResponseSummary | null;
   responseError: string | null;
   inFlight: boolean;
+  /** Set when a response (or error) lands for this tab while it wasn't the
+   * active one — drives a "response ready" marker on the tab strip.
+   * Cleared when the tab becomes active. */
+  hasUnseenResponse: boolean;
 }
 
 export function emptyHeader(): KvPair {
@@ -140,6 +144,7 @@ export function blankTab(): RequestTabState {
     response: null,
     responseError: null,
     inFlight: false,
+    hasUnseenResponse: false,
   };
 }
 
@@ -169,6 +174,7 @@ export function tabFromSavedRequest(saved: SavedRequest, loadedRequest: LoadedRe
     response: null,
     responseError: null,
     inFlight: false,
+    hasUnseenResponse: false,
   };
 }
 
@@ -235,6 +241,7 @@ export function tabFromHistoryEntry(entry: HistoryEntry): RequestTabState {
     response: null,
     responseError: null,
     inFlight: false,
+    hasUnseenResponse: false,
   };
 }
 
@@ -254,4 +261,56 @@ export function tabLabel(tab: RequestTabState): string {
       ? `${tab.method} ${tab.url}`
       : "New Request";
   return isTabDirty(tab) ? `* ${base}` : base;
+}
+
+/** What gets written to `localStorage` for a tab (M9 gap-fill —
+ * persistence across restarts, mirroring the egui GUI's own
+ * `persistence.rs::PersistedTab`). Deliberately narrow: no response/
+ * search/extraction-rules/overrides — those reset to defaults on restart,
+ * matching the same "ephemeral editor state, not saved" stance the egui
+ * GUI already established for this exact set of fields. */
+export interface PersistedTabData {
+  method: string;
+  url: string;
+  headers: KvPair[];
+  body: string;
+  auth: AuthEditorState;
+  loadedRequest: LoadedRequestRef | null;
+}
+
+export function tabToPersisted(tab: RequestTabState): PersistedTabData {
+  return {
+    method: tab.method,
+    url: tab.url,
+    headers: tab.headers,
+    body: tab.body,
+    auth: tab.auth,
+    loadedRequest: tab.loadedRequest,
+  };
+}
+
+/** Rebuild a tab from persisted data — treated as freshly "clean" against
+ * its own restored content (there's no cheap way to know whether it still
+ * matches whatever's on disk without re-fetching, so restoring is its own
+ * new baseline, same as a fresh load). */
+export function tabFromPersisted(p: PersistedTabData): RequestTabState {
+  const headers = p.headers.length > 0 ? p.headers : [emptyHeader()];
+  const name = p.loadedRequest ? splitFolderAndName(p.loadedRequest.path)[1] : "";
+  return {
+    key: `tab-${nextTabKey++}`,
+    method: p.method,
+    url: p.url,
+    headers,
+    body: p.body,
+    auth: p.auth,
+    extractRules: [],
+    overrides: [],
+    loadedRequest: p.loadedRequest,
+    breadcrumbDraft: name,
+    savedSnapshot: snapshotOf({ method: p.method, url: p.url, headers, body: p.body, auth: p.auth, extractRules: [] }),
+    response: null,
+    responseError: null,
+    inFlight: false,
+    hasUnseenResponse: false,
+  };
 }

@@ -78,6 +78,9 @@ struct HeaderRow {
 }
 
 val header_rows = 4
+// Tall enough for a small JSON document without crowding the response out of the window. The field
+// scrolls rather than growing, so a longer body is reachable and the layout does not move.
+val body_rows = 6
 
 struct State {
     items: [Item]
@@ -85,10 +88,10 @@ struct State {
     method: controls.Entry
     url: controls.Entry
     headers: [HeaderRow]
-    // **A single line, because `lib/ui` has no multi-line text control.** `edit.Editor` is a string
-    // with a caret and `controls.entry_widget` draws one text run, so a newline has nowhere to go.
-    // That is the gap to close before this is a comfortable place to write JSON; until then a
-    // compact body works and a long one is better edited through the CLI.
+    // **A text area**, which this application is the reason `lib/ui` has: it was a one-line field
+    // until `controls.text_area_of` existed, and a REST client where a JSON body has to be typed on
+    // one line is a REST client nobody would use. Enter inserts a newline here, Up and Down move by
+    // line, and the whole body is drawn a line at a time.
     body: controls.Entry
     // The environment to resolve `{{variables}}` against. Typed rather than picked, for the same
     // reason: a dropdown is a control that does not exist yet. Empty means the global scope alone.
@@ -114,6 +117,7 @@ fn mono_label(text: string, size: float, style: controls.Style) -> widget.Widget
 }
 
 fn view(s: State, style: controls.Style, m: widget.Metrics) -> widget.Widget {
+    val body_height = (body_rows as float) * 17.0 + 8.0
     val sidebar = widget.column_of(gap, [
         widget.fixed_of(0.0, gap, widget.flex()),
         widget.fixed_of(0.0, 18.0, mono_label("Requests", 12.0, style)),
@@ -136,7 +140,7 @@ fn view(s: State, style: controls.Style, m: widget.Metrics) -> widget.Widget {
         widget.fixed_of(0.0, 16.0, mono_label("Headers", 11.0, style)),
         widget.column_of(4.0, snapshot(header_widgets)),
         widget.fixed_of(0.0, 16.0, mono_label("Body", 11.0, style)),
-        widget.fixed_of(0.0, row_height, controls.entry_widget(s.body, style, m)),
+        widget.fixed_of(0.0, body_height, controls.entry_widget(s.body, style, m)),
         widget.fixed_of(0.0, row_height, widget.row_of(gap, [
             widget.fixed_of(110.0, 0.0, mono_label("Environment", 11.0, style)),
             widget.expand(controls.entry_widget(s.env, style, m))
@@ -148,7 +152,7 @@ fn view(s: State, style: controls.Style, m: widget.Metrics) -> widget.Widget {
         s.scroll,
         widget.column_of(2.0, body_lines(s.response, style))
     )
-    val editors_height = 16.0 + 4.0 + ((row_height + 4.0) * (header_rows as float)) + 16.0 + 4.0 + row_height + 4.0 + row_height + 8.0
+    val editors_height = 16.0 + 4.0 + ((row_height + 4.0) * (header_rows as float)) + 16.0 + 4.0 + body_height + 4.0 + row_height + 8.0
     val main = widget.column_of(gap, [
         widget.fixed_of(0.0, gap, widget.flex()),
         widget.fixed_of(0.0, row_height, bar),
@@ -337,7 +341,7 @@ fn show_request(s: State, item: Item) -> State {
         method: controls.entry_of("method", "Method", item.saved.method),
         url: controls.entry_of("url", "URL", item.saved.url),
         headers: header_editors(item.saved.headers),
-        body: controls.entry_of("body", "Body", body_text_of(item.saved.body)),
+        body: controls.text_area_of("body", "Body", body_text_of(item.saved.body), body_rows),
         status: concat(item.collection, "/", item.path)
     }
 }
@@ -691,7 +695,7 @@ pub fn run(store: Storage) -> Result<unit, string> {
         method: controls.entry_of("method", "Method", "GET"),
         url: controls.entry_of("url", "URL", ""),
         headers: header_editors([]),
-        body: controls.entry_of("body", "Body", ""),
+        body: controls.text_area_of("body", "Body", "", body_rows),
         env: controls.entry_of("env", "Environment", ""),
         send: controls.button_of("send", "Send"),
         save: controls.button_of("save", "Save"),

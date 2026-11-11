@@ -59,7 +59,18 @@ not.
 ## `curly gui`
 
 A desktop REST client in a window: the saved requests on the left, method and URL across the top,
-the response below, Send on the right.
+headers, body and environment below them, the response under that, Send and Save on the right.
+
+| | |
+|---|---|
+| **Edit** | method, URL, four headers, a raw body, the environment to resolve `{{variables}}` against |
+| **Send** | `core/exec.send` in this process — history written, extractions applied, exactly as `curly ui` does them |
+| **Save** | `replace_request` back into the collection, **keeping the request's position** |
+
+Only a raw body is editable: a binary, form or multipart body is shown as what it is and left
+alone, rather than flattened into something that would save back wrong. Four header rows, fixed,
+because `lib/ui` has no control that adds and removes its own rows yet; the environment is typed for
+the same reason, and empty means the global scope.
 
 **It depends on no server.** `curly serve` exists so the React frontend can reach the same `.curly`
 storage over HTTP; this does not use it. The same collections are read from the same disk, variables
@@ -80,6 +91,15 @@ standalone.
 It is also **the first application built on ziman's `lib/ui`**. `curly ui` predates that layer and
 has its own rows-and-cells renderer; every part of the widget stack was until now exercised only by
 its own fixtures.
+
+**Three gaps in that layer were found here rather than by a wishlist**, which is the argument for
+having an application at all. Two are closed: nothing had noticed `lib/ui` drew to the edges of its
+own box, because every example did (a window has glass); and **the request body had to be a
+one-line field**, because no multi-line control existed -- `controls.text_area_of` is the answer to
+this application, and `edit` needed only line-aware Home/End and an up and a down to get there,
+since a newline had always been an ordinary character in its string. The third is open: there is no
+control that grows its own rows or offers a choice, which is why the headers are four and the
+environment is typed.
 
 ## `curly serve`
 

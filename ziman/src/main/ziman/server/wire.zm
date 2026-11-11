@@ -31,7 +31,8 @@ use json
 use json.Json
 
 // A storage root plus a label to show for it -- not a new concept on disk, just what `curly init`
-// already makes. Mirrors `curly-gui-tauri/src-tauri/src/project.rs`.
+// already makes. Mirrors the Tauri shell's `src-tauri/src/project.rs`, which was deleted on
+// 2026-11-11 once this had replaced it -- see git history for the original.
 pub struct ProjectInfo {
     label: string
     root: string

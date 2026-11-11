@@ -1,5 +1,6 @@
 // Every operation the frontend needs, as one named command taking a JSON object of arguments and
-// answering JSON -- the Ziman side of `curly-gui-tauri/src-tauri/src/commands.rs`.
+// answering JSON -- the Ziman side of what the Tauri shell's `src-tauri/src/commands.rs` did
+// before it was deleted on 2026-11-11.
 //
 // **Command-shaped, not REST, and that is the point.** The frontend calls these through Tauri's
 // `invoke(name, args)` today, where `args` is an object of named arguments and the answer is the
@@ -469,7 +470,7 @@ fn do_send_request(ctx: Context, args: Json) -> Result<Json, string> {
 
 // ------------------------------------------------------------------ the table
 
-// The whole surface, in the order `curly-gui-tauri/src-tauri/src/lib.rs` lists it in its
+// The whole surface, in the order the Tauri shell's `src-tauri/src/lib.rs` listed it in its
 // `invoke_handler`, so the two can be read side by side and a missing one is visible.
 pub fn commands() -> [Command] {
     return [

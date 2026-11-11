@@ -1,6 +1,6 @@
 # Curly GUI — User Guide
 
-> Status: the GUI is now a **Tauri + React + TypeScript** app, living in `curly-gui-tauri/` (a sibling of `rust/`), replacing the earlier Rust/egui implementation (`crates/curly-gui`, **deleted 2026-11-09** after a period frozen and parked — see `DESIGN.md`'s M8 and M9 entries). It reaches the same feature set the M8 design pass specified: a sidebar Project/History switcher, a Collections tree with hover "⋯" menus (rename/duplicate/delete; new-folder/new-request/delete-folder; new-folder/new-request/save-all on the collection root), an Environments list with create/edit/delete, multiple request tabs with dirty `"*"` tracking, an editable breadcrumb for renaming, Save/Save As, Variables (ad-hoc overrides)/Authorization/Headers/Body/Extraction sub-tabs, dedicated Collection/Folder/Environment main tabs plus an "Active environment" selector, and a Response pane with Body/Headers/History sub-tabs, JSON syntax highlighting, and search with match navigation. Like the GUI it replaces, it shares the exact same `.curly` storage the CLI reads and writes (NFR-5) — nothing here is a separate data store.
+> Status: the GUI is now a **Tauri + React + TypeScript** app, living in `curly-gui-web/` (a sibling of `rust/`), replacing the earlier Rust/egui implementation (`crates/curly-gui`, **deleted 2026-11-09** after a period frozen and parked — see `DESIGN.md`'s M8 and M9 entries). It reaches the same feature set the M8 design pass specified: a sidebar Project/History switcher, a Collections tree with hover "⋯" menus (rename/duplicate/delete; new-folder/new-request/delete-folder; new-folder/new-request/save-all on the collection root), an Environments list with create/edit/delete, multiple request tabs with dirty `"*"` tracking, an editable breadcrumb for renaming, Save/Save As, Variables (ad-hoc overrides)/Authorization/Headers/Body/Extraction sub-tabs, dedicated Collection/Folder/Environment main tabs plus an "Active environment" selector, and a Response pane with Body/Headers/History sub-tabs, JSON syntax highlighting, and search with match navigation. Like the GUI it replaces, it shares the exact same `.curly` storage the CLI reads and writes (NFR-5) — nothing here is a separate data store.
 
 > **There are two graphical front-ends now, and they are not rivals.** The React app documented
 > below is served by `curly serve` over HTTP; **its Tauri shell was deleted on 2026-11-11** and it is
@@ -14,7 +14,7 @@
 Unlike the CLI (a single `curly` binary), the GUI isn't bundled into that binary yet — it's a separate project you run directly:
 
 ```sh
-cd curly-gui-tauri
+cd curly-gui-web
 npm install        # first time only
 npm run tauri dev  # launches the dev build (Vite + the Tauri window together)
 ```

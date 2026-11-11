@@ -1,7 +1,7 @@
 # The Ziman implementation
 
 Curly is being reimplemented in [Ziman](https://ziman.dev). The Rust implementation in `rust/`
-stays as the **reference** until the port passes parity; the React frontend in `curly-gui-tauri/`
+stays as the **reference** until the port passes parity; the React frontend in `curly-gui-web/`
 is **shared and is not being rewritten**.
 
 What that means in practice is that nothing here is finished because its own tests pass. `parity.sh`
@@ -84,7 +84,7 @@ its own fixtures.
 ## `curly serve`
 
 ```sh
-ziman/bin/curly serve --port 8787 --web-root curly-gui-tauri/dist
+ziman/bin/curly serve --port 8787 --web-root curly-gui-web/dist
 ```
 
 | flag | |
@@ -158,7 +158,7 @@ is refused.
 
 ### The frontend
 
-**Done.** `curly-gui-tauri/src/api.ts` calls the server, not Tauri: the `invoke` import became a
+**Done.** `curly-gui-web/src/api.ts` calls the server, not Tauri: the `invoke` import became a
 `post` helper of the same shape, and all 21 wrappers below it are unchanged, because the server kept
 `invoke`'s shape precisely so they could be. `vite.config.ts` proxies `/api` (set `CURLY_PORT` to
 match a `curly serve --port`).
@@ -176,9 +176,9 @@ two honest options recorded here — a text field, or dropping the switcher and 
 the server then opens. The server runs on the same machine as the files, so this is less convenient
 and no less capable.
 
-With that, nothing reached Tauri and `curly-gui-tauri/src-tauri/` was deleted — 18 tracked files, a
+With that, nothing reached Tauri and `curly-gui-web/src-tauri/` was deleted — 18 tracked files, a
 Rust crate whose `project.rs` the Ziman server had already reimplemented, and four `@tauri-apps`
-npm dependencies. **The directory is still called `curly-gui-tauri` and no longer contains any
+npm dependencies. **The directory is still called `curly-gui-web` and no longer contains any
 Tauri**, which is a rename waiting to happen rather than a statement about the code.
 
 curly's own mark survived the shell: it was the Tauri bundler's icon source and is now the web app's

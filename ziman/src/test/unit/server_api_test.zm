@@ -94,7 +94,8 @@ fn the_table_is_the_bridges_invoke_handler_list() {
     for one in commands() {
         push(names, one.name)
     }
-    // In `curly-gui-tauri/src-tauri/src/lib.rs`'s order, minus `save_bytes` -- which writes to a
+    // In the order the Tauri shell's `src-tauri/src/lib.rs` listed them (deleted 2026-11-11;
+    // git history has it), minus `save_bytes` -- which writes to a
     // path a native save dialog picked, and has no business on a server (see `server/api`).
     test.assert_eq(
         join(separator: " ", pieces: snapshot(names)),

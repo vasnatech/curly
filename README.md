@@ -3,7 +3,7 @@
 A lightweight REST client, written in Rust, with two faces sharing one core:
 
 - **`curly` (CLI)** — a curl-like command-line tool for sending requests and managing saved collections/environments from the terminal. Ships as a native, single-binary executable for Linux, macOS, and Windows.
-- **Curly (GUI)** — a Postman-like interface for building, organizing, and inspecting HTTP requests visually. There are two, neither bundled into the `curly` binary: a **React/TypeScript web app** (`curly-gui-tauri/`) served by `curly serve`, and **`curly gui`**, a desktop window written in Ziman that needs no server at all. See "Using the GUI" below.
+- **Curly (GUI)** — a Postman-like interface for building, organizing, and inspecting HTTP requests visually. There are two, neither bundled into the `curly` binary: a **React/TypeScript web app** (`curly-gui-web/`) served by `curly serve`, and **`curly gui`**, a desktop window written in Ziman that needs no server at all. See "Using the GUI" below.
 
 ## Status
 
@@ -23,7 +23,7 @@ cd rust && cargo build --release
 See [docs/GUI.md](docs/GUI.md) for the full guide, including Linux build prerequisites. In short:
 
 ```sh
-cd curly-gui-tauri
+cd curly-gui-web
 npm install        # first time only
 npm run dev          # and `ziman/bin/curly serve` in another terminal
 ```
@@ -39,7 +39,7 @@ curly/
 │       └── curly-cli/    # bin "curly": the clap-based CLI
 ├── ziman/             # the Ziman implementation — see docs/ZIMAN.md
 │   └── src/{main,test}/ziman/
-├── curly-gui-tauri/   # the web GUI: React/TypeScript, talking to `curly serve` over HTTP
+├── curly-gui-web/   # the web GUI: React/TypeScript, talking to `curly serve` over HTTP
 │   └── src/           #   React frontend
 ├── docs/
 ├── run-all.sh         # every check, both implementations, plus the cross-check between them

@@ -482,7 +482,7 @@ When adding a new flag or subcommand, add at minimum:
 
 ## 20. Tauri + React GUI (M9 — see GUI.md)
 
-The current GUI — supersedes §16 above. Requires an actual display; not scriptable, run by hand from `curly-gui-tauri/`: `npm install` (first time), then `npm run tauri dev`. No automated frontend test suite exists yet (see GUI.md's own testing note), so this checklist is the only verification these behaviors get beyond `tsc --noEmit`.
+The current GUI — supersedes §16 above. Requires an actual display; not scriptable, run by hand from `curly-gui-web/`: `npm install` (first time), then `npm run tauri dev`. No automated frontend test suite exists yet (see GUI.md's own testing note), so this checklist is the only verification these behaviors get beyond `tsc --noEmit`.
 
 Set `CURLY_DATA_DIR` to a scratch directory before starting, same reasoning as the top of this doc:
 ```sh
@@ -492,7 +492,7 @@ rm -rf "$CURLY_DATA_DIR"
 
 | # | Steps | Expected |
 |---|---|---|
-| 20.1 | `npm run tauri dev` from `curly-gui-tauri/` with no `.curly` anywhere above the cwd and `CURLY_DATA_DIR` unset | Window opens; sidebar shows project label "Default". |
+| 20.1 | `npm run tauri dev` from `curly-gui-web/` with no `.curly` anywhere above the cwd and `CURLY_DATA_DIR` unset | Window opens; sidebar shows project label "Default". |
 | 20.2 | Same, with `CURLY_DATA_DIR` set to an empty scratch dir | Sidebar shows a project label derived from that directory; `ls "$CURLY_DATA_DIR"` shows nothing was created yet (created lazily on first save, same as the CLI/egui GUI). |
 | 20.3 | `curly collections add-request smoke-test login https://example.com/login` (CLI, same `CURLY_DATA_DIR`) then relaunch the GUI | Sidebar's Collections list shows `smoke-test`. |
 | 20.4 | Click **"Open Project…"**, pick a different directory that already has a `.curly` | Native folder picker opens (no window freeze); sidebar switches to that project's label/collections/environments. |

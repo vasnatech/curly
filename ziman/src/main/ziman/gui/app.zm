@@ -27,9 +27,11 @@
 use clock
 use controls
 use core/collection.find_request
+use core/collection.replace_request
 use core/exec
 use core/exec.ResponseSummary
 use core/extraction.apply
+use core/saved
 use core/saved.Collection
 use core/saved.Folder
 use core/saved.SavedRequest
@@ -43,6 +45,7 @@ use core/storage.history_entry_of
 use core/storage.list_collections
 use core/storage.load_collection
 use core/storage.load_session
+use core/storage.save_collection
 use core/storage.save_session
 use desktop
 use focus
@@ -66,14 +69,34 @@ struct Item {
     saved: SavedRequest
 }
 
+// One header being edited. Four of these rather than a growable list, because `lib/ui` has no
+// control that adds and removes its own rows yet -- a real gap this application found, recorded in
+// the commit that added it. Four covers the ordinary request; a fifth needs the CLI for now.
+struct HeaderRow {
+    name: controls.Entry
+    value: controls.Entry
+}
+
+val header_rows = 4
+
 struct State {
     items: [Item]
     requests: controls.List
     method: controls.Entry
     url: controls.Entry
+    headers: [HeaderRow]
+    // **A single line, because `lib/ui` has no multi-line text control.** `edit.Editor` is a string
+    // with a caret and `controls.entry_widget` draws one text run, so a newline has nowhere to go.
+    // That is the gap to close before this is a comfortable place to write JSON; until then a
+    // compact body works and a long one is better edited through the CLI.
+    body: controls.Entry
+    // The environment to resolve `{{variables}}` against. Typed rather than picked, for the same
+    // reason: a dropdown is a control that does not exist yet. Empty means the global scope alone.
+    env: controls.Entry
     send: controls.Button
+    save: controls.Button
     // The response as text, and how far it is scrolled.
-    body: string
+    response: string
     scroll: float
     // One line under everything: what just happened, or what went wrong.
     status: string
@@ -99,17 +122,38 @@ fn view(s: State, style: controls.Style, m: widget.Metrics) -> widget.Widget {
     val bar = widget.row_of(gap, [
         widget.fixed_of(90.0, 0.0, controls.entry_widget(s.method, style, m)),
         widget.expand(controls.entry_widget(s.url, style, m)),
-        widget.fixed_of(90.0, 0.0, controls.button_widget(s.send, style))
+        widget.fixed_of(90.0, 0.0, controls.button_widget(s.send, style)),
+        widget.fixed_of(90.0, 0.0, controls.button_widget(s.save, style))
+    ])
+    val header_widgets = mutable_array_new<widget.Widget>()
+    for row in s.headers {
+        push(header_widgets, widget.fixed_of(0.0, row_height, widget.row_of(gap, [
+            widget.fixed_of(220.0, 0.0, controls.entry_widget(row.name, style, m)),
+            widget.expand(controls.entry_widget(row.value, style, m))
+        ])))
+    }
+    val editors = widget.column_of(4.0, [
+        widget.fixed_of(0.0, 16.0, mono_label("Headers", 11.0, style)),
+        widget.column_of(4.0, snapshot(header_widgets)),
+        widget.fixed_of(0.0, 16.0, mono_label("Body", 11.0, style)),
+        widget.fixed_of(0.0, row_height, controls.entry_widget(s.body, style, m)),
+        widget.fixed_of(0.0, row_height, widget.row_of(gap, [
+            widget.fixed_of(110.0, 0.0, mono_label("Environment", 11.0, style)),
+            widget.expand(controls.entry_widget(s.env, style, m))
+        ]))
     ])
     val response = widget.named_scroll(
         "response",
         0.0,
         s.scroll,
-        widget.column_of(2.0, body_lines(s.body, style))
+        widget.column_of(2.0, body_lines(s.response, style))
     )
+    val editors_height = 16.0 + 4.0 + ((row_height + 4.0) * (header_rows as float)) + 16.0 + 4.0 + row_height + 4.0 + row_height + 8.0
     val main = widget.column_of(gap, [
         widget.fixed_of(0.0, gap, widget.flex()),
         widget.fixed_of(0.0, row_height, bar),
+        widget.fixed_of(0.0, editors_height, editors),
+        widget.fixed_of(0.0, 16.0, mono_label("Response", 11.0, style)),
         widget.expand(response),
         widget.fixed_of(0.0, 18.0, mono_label(s.status, 11.0, style)),
         widget.fixed_of(0.0, gap, widget.flex())
@@ -163,10 +207,119 @@ fn body_lines(body: string, style: controls.Style) -> [widget.Widget] {
 struct Step {
     state: State
     send: bool
+    save: bool
 }
 
 fn kept(s: State) -> Step {
-    return Step { state: s, send: false }
+    return Step { state: s, send: false, save: false }
+}
+
+// Builds the header rows for a request, padded out to `header_rows` so the layout does not change
+// shape with the request -- an empty row is how one is added.
+fn header_editors(pairs: [saved.KvPair]) -> [HeaderRow] {
+    val out = mutable_array_new<HeaderRow>()
+    var i = 0
+    while i < header_rows {
+        val name = if i < len(pairs) { pairs[i].name } else { "" }
+        val value = if i < len(pairs) { pairs[i].value } else { "" }
+        push(out, HeaderRow {
+            name: controls.entry_of(concat("header", str(i), "name"), "Header name", name),
+            value: controls.entry_of(concat("header", str(i), "value"), "Header value", value)
+        })
+        i = i + 1
+    }
+    return snapshot(out)
+}
+
+// The non-empty rows, as the pairs a request carries. A row whose name is blank is not a header,
+// whatever its value says -- which is how one is deleted.
+fn headers_of(rows: [HeaderRow]) -> [saved.KvPair] {
+    val out = mutable_array_new<saved.KvPair>()
+    for row in rows {
+        val name = trim(row.name.editor.text)
+        if len(name) > 0 {
+            push(out, saved.kv_pair_of(name, row.value.editor.text))
+        }
+    }
+    return snapshot(out)
+}
+
+fn body_text_of(b: Option<saved.SavedBody>) -> string {
+    return switch b {
+        Some(found) {
+            switch found {
+                Raw(text) { text }
+                // Only a raw body is editable here. The others name a file or carry structure that
+                // a single line cannot express, so they are shown as what they are and left alone
+                // rather than flattened into something that would save back wrong.
+                Binary(path) { concat("(binary body: ", path, ")") }
+                Form(_) { "(form body -- edit with the CLI)" }
+                Multipart(_) { "(multipart body -- edit with the CLI)" }
+            }
+        }
+        None { "" }
+    }
+}
+
+fn is_editable_body(b: Option<saved.SavedBody>) -> bool {
+    return switch b {
+        Some(found) {
+            switch found {
+                Raw(_) { true }
+                Binary(_) { false }
+                Form(_) { false }
+                Multipart(_) { false }
+            }
+        }
+        None { true }
+    }
+}
+
+// The request as the editors have it. One place, so Send and Save cannot disagree about what is
+// being sent and what is being written.
+fn edited_request(s: State, item: Item) -> saved.SavedRequest {
+    val body = if is_editable_body(item.saved.body) {
+        val text = s.body.editor.text
+        if len(text) == 0 {
+            Option<saved.SavedBody>.None
+        } else {
+            Option<saved.SavedBody>.Some(saved.SavedBody.Raw(text))
+        }
+    } else {
+        item.saved.body
+    }
+    return with item.saved {
+        method: s.method.editor.text,
+        url: s.url.editor.text,
+        headers: headers_of(s.headers),
+        body: body
+    }
+}
+
+fn header_row_set(rows: [HeaderRow], index: int, row: HeaderRow) -> [HeaderRow] {
+    val out = mutable_array_new<HeaderRow>()
+    var i = 0
+    while i < len(rows) {
+        push(out, if i == index { row } else { rows[i] })
+        i = i + 1
+    }
+    return snapshot(out)
+}
+
+fn selected_item(s: State) -> Option<Item> {
+    val index = s.requests.selected
+    if index < 0 || index >= len(s.items) {
+        return Option<Item>.None
+    }
+    return Option<Item>.Some(s.items[index])
+}
+
+fn env_name(s: State) -> Option<string> {
+    val typed = trim(s.env.editor.text)
+    if len(typed) == 0 {
+        return Option<string>.None
+    }
+    return Option<string>.Some(typed)
 }
 
 fn bounds_of(laid: widget.Laid, name: string) -> geom.Rect {
@@ -183,6 +336,8 @@ fn show_request(s: State, item: Item) -> State {
     return with s {
         method: controls.entry_of("method", "Method", item.saved.method),
         url: controls.entry_of("url", "URL", item.saved.url),
+        headers: header_editors(item.saved.headers),
+        body: controls.entry_of("body", "Body", body_text_of(item.saved.body)),
         status: concat(item.collection, "/", item.path)
     }
 }
@@ -227,9 +382,41 @@ fn step(s: State, input: controls.Input, laid: widget.Laid, style: controls.Styl
         val taken = controls.entry_input(after_click.url, input, bounds_of(laid, "url"), style, m)
         return kept(with after_click { url: taken.entry })
     }
+    if name == "body" {
+        val taken = controls.entry_input(after_click.body, input, bounds_of(laid, "body"), style, m)
+        return kept(with after_click { body: taken.entry })
+    }
+    if name == "env" {
+        val taken = controls.entry_input(after_click.env, input, bounds_of(laid, "env"), style, m)
+        return kept(with after_click { env: taken.entry })
+    }
     if name == "send" {
         val taken = controls.button_input(after_click.send, input, bounds_of(laid, "send"))
-        return Step { state: with after_click { send: taken.button }, send: taken.activated }
+        return Step { state: with after_click { send: taken.button }, send: taken.activated, save: false }
+    }
+    if name == "save" {
+        val taken = controls.button_input(after_click.save, input, bounds_of(laid, "save"))
+        return Step { state: with after_click { save: taken.button }, send: false, save: taken.activated }
+    }
+    // The header rows are named by position, so one test finds the row and the field at once
+    // rather than eight branches naming themselves.
+    var row = 0
+    while row < header_rows {
+        val name_field = concat("header", str(row), "name")
+        val value_field = concat("header", str(row), "value")
+        if name == name_field || name == value_field {
+            val editing_name = name == name_field
+            val current = after_click.headers[row]
+            val target = if editing_name { current.name } else { current.value }
+            val taken = controls.entry_input(target, input, bounds_of(laid, name), style, m)
+            val replaced = if editing_name {
+                with current { name: taken.entry }
+            } else {
+                with current { value: taken.entry }
+            }
+            return kept(with after_click { headers: header_row_set(after_click.headers, row, replaced) })
+        }
+        row = row + 1
     }
     // The wheel over anything else scrolls the response, which is the only scrollable thing here.
     return switch input {
@@ -249,7 +436,7 @@ val wheel_lines = 3.0
 
 fn scrolled(s: State, vertical: int) -> float {
     var lines = 0
-    for _ in split(s.body, "\n") {
+    for _ in split(s.response, "\n") {
         lines = lines + 1
     }
     val content = (lines as float) * line_height
@@ -291,29 +478,51 @@ fn shift_held(input: controls.Input) -> bool {
 // extracting into the session. The editable method and URL override what the collection holds, so a
 // user can change them without saving first.
 fn send_now(store: Storage, s: State) -> Result<ResponseSummary, string> {
-    if len(s.items) == 0 {
-        return err("no requests loaded")
+    val item = switch selected_item(s) {
+        Some(found) { found }
+        None { return err("no request selected") }
     }
-    val index = s.requests.selected
-    if index < 0 || index >= len(s.items) {
-        return err("no request selected")
-    }
-    val item = s.items[index]
-    val edited = with item.saved { method: s.method.editor.text, url: s.url.editor.text }
-    val variables = try merged_variables(store, Option<string>.None, [])
+    val edited = edited_request(s, item)
+    val variables = try merged_variables(store, env_name(s), [])
     val request = try into_request(try resolve_request(edited, variables))
     val response = try exec.send(request)
     // A failure to record history never fails the request, as in the TUI and the CLI.
     val _ = append_history(store, history_entry_of(request, response))
     if response.status >= 200 && response.status < 300 && len(edited.extract) > 0 {
+        // Extractions land in the selected environment's session, as the terminal runner puts them
+        // there -- a token pulled out under one environment must not appear under another.
+        val scope = switch env_name(s) {
+            Some(name) { name }
+            None { "global" }
+        }
         val extracted = try apply(edited.extract, response, variables)
-        var session = try load_session(store, "global")
+        var session = try load_session(store, scope)
         for one in extracted {
             session = environment_set(session, one.name, one.value, one.secret)
         }
         try save_session(store, session)
     }
     return ok(response)
+}
+
+// Writes the editors back over the request they came from.
+//
+// **`replace_request`, not remove-then-add.** The first version did the latter, because
+// `add_request` refuses an occupied path -- and it worked, and it moved the request to the end of
+// its folder, so the sidebar reordered itself every time anything was saved. Seen in a screenshot
+// of the running window, which is the only place it would have shown. The whole collection is
+// rewritten, which is how every other writer in curly works: these files are small and a partial
+// write would be the thing worth fearing.
+fn save_now(store: Storage, s: State) -> Result<string, string> {
+    val item = switch selected_item(s) {
+        Some(found) { found }
+        None { return err("no request selected") }
+    }
+    val collection = try load_collection(store, item.collection)
+    val edited = edited_request(s, item)
+    val saved_collection = try replace_request(collection, item.path, edited)
+    try save_collection(store, saved_collection)
+    return ok(concat("saved ", item.collection, "/", item.path))
 }
 
 fn response_text(r: ResponseSummary) -> string {
@@ -481,8 +690,12 @@ pub fn run(store: Storage) -> Result<unit, string> {
         requests: controls.list_of("requests", "Saved requests", snapshot(labels)),
         method: controls.entry_of("method", "Method", "GET"),
         url: controls.entry_of("url", "URL", ""),
+        headers: header_editors([]),
+        body: controls.entry_of("body", "Body", ""),
+        env: controls.entry_of("env", "Environment", ""),
         send: controls.button_of("send", "Send"),
-        body: "",
+        save: controls.button_of("save", "Save"),
+        response: "",
         scroll: 0.0,
         status: concat(str(len(items)), " request(s) loaded"),
         focused: "requests"
@@ -539,12 +752,29 @@ pub fn run(store: Storage) -> Result<unit, string> {
                             switch send_now(store, st) {
                                 Ok(r) {
                                     st = with st {
-                                        body: response_text(r),
+                                        response: response_text(r),
                                         scroll: 0.0,
                                         status: concat("HTTP ", str(r.status), " in ", str(r.elapsed_millis), " ms")
                                     }
                                 }
-                                Err(why) { st = with st { body: "", scroll: 0.0, status: concat("error: ", why) } }
+                                Err(why) { st = with st { response: "", scroll: 0.0, status: concat("error: ", why) } }
+                            }
+                        }
+                        if stepped.save {
+                            switch save_now(store, st) {
+                                Ok(said) {
+                                    // The sidebar labels come from the collection, so a saved edit
+                                    // that renamed nothing still needs the items reloaded: the
+                                    // request behind the selected row is now a different value.
+                                    switch load_items(store) {
+                                        Ok(fresh) { st = with st { items: fresh, status: said } }
+                                        Err(why) { st = with st { status: concat(
+                                            "saved, but reloading failed: ",
+                                            why
+                                        ) } }
+                                    }
+                                }
+                                Err(why) { st = with st { status: concat("save failed: ", why) } }
                             }
                         }
                     }

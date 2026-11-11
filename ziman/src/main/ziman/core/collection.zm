@@ -188,6 +188,70 @@ fn node_add(node: Node, segments: [string], leaf: string, request: SavedRequest,
     return ok(with node { folders: snapshot(folders) })
 }
 
+// Replaces the request at `path`, **keeping its position**. Refuses if nothing is there.
+//
+// **The counterpart to `add_request`, and the reason both exist.** `add_request` refuses an
+// occupied path, which is right for its callers: adding over something is a mistake worth catching.
+// Saving an edit is the opposite -- the request is meant to be there -- and doing it as a remove
+// followed by an add works but **moves the request to the end of its folder**, so a user who saves
+// watches their list reorder itself under them. The web frontend never had the problem because it
+// sends the whole collection back with one entry swapped (`withRequestReplaced` in
+// `collectionTree.ts`); this is that, on this side.
+pub fn replace_request(c: Collection, path: string, request: SavedRequest) -> Result<Collection, string> {
+    val parts = split_request_path(path)
+    return ok(collection_with(c, try node_replace(node_of(c), parts.segments, parts.leaf, request, path)))
+}
+
+fn node_replace(
+    node: Node,
+    segments: [string],
+    leaf: string,
+    request: SavedRequest,
+    path: string
+) -> Result<Node, string> {
+    if len(segments) == 0 {
+        val requests = mutable_array_new<SavedRequest>()
+        var found = false
+        for r in node.requests {
+            if r.name == leaf {
+                // The leaf wins over the name the request arrived with, as `node_add` does it, so
+                // the two cannot disagree about what a path means.
+                push(requests, with request { name: leaf })
+                found = true
+            } else {
+                push(requests, r)
+            }
+        }
+        if !found {
+            return err(prelude.format("no request at \"{}\"", path))
+        }
+        return ok(with node { requests: snapshot(requests) })
+    }
+    val head = segments[0]
+    val rest = slice(segments, 1, len(segments))
+    val folders = mutable_array_new<Folder>()
+    var entered = false
+    for f in node.folders {
+        if f.name == head && !entered {
+            val changed = try node_replace(
+                Node { folders: f.folders, requests: f.requests },
+                rest,
+                leaf,
+                request,
+                path
+            )
+            push(folders, folder_with(f, changed))
+            entered = true
+        } else {
+            push(folders, f)
+        }
+    }
+    if !entered {
+        return err(prelude.format("no request at \"{}\"", path))
+    }
+    return ok(with node { folders: snapshot(folders) })
+}
+
 // Adds `request` at `path`, creating any missing folders. Refuses if a request is already there.
 pub fn add_request(c: Collection, path: string, request: SavedRequest) -> Result<Collection, string> {
     val parts = split_request_path(path)

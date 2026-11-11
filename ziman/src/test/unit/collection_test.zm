@@ -14,6 +14,7 @@ use core/collection.find_request
 use core/collection.remove_folder
 use core/collection.remove_request
 use core/collection.rename_or_move_request
+use core/collection.replace_request
 use core/saved.Collection
 use core/saved.SavedRequest
 use test
@@ -336,4 +337,54 @@ fn removing_a_folder_that_is_not_there_says_so_rather_than_failing() {
     test.assert_eq(false, unwrap(remove_folder(c, "Nope/Deeper", false)).removed)
     // An empty path names no folder.
     test.assert_eq(false, unwrap(remove_folder(c, "", false)).removed)
+}
+
+// ---- replace_request
+//
+// **The case that matters is position**, not the swap. Saving an edit as a remove followed by an
+// add produces the right contents and moves the request to the end of its folder, which the curly
+// gui did until a screenshot of the running window showed the sidebar reordering itself. Contents
+// are easy to assert and were never wrong; order is the thing to hold on to.
+
+#[test]
+fn replacing_keeps_the_request_where_it_was() {
+    var c = added(empty_collection(), "first")
+    c = added(c, "second")
+    c = added(c, "third")
+    val changed = with sample_request("second") { method: "PATCH" }
+    val out = unwrap(replace_request(c, "second", changed))
+    test.assert_len(3, out.requests)
+    test.assert_eq("first", out.requests[0].name)
+    test.assert_eq("second", out.requests[1].name)
+    test.assert_eq("third", out.requests[2].name)
+    test.assert_eq("PATCH", out.requests[1].method)
+}
+
+#[test]
+fn replacing_inside_a_folder_keeps_its_place_too() {
+    var c = added(empty_collection(), "Auth/login")
+    c = added(c, "Auth/logout")
+    val changed = with sample_request("login") { url: "https://example.test/new" }
+    val out = unwrap(replace_request(c, "Auth/login", changed))
+    test.assert_len(2, out.folders[0].requests)
+    test.assert_eq("login", out.folders[0].requests[0].name)
+    test.assert_eq("https://example.test/new", out.folders[0].requests[0].url)
+    test.assert_eq("logout", out.folders[0].requests[1].name)
+}
+
+#[test]
+fn replacing_what_is_not_there_is_refused() {
+    val c = added(empty_collection(), "login")
+    test.assert_eq(false, is_ok(replace_request(c, "logout", sample_request("logout"))))
+    // A path through a folder that does not exist is the same refusal, not a created folder --
+    // `add_request` makes folders along the way and this must not, or a typo would build a tree.
+    test.assert_eq(false, is_ok(replace_request(c, "Auth/login", sample_request("login"))))
+    test.assert_len(0, c.folders)
+}
+
+#[test]
+fn the_path_leaf_wins_over_the_name_the_request_carries() {
+    val c = added(empty_collection(), "login")
+    val out = unwrap(replace_request(c, "login", sample_request("something-else")))
+    test.assert_eq("login", out.requests[0].name)
 }

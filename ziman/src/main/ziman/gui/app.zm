@@ -24,6 +24,8 @@
 // so that an ordinary `ziman` does not depend on a display, which means `curly gui` needs the build
 // `make gui` produces. `bin/curly` prefers `ziman-gui` for this subcommand when it can find one,
 // and `run` says so by name when it cannot.
+use a11y
+use atspi
 use clock
 use controls
 use core/collection.find_request
@@ -819,6 +821,7 @@ pub fn run(store: Storage) -> Result<unit, string> {
             var width_pt = start_width as float
             var height_pt = start_height as float
             var closing = false
+            var readable = true
             while !closing {
                 // Laid out once per pass and used for both halves: the scene to draw and the
                 // geometry an input is routed by. Two layouts could disagree, and a press would
@@ -851,6 +854,34 @@ pub fn run(store: Storage) -> Result<unit, string> {
                 }
                 val painted = try desktop.repaint(painter, w, widget.paint(laid, m), options)
                 painter = painted.next
+
+                // **Published when something changed, pumped every frame.** The accessibility tree
+                // describes the same widgets the scene draws, so it is stale in exactly the cases
+                // the scene is -- which `repaint` has already worked out. Republishing an unchanged
+                // tree sixty times a second would be the same waste the damage path exists to
+                // avoid.
+                //
+                // The pump is unconditional because it is the other direction: it lets the bridge
+                // *answer* what a reader has asked, which happens whether or not anything moved.
+                if readable {
+                    switch painted.region {
+                        Some(_) {
+                            switch atspi.publish(a11y.tree_of(laid, "curly", st.focused), "curly") {
+                                Ok(_) { unit }
+                                // **Stop trying rather than fail.** A window with no accessibility
+                                // bus is a window, not an error: this build may have no backend, or
+                                // the session may have no registry. Said once, in the status line,
+                                // and then left alone.
+                                Err(why) {
+                                    readable = false
+                                    st = with st { status: concat("accessibility off: ", why) }
+                                }
+                            }
+                        }
+                        None { unit }
+                    }
+                    atspi.pump()
+                }
 
                 for e in try window.poll(w) {
                     if is_close(e) {

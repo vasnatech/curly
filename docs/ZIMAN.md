@@ -88,6 +88,12 @@ list of system paths — `lib/graphics` has no notion of a system font, so somet
 bytes, and an application that asked the user to find a TrueType file before it would open is not
 standalone.
 
+**A screen reader can read it.** The window publishes its accessibility tree over AT-SPI every time
+something changes and pumps the bridge every frame, so Orca sees the request list, the fields, the
+buttons, the combo box and which control has focus. A ziman without the backend, or a session with
+no accessibility bus, turns it off and says so once in the status line rather than failing -- a
+window that cannot publish is still a window.
+
 It is also **the first application built on ziman's `lib/ui`**. `curly ui` predates that layer and
 has its own rows-and-cells renderer; every part of the widget stack was until now exercised only by
 its own fixtures.

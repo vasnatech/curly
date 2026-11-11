@@ -16,6 +16,18 @@ export default defineConfig(() => ({
   server: {
     port: 1420,
     strictPort: true,
+    // 2a. `/api` is `curly serve` (ziman/src/main/ziman/server/). PROXIED, not reached by an
+    //     absolute URL, because the server refuses a request whose `Origin` does not match its
+    //     `Host` — these commands read and write the user's files, and a server that accepted
+    //     them from any origin would hand every open tab a file-writing API. Through the proxy
+    //     the call leaves this dev server's own origin and arrives same-origin.
+    //
+    //     **`changeOrigin` must stay false** (Vite's default, so it is simply not set): rewriting
+    //     `Host` to the target would make it disagree with the browser's `Origin` and every
+    //     command would be refused. Set CURLY_PORT to match a `curly serve --port`.
+    proxy: {
+      "/api": `http://127.0.0.1:${process.env.CURLY_PORT || 8787}`,
+    },
     host: host || false,
     hmr: host
       ? {

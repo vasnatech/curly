@@ -1,6 +1,9 @@
 <svg width="256" height="256" viewBox="0 0 256 256" xmlns="http://www.w3.org/2000/svg">
-  <!-- curly's own { } mark (crates/curly-gui/assets/icon.svg), rotated 90°
-       for the new Tauri app so the two GUIs' icons are visually distinct. -->
+  <!-- curly's own { } mark, rotated 90° from the egui GUI's original so the two were visually
+       distinct. Both of those GUIs are gone now - the egui crate in 2026-11-09 and the Tauri shell
+       in this commit - and the mark outlived them, which is why it lives in the web app's `public/`
+       rather than in a shell's icon folder. It is the favicon; `curly-256.png` beside it is the
+       rendering the Tauri bundler produced, kept for anywhere that wants a raster. -->
   <g transform="rotate(90 128 128)">
     <rect x="0" y="0" width="256" height="256" rx="48" fill="#232830"/>
     <g fill="none" stroke="#5EEAD4" stroke-width="26" stroke-linecap="round" stroke-linejoin="round">

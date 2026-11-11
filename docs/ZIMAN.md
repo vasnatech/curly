@@ -45,8 +45,9 @@ subcommand is read as a one-shot flag and refused.
 
 Three commands exist here and not in the Rust CLI, and all three are deliberate rather than drift:
 `curly ui`, because a terminal interface is this implementation's own; `curly serve`, because the
-Rust frontend is a Tauri desktop shell that linked `curly-core` into the app directly — there was
-nothing to serve; and `curly gui`, which **means the opposite of what it means in the Rust CLI**.
+Rust frontend was a Tauri desktop shell that linked `curly-core` into the app directly — there was
+nothing to serve (that shell was deleted on 2026-11-11, and `curly serve` is now how the React
+frontend reaches storage at all); and `curly gui`, which **means the opposite of what it means in the Rust CLI**.
 There it prints "the graphical interface is a separate application", left behind when the egui crate
 was deleted in favour of the Tauri app. Here it opens a window.
 
@@ -166,12 +167,22 @@ match a `curly serve --port`).
 `<a download>`, still byte-exact from `body_bytes`. Its first argument is therefore a *name* rather
 than a path, and `ResponsePane.tsx` no longer opens a native save dialog to produce one.
 
-**One Tauri dependency is left, and it is a product decision rather than an oversight**: `App.tsx`'s
-"Open Project…" uses `@tauri-apps/plugin-dialog`'s folder picker. A browser has no equivalent that
-yields an absolute path — `<input webkitdirectory>` gives paths relative to the chosen directory —
-so the honest options are a text field for a path (the app's existing `PathDialog` is the pattern),
-or dropping the in-app switcher and letting `curly serve --data-dir` decide. The `open_project`
-command itself works over HTTP; only the picker does not.
+**The last Tauri dependency is gone, and the shell with it (2026-11-11).** `App.tsx`'s
+"Open Project…" used `@tauri-apps/plugin-dialog`'s folder picker, which a browser has no equivalent
+for: the File System Access API answers an opaque handle and `<input webkitdirectory>` gives paths
+relative to the chosen directory, neither of which is the absolute path `open_project` needs. Of the
+two honest options recorded here — a text field, or dropping the switcher and letting
+`curly serve --data-dir` decide — the first was taken: `OpenProjectDialog` asks for the path, which
+the server then opens. The server runs on the same machine as the files, so this is less convenient
+and no less capable.
+
+With that, nothing reached Tauri and `curly-gui-tauri/src-tauri/` was deleted — 18 tracked files, a
+Rust crate whose `project.rs` the Ziman server had already reimplemented, and four `@tauri-apps`
+npm dependencies. **The directory is still called `curly-gui-tauri` and no longer contains any
+Tauri**, which is a rename waiting to happen rather than a statement about the code.
+
+curly's own mark survived the shell: it was the Tauri bundler's icon source and is now the web app's
+favicon (`public/curly.svg`), which is its third home — the egui GUI had it first.
 
 ## The tests
 

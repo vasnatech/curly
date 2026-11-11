@@ -3,7 +3,7 @@
 A lightweight REST client, written in Rust, with two faces sharing one core:
 
 - **`curly` (CLI)** — a curl-like command-line tool for sending requests and managing saved collections/environments from the terminal. Ships as a native, single-binary executable for Linux, macOS, and Windows.
-- **Curly (GUI)** — a Postman-like desktop app for building, organizing, and inspecting HTTP requests visually. Now a separate **Tauri + React + TypeScript** app (`curly-gui-tauri/`), not bundled into the `curly` binary — see "Using the GUI" below.
+- **Curly (GUI)** — a Postman-like interface for building, organizing, and inspecting HTTP requests visually. There are two, neither bundled into the `curly` binary: a **React/TypeScript web app** (`curly-gui-tauri/`) served by `curly serve`, and **`curly gui`**, a desktop window written in Ziman that needs no server at all. See "Using the GUI" below.
 
 ## Status
 
@@ -25,7 +25,7 @@ See [docs/GUI.md](docs/GUI.md) for the full guide, including Linux build prerequ
 ```sh
 cd curly-gui-tauri
 npm install        # first time only
-npm run tauri dev
+npm run dev          # and `ziman/bin/curly serve` in another terminal
 ```
 
 ## Layout
@@ -39,8 +39,7 @@ curly/
 │       └── curly-cli/    # bin "curly": the clap-based CLI
 ├── ziman/             # the Ziman implementation — see docs/ZIMAN.md
 │   └── src/{main,test}/ziman/
-├── curly-gui-tauri/   # the GUI: Tauri (Rust shell) + React/TypeScript, its own Cargo workspace
-│   ├── src-tauri/     #   Rust shell — Tauri commands wrapping curly-core
+├── curly-gui-tauri/   # the web GUI: React/TypeScript, talking to `curly serve` over HTTP
 │   └── src/           #   React frontend
 ├── docs/
 ├── run-all.sh         # every check, both implementations, plus the cross-check between them
@@ -52,7 +51,7 @@ Ziman one is measured against — `parity.sh` asks both the same questions over 
 tree and diffs the answers, which is what makes "replaces" a claim a test can fail on. The React
 frontend is shared and is not being rewritten.
 
-The Ziman side now has the core, every CLI subcommand, a terminal interface (`curly ui`) and the
-HTTP API the React frontend talks to (`curly serve`) — which replaces the Tauri shell's bridge, the
-last piece of the port. The frontend's own switch from Tauri's `invoke` to `fetch` is one file and
-has not been made yet; [docs/ZIMAN.md](docs/ZIMAN.md) has the change and how to run the server.
+The Ziman side now has the core, every CLI subcommand, a terminal interface (`curly ui`), the HTTP
+API the React frontend talks to (`curly serve`), and a desktop window of its own (`curly gui`) that
+uses no server. The frontend moved from Tauri's `invoke` to `fetch` on 2026-11-11 and the Tauri
+shell was deleted the same day; [docs/ZIMAN.md](docs/ZIMAN.md) has what is there and how to run it.

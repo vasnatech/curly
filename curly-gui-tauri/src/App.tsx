@@ -1,5 +1,4 @@
 import { useEffect, useRef, useState } from "react";
-import { open as openFolderDialog } from "@tauri-apps/plugin-dialog";
 import * as api from "./api";
 import { centralViewEquals, extraTabKey, extraTabToCentralView, type CentralView, type ExtraTab } from "./centralView";
 import { withRequestReplaced } from "./collectionTree";
@@ -7,6 +6,7 @@ import { CollectionTabView } from "./components/CollectionTabView";
 import { EnvironmentTabView } from "./components/EnvironmentTabView";
 import { FolderDialog, type FolderDialogState } from "./components/FolderDialog";
 import { FolderTabView } from "./components/FolderTabView";
+import { OpenProjectDialog, type OpenProjectDialogState } from "./components/OpenProjectDialog";
 import { PathDialog, type PathDialogState } from "./components/PathDialog";
 import { RequestEditor } from "./components/RequestEditor";
 import { ResponsePane } from "./components/ResponsePane";
@@ -63,6 +63,7 @@ export default function App() {
   const [notice, setNotice] = useState<string | null>(null);
   const [saveAsDialog, setSaveAsDialog] = useState<SaveAsDialogState | null>(null);
   const [pathDialog, setPathDialog] = useState<PathDialogState | null>(null);
+  const [openProjectDialog, setOpenProjectDialog] = useState<OpenProjectDialogState | null>(null);
   const [folderDialog, setFolderDialog] = useState<FolderDialogState | null>(null);
   const [collectionsVersion, setCollectionsVersion] = useState(0);
   const [environmentsVersion, setEnvironmentsVersion] = useState(0);
@@ -180,15 +181,22 @@ export default function App() {
    * tabs, since they reference the *previous* project's data — but
    * leaves request tabs alone, so in-progress edits aren't lost just for
    * switching projects. */
-  async function onOpenProject() {
-    let picked: string | string[] | null;
-    try {
-      picked = await openFolderDialog({ directory: true, multiple: false });
-    } catch (e) {
-      setNotice(`failed to open the folder picker: ${e}`);
+  // **Asks for a path rather than opening a picker**, which is the one thing that genuinely changed
+  // when the Tauri shell went. A browser will not hand a page a filesystem path -- the File System
+  // Access API answers an opaque handle on purpose -- and `open_project` needs a path because the
+  // server is what opens it. The server runs on the same machine as the files, so typing one is
+  // less convenient and no less capable.
+  function onOpenProject() {
+    setOpenProjectDialog({ path: project?.root ?? "", error: null });
+  }
+
+  async function confirmOpenProject() {
+    if (!openProjectDialog) return;
+    const picked = openProjectDialog.path.trim();
+    if (!picked) {
+      setOpenProjectDialog({ ...openProjectDialog, error: "a path is required" });
       return;
     }
-    if (!picked || Array.isArray(picked)) return;
     try {
       const info = await api.openProject(picked);
       setProject(info);
@@ -199,9 +207,10 @@ export default function App() {
       setCentralView({ kind: "request" });
       bumpCollectionsVersion();
       setEnvironmentsVersion((v) => v + 1);
+      setOpenProjectDialog(null);
       setNotice(`opened project "${info.label}"`);
     } catch (e) {
-      setNotice(`failed to open project: ${e}`);
+      setOpenProjectDialog({ ...openProjectDialog, error: `${e}` });
     }
   }
 
@@ -625,6 +634,15 @@ export default function App() {
           />
         )}
       </main>
+
+      {openProjectDialog && (
+        <OpenProjectDialog
+          state={openProjectDialog}
+          onChange={(patch) => setOpenProjectDialog((d) => (d ? { ...d, ...patch } : d))}
+          onConfirm={confirmOpenProject}
+          onCancel={() => setOpenProjectDialog(null)}
+        />
+      )}
 
       {saveAsDialog && (
         <SaveAsDialog

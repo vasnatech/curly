@@ -119,13 +119,27 @@ fn naming_of(collection: string, path: string) -> Naming {
 
 // Which pane the lower half is showing.
 //
-// **Two buttons rather than a tab strip, because `lib/ui` has no tab control.** `widget.Role` has
-// `Tab` and `TabList` -- accessibility anticipated one -- and no control builds them yet. Two
-// buttons say the same thing to a user and the wrong thing to a reader, which is the honest state
-// of it until that control exists.
+// **Derived from the tab strip, never stored beside it.** Two fields saying the same thing are two
+// fields that can disagree, and the one a user believes is the one the strip draws -- so the strip
+// holds the answer and this is how the rest of the window asks for it.
 enum Pane {
     Response
     History
+}
+
+val response_tab = 0
+val history_tab = 1
+
+fn showing(s: State) -> Pane {
+    return if s.panes.selected == history_tab { Pane.History } else { Pane.Response }
+}
+
+fn show_pane(s: State, which: Pane) -> State {
+    val at = switch which {
+        Response { response_tab }
+        History { history_tab }
+    }
+    return with s { panes: with s.panes { selected: at } }
 }
 
 struct State {
@@ -161,9 +175,7 @@ struct State {
     // `disabled`: the caret still moves and the text can still be selected.
     response: controls.Entry
     scroll: float
-    pane: Pane
-    show_response: controls.Button
-    show_history: controls.Button
+    panes: controls.Tabs
     // The past exchanges, newest first, and the list that picks one. Read when the pane is opened
     // rather than every frame: history is written by sends, and this window knows when it sent.
     past: [HistoryEntry]
@@ -175,6 +187,8 @@ struct State {
 
 val sidebar_width = 280.0
 val row_height = 30.0
+// Both tabs, and the box the strip is laid out in, come from this one number.
+val tab_width = 100.0
 val gap = 8.0
 
 // ---- building the view
@@ -257,11 +271,10 @@ fn view(s: State, style: controls.Style, m: widget.Metrics) -> widget.Widget {
     // control owns its view now, which is the right place for it -- only the code that moved the
     // caret knows where it went.
     val switcher = widget.fixed_of(0.0, row_height, widget.row_of(gap, [
-        widget.fixed_of(100.0, 0.0, controls.button_widget(s.show_response, style)),
-        widget.fixed_of(100.0, 0.0, controls.button_widget(s.show_history, style)),
+        widget.fixed_of(tab_width * 2.0, 0.0, controls.tabs_widget(s.panes, style)),
         widget.expand(widget.flex())
     ]))
-    val lower = switch s.pane {
+    val lower = switch showing(s) {
         Response { controls.entry_widget(s.response, style, m) }
         History { controls.list_widget(s.history, style) }
     }
@@ -704,22 +717,18 @@ fn step(s: State, input: controls.Input, laid: widget.Laid, style: controls.Styl
         }
         row = row + 1
     }
-    if name == "show-response" {
-        val taken = controls.button_input(after_click.show_response, input, bounds_of(laid, name))
-        val moved = if taken.activated { Pane.Response } else { after_click.pane }
-        return kept(with after_click { show_response: taken.button, pane: moved })
-    }
-    if name == "show-history" {
-        val taken = controls.button_input(after_click.show_history, input, bounds_of(laid, name))
+    if name == "panes" {
+        val taken = controls.tabs_input(after_click.panes, input, bounds_of(laid, name))
         return Step {
-            state: with after_click { show_history: taken.button },
+            state: with after_click { panes: taken.tabs },
             send: false,
             save: false,
             save_as: false,
-            // Re-read on opening rather than every frame: history is written by sends, and a list
-            // that reloaded sixty times a second would be asking the filesystem for an answer that
-            // changes when this window changes it.
-            open_history: taken.activated
+            // Re-read when the history tab is *reached*, not every frame: history is written by
+            // sends, and a list that reloaded sixty times a second would be asking the filesystem
+            // for an answer that changes when this window changes it. `moved` is what makes that
+            // safe -- arriving on a tab already showing reports nothing.
+            open_history: taken.moved && taken.tabs.selected == history_tab
         }
     }
     if name == "history" {
@@ -739,7 +748,7 @@ fn step(s: State, input: controls.Input, laid: widget.Laid, style: controls.Styl
                 response: response_entry(history_text(with_list.past[at])),
                 status: concat("history: ", with_list.past[at].sent_at)
             }
-            return kept(if taken.activated { with chosen { pane: Pane.Response } } else { chosen })
+            return kept(if taken.activated { show_pane(chosen, Pane.Response) } else { chosen })
         }
         return kept(with_list)
     }
@@ -1106,9 +1115,9 @@ pub fn run(store: Storage) -> Result<unit, string> {
         save: controls.button_of("save", "Save"),
         save_as: controls.button_of("save-as", "Save As"),
         add_header: controls.button_of("add-header", "+ header"),
-        pane: Pane.Response,
-        show_response: controls.button_of("show-response", "Response"),
-        show_history: controls.button_of("show-history", "History"),
+        panes: with controls.tabs_of("panes", "Panes", ["Response", "History"]) {
+            tab_width: tab_width
+        },
         past: [],
         history: controls.list_of("history", "History", []),
         naming: Option<Naming>.None,
@@ -1246,8 +1255,7 @@ pub fn run(store: Storage) -> Result<unit, string> {
                                 Ok(entries) {
                                     st = with st {
                                         past: entries,
-                                        history: controls.list_of("history", "History", history_rows(entries)),
-                                        pane: Pane.History
+                                        history: controls.list_of("history", "History", history_rows(entries))
                                     }
                                 }
                                 Err(why) { st = with st { status: concat("history: ", why) } }

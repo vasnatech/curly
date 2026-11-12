@@ -99,12 +99,13 @@ The response is a **read-only text area**, not a column of labels: Tab reaches i
 through it, and a screen reader can be *on* it and read it out. Labels cannot be focused, so before
 this the response was unreachable without a mouse.
 
-**History shares that pane**, under a **Response**/**History** pair of buttons rather than a tab
-strip: `widget.Role` has `Tab` and `TabList` -- accessibility anticipated one -- but no control
-builds them yet, and two buttons say the right thing to a user while saying the wrong thing to a
-reader, which is the honest state of it until that control exists. The list is read from disk when
-it is opened and not every frame, because history is written by sends and this window knows when it
-sent. Moving the selection loads the exchange behind the list; Enter, or the Response button, is
+**History shares that pane**, under a **Response**/**History** tab strip. The strip did not exist
+when this needed one -- `widget.Role` had `Tab` and `TabList` since accessibility was built, and no
+control made them -- so it shipped as two buttons for an afternoon and `lib/ui` gained
+`controls.Tabs` (ziman F280). A screen reader now hears "page tab list, Panes" with "page tab,
+Response, selected", which two buttons could never have said. The list is read from disk when the
+tab is reached and not every frame, because history is written by sends and this window knows when
+it sent. Moving the selection loads the exchange behind the list; Enter, or the Response tab, is
 what leaves the list to go and read it -- the requests list on the left switches on either, because
 it stays on screen either way, but this list *is* the pane, so switching on a move would throw a
 keyboard user out of it on their first Down. A past exchange is rendered by the same text area a

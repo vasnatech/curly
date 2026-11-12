@@ -41,7 +41,8 @@ subcommand is read as a one-shot flag and refused.
 | `cli/` | every subcommand: `init`, `env`, `collections`, `scenario`, `session`, `history`, `run`, one-shot mode |
 | `tui/` | `curly ui` — a terminal runner: browse the saved tree, send a request, read the response |
 | `server/` | `curly serve` — the HTTP API the React frontend talks to |
-| `gui/` | `curly gui` — a desktop window, built on ziman's `lib/ui`, talking to nothing but the network |
+| `gui/state.zm` | what the window *is*: every type it holds, and `step`, which takes a state and an input and answers a new one. Pure, and tested |
+| `gui/app.zm` | the half that cannot be pure: the window, the font, the filesystem, the network |
 
 Three commands exist here and not in the Rust CLI, and all three are deliberate rather than drift:
 `curly ui`, because a terminal interface is this implementation's own; `curly serve`, because the
@@ -175,6 +176,16 @@ something changes and pumps the bridge every frame, so Orca sees the request lis
 buttons, the combo box and which control has focus. A ziman without the backend, or a session with
 no accessibility bus, turns it off and says so once in the status line rather than failing -- a
 window that cannot publish is still a window.
+
+**The window is two modules, and the line between them is testability.** `gui/state.zm` holds
+every type and every function that turns one value into another -- `step(state, input, laid,
+style, metrics)` answers a new state and `view(state, ...)` answers a widget tree -- while
+`gui/app.zm` holds the window, the font, the disk and the network. That is the split `tui/`
+already has one directory over (`tui/app.zm` reads keys; `tui/rows.zm` and `tui/render.zm` take
+values and answer values), and it was arrived at here the same way: there was no way to test a
+thousand lines of new window behaviour without it. `src/test/unit/gui_test.zm` lays the **real**
+`view` out at a window-sized box and asserts what a gesture does -- the font is the only thing
+stubbed.
 
 It is also **the first application built on ziman's `lib/ui`**. `curly ui` predates that layer and
 has its own rows-and-cells renderer; every part of the widget stack was until now exercised only by

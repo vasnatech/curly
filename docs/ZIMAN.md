@@ -66,6 +66,12 @@ headers, body and environment below them, the response under that, Send and Save
 | **Edit** | method, URL, four headers, a raw body, the environment to resolve `{{variables}}` against |
 | **Send** | `core/exec.send` in this process — history written, extractions applied, exactly as `curly ui` does them |
 | **Save** | `replace_request` back into the collection, **keeping the request's position** |
+| **Save As** | a modal dialog naming a collection and a path, then `add_request`, which **refuses a path already taken** |
+
+Save As is how a request is *created*: until it existed this window could only edit what was
+already on disk, so a fresh install had an empty sidebar and no way forward. A collection that does
+not exist yet is created with it, as `curly collections create` would -- refusing there would mean
+leaving the window to run a command and coming back.
 
 Only a raw body is editable: a binary, form or multipart body is shown as what it is and left
 alone, rather than flattened into something that would save back wrong. Headers grow and shrink --

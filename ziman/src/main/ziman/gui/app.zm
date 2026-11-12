@@ -28,6 +28,7 @@ use a11y
 use atspi
 use clock
 use controls
+use core/collection.add_request
 use core/collection.find_request
 use core/collection.replace_request
 use core/exec
@@ -47,6 +48,7 @@ use core/storage.history_entry_of
 use core/storage.list_collections
 use core/storage.list_environments
 use core/storage.load_collection
+use core/storage.load_collection_opt
 use core/storage.load_session
 use core/storage.save_collection
 use core/storage.save_session
@@ -60,6 +62,7 @@ use os
 use paint
 use raster
 use scene
+use uuid
 use widget
 use window
 
@@ -93,6 +96,25 @@ val global_scope = "(global)"
 // scrolls rather than growing, so a longer body is reachable and the layout does not move.
 val body_rows = 6
 
+// The Save As dialog, while it is open.
+struct Naming {
+    collection: controls.Entry
+    path: controls.Entry
+    confirm: controls.Button
+    cancel: controls.Button
+    error: string
+}
+
+fn naming_of(collection: string, path: string) -> Naming {
+    return Naming {
+        collection: controls.entry_of("save-collection", "Collection", collection),
+        path: controls.entry_of("save-path", "Name", path),
+        confirm: controls.button_of("save-confirm", "Save"),
+        cancel: controls.button_of("save-cancel", "Cancel"),
+        error: ""
+    }
+}
+
 struct State {
     items: [Item]
     requests: controls.List
@@ -110,7 +132,12 @@ struct State {
     env: controls.Menu
     send: controls.Button
     save: controls.Button
+    save_as: controls.Button
     add_header: controls.Button
+    // **Open when a request is being named.** `None` is the ordinary state, which is why this is an
+    // `Option` rather than a flag beside the fields: a dialog that is not open has no name being
+    // typed into it, and keeping the three apart lets the closed state hold nothing at all.
+    naming: Option<Naming>
     // **The response is a read-only text area, not a column of labels.**
     //
     // It was labels, and labels are not focusable -- so Tab could not reach the response and the
@@ -136,6 +163,38 @@ fn mono_label(text: string, size: float, style: controls.Style) -> widget.Widget
     return widget.label_of(text, size, style.ink)
 }
 
+// The Save As dialog's contents: two fields and two buttons.
+fn naming_widget(n: Naming, style: controls.Style, m: widget.Metrics) -> widget.Widget {
+    // **Every width is given, and none is `expand`.** A dialog is centred by its own natural size --
+    // `dialog_layer` puts flexible space either side of it -- so a child that asks to fill its
+    // parent is asking the box how big it is while the box is asking the child. The window's own
+    // rows use `fixed_of(0.0, h, ...)` with an `expand` inside precisely because *there* the column
+    // does know its width; here nothing does until this says so.
+    val label_width = 90.0
+    val field_width = 260.0
+    val rows = mutable_array_new<widget.Widget>()
+    push(rows, widget.fixed_of(0.0, row_height, widget.row_of(gap, [
+        widget.fixed_of(label_width, 0.0, mono_label("Collection", 11.0, style)),
+        widget.fixed_of(field_width, 0.0, controls.entry_widget(n.collection, style, m))
+    ])))
+    push(rows, widget.fixed_of(0.0, row_height, widget.row_of(gap, [
+        widget.fixed_of(label_width, 0.0, mono_label("Name", 11.0, style)),
+        widget.fixed_of(field_width, 0.0, controls.entry_widget(n.path, style, m))
+    ])))
+    if len(n.error) > 0 {
+        push(rows, widget.fixed_of(0.0, 16.0, mono_label(n.error, 11.0, style)))
+    }
+    push(rows, widget.fixed_of(0.0, row_height, widget.row_of(gap, [
+        widget.fixed_of(label_width, 0.0, controls.button_widget(n.confirm, style)),
+        widget.fixed_of(label_width, 0.0, controls.button_widget(n.cancel, style))
+    ])))
+    return widget.fixed_of(
+        label_width + gap + field_width,
+        ((row_height + gap) * 3.0) + 16.0,
+        widget.column_of(gap, snapshot(rows))
+    )
+}
+
 fn view(s: State, style: controls.Style, m: widget.Metrics) -> widget.Widget {
     val body_height = (body_rows as float) * 17.0 + 8.0
     val sidebar = widget.column_of(gap, [
@@ -147,7 +206,8 @@ fn view(s: State, style: controls.Style, m: widget.Metrics) -> widget.Widget {
         widget.fixed_of(90.0, 0.0, controls.entry_widget(s.method, style, m)),
         widget.expand(controls.entry_widget(s.url, style, m)),
         widget.fixed_of(90.0, 0.0, controls.button_widget(s.send, style)),
-        widget.fixed_of(90.0, 0.0, controls.button_widget(s.save, style))
+        widget.fixed_of(90.0, 0.0, controls.button_widget(s.save, style)),
+        widget.fixed_of(90.0, 0.0, controls.button_widget(s.save_as, style))
     ])
     val header_widgets = mutable_array_new<widget.Widget>()
     for row in s.headers {
@@ -189,12 +249,25 @@ fn view(s: State, style: controls.Style, m: widget.Metrics) -> widget.Widget {
     ])
     // A margin all round, which a window needs and a fixture does not -- every `lib/ui` example so
     // far laid out to the edges of its own box, so nothing had noticed.
-    return widget.row_of(gap, [
+    val body = widget.row_of(gap, [
         widget.fixed_of(gap, 0.0, widget.flex()),
         widget.fixed_of(sidebar_width, 0.0, sidebar),
         widget.expand(main),
         widget.fixed_of(gap, 0.0, widget.flex())
     ])
+    // **A modal layer, which is what `dialog_layer` is for**: it takes the keys, so Tab cannot walk
+    // out of the dialog into the window behind it. `widget.keyboard_children` holds that rule once
+    // for both the focus and the accessibility tree, so a reader is told about the dialog's
+    // controls and not about the window it covers.
+    return switch s.naming {
+        Some(n) {
+            widget.layered_of([
+                widget.base_layer(body),
+                controls.dialog_layer("save-as", "Save Request As", naming_widget(n, style, m), style)
+            ])
+        }
+        None { body }
+    }
 }
 
 // The response as a read-only text area.
@@ -236,10 +309,11 @@ struct Step {
     state: State
     send: bool
     save: bool
+    save_as: bool
 }
 
 fn kept(s: State) -> Step {
-    return Step { state: s, send: false, save: false }
+    return Step { state: s, send: false, save: false, save_as: false }
 }
 
 // Builds the header rows for a request, padded out to `header_rows` so the layout does not change
@@ -330,7 +404,11 @@ fn is_editable_body(b: Option<saved.SavedBody>) -> bool {
 // The request as the editors have it. One place, so Send and Save cannot disagree about what is
 // being sent and what is being written.
 fn edited_request(s: State, item: Item) -> saved.SavedRequest {
-    val body = if is_editable_body(item.saved.body) {
+    return edited_request_from(s, item.saved)
+}
+
+fn edited_request_from(s: State, source: saved.SavedRequest) -> saved.SavedRequest {
+    val body = if is_editable_body(source.body) {
         val text = s.body.editor.text
         if len(text) == 0 {
             Option<saved.SavedBody>.None
@@ -338,9 +416,9 @@ fn edited_request(s: State, item: Item) -> saved.SavedRequest {
             Option<saved.SavedBody>.Some(saved.SavedBody.Raw(text))
         }
     } else {
-        item.saved.body
+        source.body
     }
-    return with item.saved {
+    return with source {
         method: s.method.editor.text,
         url: s.url.editor.text,
         headers: headers_of(s.headers),
@@ -396,7 +474,66 @@ fn show_request(s: State, item: Item) -> State {
     }
 }
 
+// Everything that happens while the Save As dialog is open.
+//
+// **It is answered before anything else and nothing falls through**, which is what modal means: a
+// dialog that let a stray key reach the window behind it would be a dialog in appearance only.
+// Escape cancels and Enter confirms, because those are the two keys a dialog owes a user who never
+// reaches for the mouse -- `controls.dialog_keys` answers both.
+fn naming_step(
+    s: State,
+    n: Naming,
+    input: controls.Input,
+    laid: widget.Laid,
+    style: controls.Style,
+    m: widget.Metrics
+) -> Step {
+    val answer = controls.dialog_keys(input)
+    if controls.DialogAnswer.is_Cancel(answer) {
+        return kept(with s { naming: Option<Naming>.None })
+    }
+    if controls.DialogAnswer.is_Confirm(answer) {
+        return Step { state: s, send: false, save: false, save_as: true }
+    }
+    val name = controls.target(laid, input, s.focused)
+    if name == "save-collection" {
+        val taken = controls.entry_input(n.collection, input, bounds_of(laid, name), style, m)
+        return kept(with s { naming: Option<Naming>.Some(with n { collection: taken.entry }) })
+    }
+    if name == "save-path" {
+        val taken = controls.entry_input(n.path, input, bounds_of(laid, name), style, m)
+        return kept(with s { naming: Option<Naming>.Some(with n { path: taken.entry }) })
+    }
+    if name == "save-confirm" {
+        val taken = controls.button_input(n.confirm, input, bounds_of(laid, name))
+        val held = with s { naming: Option<Naming>.Some(with n { confirm: taken.button }) }
+        return Step { state: held, send: false, save: false, save_as: taken.activated }
+    }
+    if name == "save-cancel" {
+        val taken = controls.button_input(n.cancel, input, bounds_of(laid, name))
+        if taken.activated {
+            return kept(with s { naming: Option<Naming>.None })
+        }
+        return kept(with s { naming: Option<Naming>.Some(with n { cancel: taken.button }) })
+    }
+    // A press inside the dialog moves the focus within it; one outside is swallowed rather than
+    // reaching the window, which is the other half of modal.
+    return switch input {
+        Press(at) { kept(with s { focused: focus.clicked(laid, at, s.focused) }) }
+        Wheel(_) { kept(s) }
+        Release(_) { kept(s) }
+        Move(_) { kept(s) }
+        KeyDown(_) { kept(s) }
+        KeyUp(_) { kept(s) }
+        Text(_) { kept(s) }
+        Paste(_) { kept(s) }
+    }
+}
+
 fn step(s: State, input: controls.Input, laid: widget.Laid, style: controls.Style, m: widget.Metrics) -> Step {
+    if Some(n) = s.naming {
+        return naming_step(s, n, input, laid, style, m)
+    }
     // Tab moves the focus and reaches no control, which is why it is taken before `target`: a field
     // that saw Tab would type it.
     if is_tab(input) {
@@ -451,6 +588,20 @@ fn step(s: State, input: controls.Input, laid: widget.Laid, style: controls.Styl
         )
         return kept(with after_click { env: taken.menu })
     }
+    if name == "save-as" {
+        val taken = controls.button_input(after_click.save_as, input, bounds_of(laid, "save-as"))
+        val opened = if taken.activated {
+            // Pre-filled from the request in hand, because Save As is almost always "this one, but
+            // called something else" -- an empty dialog would make the common case the long way.
+            switch selected_item(after_click) {
+                Some(item) { Option<Naming>.Some(naming_of(item.collection, concat(item.path, "-copy"))) }
+                None { Option<Naming>.Some(naming_of("", "")) }
+            }
+        } else {
+            after_click.naming
+        }
+        return kept(with after_click { save_as: taken.button, naming: opened })
+    }
     if name == "add-header" {
         val taken = controls.button_input(after_click.add_header, input, bounds_of(laid, "add-header"))
         val grown = if taken.activated {
@@ -467,11 +618,21 @@ fn step(s: State, input: controls.Input, laid: widget.Laid, style: controls.Styl
     }
     if name == "send" {
         val taken = controls.button_input(after_click.send, input, bounds_of(laid, "send"))
-        return Step { state: with after_click { send: taken.button }, send: taken.activated, save: false }
+        return Step {
+            state: with after_click { send: taken.button },
+            send: taken.activated,
+            save: false,
+            save_as: false
+        }
     }
     if name == "save" {
         val taken = controls.button_input(after_click.save, input, bounds_of(laid, "save"))
-        return Step { state: with after_click { save: taken.button }, send: false, save: taken.activated }
+        return Step {
+            state: with after_click { save: taken.button },
+            send: false,
+            save: taken.activated,
+            save_as: false
+        }
     }
     // The header rows are named by position, so one test finds the row and the field at once
     // rather than eight branches naming themselves.
@@ -625,6 +786,48 @@ fn save_now(store: Storage, s: State) -> Result<string, string> {
     val saved_collection = try replace_request(collection, item.path, edited)
     try save_collection(store, saved_collection)
     return ok(concat("saved ", item.collection, "/", item.path))
+}
+
+// Writes the editors to a new path, refusing one that is taken.
+//
+// **`add_request`, not `replace_request`** -- the opposite of Save, and deliberately: adding over
+// something that is already there is how a user loses work they thought they were keeping, and the
+// refusal is the whole value of the two being different functions.
+fn save_as_now(store: Storage, s: State, n: Naming) -> Result<string, string> {
+    val collection_name = trim(n.collection.editor.text)
+    val path = trim(n.path.editor.text)
+    if len(collection_name) == 0 {
+        return err("a collection is required")
+    }
+    if len(path) == 0 {
+        return err("a name is required")
+    }
+    val source = switch selected_item(s) {
+        Some(item) { item.saved }
+        // Nothing selected is not an error here: Save As with an empty sidebar is how the first
+        // request in a fresh collection gets made, which was impossible from this window until now.
+        None { saved.SavedRequest {
+            id: uuid.uuid_new(),
+            name: path,
+            method: "GET",
+            url: "",
+            query_params: [],
+            headers: [],
+            body: Option<saved.SavedBody>.None,
+            auth: Option<saved.SavedAuth>.None,
+            extract: []
+        } }
+    }
+    val edited = with edited_request_from(s, source) { id: uuid.uuid_new() }
+    val collection = switch try load_collection_opt(store, collection_name) {
+        Some(found) { found }
+        // A collection that does not exist yet is created, as `curly collections create` would:
+        // refusing here would mean leaving the window to run a command and coming back.
+        None { saved.Collection { id: uuid.uuid_new(), name: collection_name, folders: [], requests: [] } }
+    }
+    val grown = try add_request(collection, path, edited)
+    try save_collection(store, grown)
+    return ok(concat("saved ", collection_name, "/", path))
 }
 
 fn response_text(r: ResponseSummary) -> string {
@@ -805,7 +1008,9 @@ pub fn run(store: Storage) -> Result<unit, string> {
         env: controls.choice_of("env", "Environment", snapshot(scopes), 0),
         send: controls.button_of("send", "Send"),
         save: controls.button_of("save", "Save"),
+        save_as: controls.button_of("save-as", "Save As"),
         add_header: controls.button_of("add-header", "+ header"),
+        naming: Option<Naming>.None,
         response: response_entry(""),
         scroll: 0.0,
         status: concat(str(len(items)), " request(s) loaded"),
@@ -933,6 +1138,32 @@ pub fn run(store: Storage) -> Result<unit, string> {
                                     scroll: 0.0,
                                     status: concat("error: ", why)
                                 } }
+                            }
+                        }
+                        if stepped.save_as {
+                            if Some(n) = st.naming {
+                                switch save_as_now(store, st, n) {
+                                    Ok(said) {
+                                        switch load_items(store) {
+                                            Ok(fresh) {
+                                                st = with st {
+                                                    items: fresh,
+                                                    naming: Option<Naming>.None,
+                                                    status: said
+                                                }
+                                            }
+                                            Err(why) {
+                                                st = with st { status: concat("saved, but reloading failed: ", why) }
+                                            }
+                                        }
+                                    }
+                                    // **The dialog stays open and says why**, which is the whole
+                                    // point of refusing a taken path: closing it would throw away
+                                    // what the user typed along with the message about it.
+                                    Err(why) {
+                                        st = with st { naming: Option<Naming>.Some(with n { error: why }) }
+                                    }
+                                }
                             }
                         }
                         if stepped.save {

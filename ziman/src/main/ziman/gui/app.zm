@@ -453,7 +453,7 @@ pub fn run(store: Storage) -> Result<unit, string> {
                     // viewport turned out to be** -- and a thumb's length is the view's share of
                     // the content. The alternative was to lay the window out, read the extents and
                     // lay it out again, which measured at 5 ms a frame over 200 rows.
-                    val scene_now = controls.paint_scroll_bars(laid, with_focus, style, 8.0)
+                    val scene_now = controls.paint_scroll_bars(laid, with_focus, style)
                     val painted = try desktop.repaint(painter, w, scene_now, options)
                     painter = painted.next
 

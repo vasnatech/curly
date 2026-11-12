@@ -42,11 +42,13 @@ use core/saved.environment_set
 use core/saved.into_request
 use core/saved.resolve as resolve_request
 use core/scenario_run.merged_variables
+use core/storage.HistoryEntry
 use core/storage.Storage
 use core/storage.append_history
 use core/storage.history_entry_of
 use core/storage.list_collections
 use core/storage.list_environments
+use core/storage.list_history
 use core/storage.load_collection
 use core/storage.load_collection_opt
 use core/storage.load_session
@@ -115,6 +117,17 @@ fn naming_of(collection: string, path: string) -> Naming {
     }
 }
 
+// Which pane the lower half is showing.
+//
+// **Two buttons rather than a tab strip, because `lib/ui` has no tab control.** `widget.Role` has
+// `Tab` and `TabList` -- accessibility anticipated one -- and no control builds them yet. Two
+// buttons say the same thing to a user and the wrong thing to a reader, which is the honest state
+// of it until that control exists.
+enum Pane {
+    Response
+    History
+}
+
 struct State {
     items: [Item]
     requests: controls.List
@@ -148,6 +161,13 @@ struct State {
     // `disabled`: the caret still moves and the text can still be selected.
     response: controls.Entry
     scroll: float
+    pane: Pane
+    show_response: controls.Button
+    show_history: controls.Button
+    // The past exchanges, newest first, and the list that picks one. Read when the pane is opened
+    // rather than every frame: history is written by sends, and this window knows when it sent.
+    past: [HistoryEntry]
+    history: controls.List
     // One line under everything: what just happened, or what went wrong.
     status: string
     focused: string
@@ -236,14 +256,22 @@ fn view(s: State, style: controls.Style, m: widget.Metrics) -> widget.Widget {
     // scroll measures as nothing, so wrapping one in another collapsed the pane to a sliver. The
     // control owns its view now, which is the right place for it -- only the code that moved the
     // caret knows where it went.
-    val response = controls.entry_widget(s.response, style, m)
+    val switcher = widget.fixed_of(0.0, row_height, widget.row_of(gap, [
+        widget.fixed_of(100.0, 0.0, controls.button_widget(s.show_response, style)),
+        widget.fixed_of(100.0, 0.0, controls.button_widget(s.show_history, style)),
+        widget.expand(widget.flex())
+    ]))
+    val lower = switch s.pane {
+        Response { controls.entry_widget(s.response, style, m) }
+        History { controls.list_widget(s.history, style) }
+    }
     val editors_height = 16.0 + 4.0 + ((row_height + 4.0) * ((len(s.headers) + 1) as float)) + 16.0 + 4.0 + body_height + 4.0 + row_height + 8.0
     val main = widget.column_of(gap, [
         widget.fixed_of(0.0, gap, widget.flex()),
         widget.fixed_of(0.0, row_height, bar),
         widget.fixed_of(0.0, editors_height, editors),
-        widget.fixed_of(0.0, 16.0, mono_label("Response", 11.0, style)),
-        widget.expand(response),
+        switcher,
+        widget.expand(lower),
         widget.fixed_of(0.0, 18.0, mono_label(s.status, 11.0, style)),
         widget.fixed_of(0.0, gap, widget.flex())
     ])
@@ -310,10 +338,11 @@ struct Step {
     send: bool
     save: bool
     save_as: bool
+    open_history: bool
 }
 
 fn kept(s: State) -> Step {
-    return Step { state: s, send: false, save: false, save_as: false }
+    return Step { state: s, send: false, save: false, save_as: false, open_history: false }
 }
 
 // Builds the header rows for a request, padded out to `header_rows` so the layout does not change
@@ -493,7 +522,7 @@ fn naming_step(
         return kept(with s { naming: Option<Naming>.None })
     }
     if controls.DialogAnswer.is_Confirm(answer) {
-        return Step { state: s, send: false, save: false, save_as: true }
+        return Step { state: s, send: false, save: false, save_as: true, open_history: false }
     }
     val name = controls.target(laid, input, s.focused)
     if name == "save-collection" {
@@ -507,7 +536,7 @@ fn naming_step(
     if name == "save-confirm" {
         val taken = controls.button_input(n.confirm, input, bounds_of(laid, name))
         val held = with s { naming: Option<Naming>.Some(with n { confirm: taken.button }) }
-        return Step { state: held, send: false, save: false, save_as: taken.activated }
+        return Step { state: held, send: false, save: false, save_as: taken.activated, open_history: false }
     }
     if name == "save-cancel" {
         val taken = controls.button_input(n.cancel, input, bounds_of(laid, name))
@@ -622,7 +651,8 @@ fn step(s: State, input: controls.Input, laid: widget.Laid, style: controls.Styl
             state: with after_click { send: taken.button },
             send: taken.activated,
             save: false,
-            save_as: false
+            save_as: false,
+            open_history: false
         }
     }
     if name == "save" {
@@ -631,7 +661,8 @@ fn step(s: State, input: controls.Input, laid: widget.Laid, style: controls.Styl
             state: with after_click { save: taken.button },
             send: false,
             save: taken.activated,
-            save_as: false
+            save_as: false,
+            open_history: false
         }
     }
     // The header rows are named by position, so one test finds the row and the field at once
@@ -672,6 +703,45 @@ fn step(s: State, input: controls.Input, laid: widget.Laid, style: controls.Styl
             return kept(with after_click { headers: header_row_set(after_click.headers, row, replaced) })
         }
         row = row + 1
+    }
+    if name == "show-response" {
+        val taken = controls.button_input(after_click.show_response, input, bounds_of(laid, name))
+        val moved = if taken.activated { Pane.Response } else { after_click.pane }
+        return kept(with after_click { show_response: taken.button, pane: moved })
+    }
+    if name == "show-history" {
+        val taken = controls.button_input(after_click.show_history, input, bounds_of(laid, name))
+        return Step {
+            state: with after_click { show_history: taken.button },
+            send: false,
+            save: false,
+            save_as: false,
+            // Re-read on opening rather than every frame: history is written by sends, and a list
+            // that reloaded sixty times a second would be asking the filesystem for an answer that
+            // changes when this window changes it.
+            open_history: taken.activated
+        }
+    }
+    if name == "history" {
+        val taken = controls.list_input(after_click.history, input, bounds_of(laid, "history"))
+        val with_list = with after_click { history: taken.list }
+        val at = taken.list.selected
+        if (taken.moved || taken.activated) && at >= 0 && at < len(with_list.past) {
+            // Showing a past exchange puts it where a fresh one goes, so there is one place a
+            // response is read and one way it looks.
+            //
+            // **Moving loads it; only activating leaves the list.** The requests list on the left
+            // switches on either, because it stays on screen either way -- this one *is* the pane,
+            // so switching on a move would throw a user out of the list on their first Down and
+            // make it unreachable by keyboard. Selecting fills the response behind it; Enter, or
+            // the Response button, is how you go and read it.
+            val chosen = with with_list {
+                response: response_entry(history_text(with_list.past[at])),
+                status: concat("history: ", with_list.past[at].sent_at)
+            }
+            return kept(if taken.activated { with chosen { pane: Pane.Response } } else { chosen })
+        }
+        return kept(with_list)
     }
     if name == "response" {
         // The arrows read a long response rather than moving an invisible cursor around inside one:
@@ -828,6 +898,32 @@ fn save_as_now(store: Storage, s: State, n: Naming) -> Result<string, string> {
     val grown = try add_request(collection, path, edited)
     try save_collection(store, grown)
     return ok(concat("saved ", collection_name, "/", path))
+}
+
+// A past exchange, read the same way a fresh one is.
+fn history_text(e: HistoryEntry) -> string {
+    val out = mutable_array_new<string>()
+    push(out, concat(e.method, " ", e.url))
+    push(out, concat("sent ", e.sent_at))
+    push(out, concat("HTTP ", str(e.status), "  ", str(e.elapsed_ms), " ms"))
+    for h in e.response_headers {
+        push(out, concat(h.name, ": ", h.value))
+    }
+    push(out, "")
+    push(out, e.response_body)
+    if e.response_body_truncated {
+        push(out, "... truncated when it was recorded")
+    }
+    return join(separator: "\n", pieces: snapshot(out))
+}
+
+// One row per exchange: what was asked and what came back, which is what a user scans for.
+fn history_rows(entries: [HistoryEntry]) -> [string] {
+    val rows = mutable_array_new<string>()
+    for e in entries {
+        push(rows, concat(str(e.status), "  ", e.method, " ", e.url, "   ", e.sent_at))
+    }
+    return snapshot(rows)
 }
 
 fn response_text(r: ResponseSummary) -> string {
@@ -1010,6 +1106,11 @@ pub fn run(store: Storage) -> Result<unit, string> {
         save: controls.button_of("save", "Save"),
         save_as: controls.button_of("save-as", "Save As"),
         add_header: controls.button_of("add-header", "+ header"),
+        pane: Pane.Response,
+        show_response: controls.button_of("show-response", "Response"),
+        show_history: controls.button_of("show-history", "History"),
+        past: [],
+        history: controls.list_of("history", "History", []),
         naming: Option<Naming>.None,
         response: response_entry(""),
         scroll: 0.0,
@@ -1138,6 +1239,18 @@ pub fn run(store: Storage) -> Result<unit, string> {
                                     scroll: 0.0,
                                     status: concat("error: ", why)
                                 } }
+                            }
+                        }
+                        if stepped.open_history {
+                            switch list_history(store, 100) {
+                                Ok(entries) {
+                                    st = with st {
+                                        past: entries,
+                                        history: controls.list_of("history", "History", history_rows(entries)),
+                                        pane: Pane.History
+                                    }
+                                }
+                                Err(why) { st = with st { status: concat("history: ", why) } }
                             }
                         }
                         if stepped.save_as {

@@ -67,6 +67,7 @@ headers, body and environment below them, the response under that, Send and Save
 | **Send** | `core/exec.send` in this process — history written, extractions applied, exactly as `curly ui` does them |
 | **Save** | `replace_request` back into the collection, **keeping the request's position** |
 | **Save As** | a modal dialog naming a collection and a path, then `add_request`, which **refuses a path already taken** |
+| **History** | every past exchange on disk, read back into the same response pane |
 
 Save As is how a request is *created*: until it existed this window could only edit what was
 already on disk, so a fresh install had an empty sidebar and no way forward. A collection that does
@@ -97,6 +98,17 @@ standalone.
 The response is a **read-only text area**, not a column of labels: Tab reaches it, the arrows read
 through it, and a screen reader can be *on* it and read it out. Labels cannot be focused, so before
 this the response was unreachable without a mouse.
+
+**History shares that pane**, under a **Response**/**History** pair of buttons rather than a tab
+strip: `widget.Role` has `Tab` and `TabList` -- accessibility anticipated one -- but no control
+builds them yet, and two buttons say the right thing to a user while saying the wrong thing to a
+reader, which is the honest state of it until that control exists. The list is read from disk when
+it is opened and not every frame, because history is written by sends and this window knows when it
+sent. Moving the selection loads the exchange behind the list; Enter, or the Response button, is
+what leaves the list to go and read it -- the requests list on the left switches on either, because
+it stays on screen either way, but this list *is* the pane, so switching on a move would throw a
+keyboard user out of it on their first Down. A past exchange is rendered by the same text area a
+fresh one is, so there is one place a response is read and one way it looks.
 
 **A screen reader can read it.** The window publishes its accessibility tree over AT-SPI every time
 something changes and pumps the bridge every frame, so Orca sees the request list, the fields, the

@@ -58,8 +58,8 @@ not.
 
 ## `curly gui`
 
-A desktop REST client in a window: the saved requests on the left, method and URL across the top,
-headers, body and environment below them, the response under that, Send and Save on the right.
+A desktop REST client in a window: the saved requests in a tree on the left, method and URL across
+the top, the editors below them, the response under that, Send and Save on the right.
 
 | | |
 |---|---|
@@ -68,6 +68,7 @@ headers, body and environment below them, the response under that, Send and Save
 | **Save** | `replace_request` back into the collection, **keeping the request's position** |
 | **Save As** | a modal dialog naming a collection and a path, then `add_request`, which **refuses a path already taken** |
 | **History** | every past exchange on disk, read back into the same response pane |
+| **Browse** | collections and folders as a tree, with the keyboard contract a tree owes |
 
 Save As is how a request is *created*: until it existed this window could only edit what was
 already on disk, so a fresh install had an empty sidebar and no way forward. A collection that does
@@ -78,6 +79,20 @@ Only a raw body is editable: a binary, form or multipart body is shown as what i
 alone, rather than flattened into something that would save back wrong. The environment is picked
 from the ones on disk, with `(global)` meaning the absence of one rather than an environment named
 that.
+
+**The sidebar is a tree** (ziman F282, written for this), where it was a flat list of
+`collection/path` strings -- the storage has folders and the window did not show them. Branches
+open and close with their mark or with Left and Right, Right steps *into* an open branch, and Left
+from a request climbs to the folder holding it. Its shape survives a save: the reload matches rows
+**by path, not by index**, because saving under a new name adds a row and moves every index below
+it, so carrying the numbers over would reopen the wrong folders and quietly select a different
+request.
+
+**The flat list had been labelling nested requests wrong and nobody had noticed.** A request
+directly in a collection read `demo/missing` while one inside a folder read `local/index` -- the
+folder and the name, with the collection missing -- so two collections with a folder of the same
+name were indistinguishable in the sidebar. The tree shows where a request is, and `Item.label`
+turned out to have no other reader and is gone.
 
 **The editors share a tab strip** -- Headers, Query, Body -- because stacked between the URL and the
 response they left the response a sliver, and a request with eight headers pushed it off the window

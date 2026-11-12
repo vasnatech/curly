@@ -76,9 +76,82 @@ use window
 // One saved request, flattened out of the collection tree so the sidebar can be a plain list.
 struct Item {
     collection: string
+    // Slash-separated from the collection root, `Auth/OAuth/refresh` -- which is what `storage`
+    // addresses a request by, and what the status line and the Save As dialog say.
     path: string
-    label: string
     saved: SavedRequest
+}
+
+// The sidebar: a tree of collections, folders and requests, the requests behind it, and the map
+// from a row of the tree back to one of them.
+//
+// **Parallel arrays rather than a payload on the row.** `controls.TreeRow` is the library's type;
+// a tree carrying an application's value would have to be generic, which in this language means
+// every caller spelling the parameter out. The three are built in one walk and reconciled in one
+// function, which is what a parallel array is usually wrong about and here is not.
+struct Sidebar {
+    tree: controls.Tree
+    items: [Item]
+    // Per row: the index into `items`, or -1 for a collection or a folder.
+    item_of: [int]
+    // Per row: what the row *is*, as a path. The identity a reload matches on, because an index
+    // is not one -- Save As adds a row and everything below it moves.
+    key_of: [string]
+}
+
+fn sidebar_item(s: Sidebar) -> Option<Item> {
+    val at = s.tree.selected
+    if at < 0 || at >= len(s.item_of) {
+        return Option<Item>.None
+    }
+    val which = s.item_of[at]
+    if which < 0 {
+        return Option<Item>.None
+    }
+    return Option<Item>.Some(s.items[which])
+}
+
+// The fresh sidebar wearing the old one's shape: the branches that were open stay open, and the
+// row that was selected stays selected.
+//
+// **Matched by path and not by index.** Saving under a new name adds a row and moves every index
+// below it, so carrying the numbers over would reopen the wrong folders and select a different
+// request -- a reload that silently changes what the editors are showing is worse than one that
+// visibly resets.
+fn relaid(old: Sidebar, fresh: Sidebar) -> Sidebar {
+    val rows = mutable_array_new<controls.TreeRow>()
+    var chosen = 0 - 1
+    val was = if old.tree.selected >= 0 && old.tree.selected < len(old.key_of) {
+        old.key_of[old.tree.selected]
+    } else {
+        ""
+    }
+    var i = 0
+    while i < len(fresh.tree.rows) {
+        val row = fresh.tree.rows[i]
+        val key = fresh.key_of[i]
+        if key == was {
+            chosen = i
+        }
+        var open = row.expanded
+        var at = 0
+        while at < len(old.key_of) {
+            if old.key_of[at] == key {
+                open = old.tree.rows[at].expanded
+            }
+            at = at + 1
+        }
+        push(rows, with row { expanded: open })
+        i = i + 1
+    }
+    val kept_rows = snapshot(rows)
+    return with fresh {
+        tree: with fresh.tree {
+            rows: kept_rows,
+            selected: if chosen >= 0 { chosen } else { fresh.tree.selected },
+            offset: old.tree.offset
+        }
+    }
 }
 
 // One header being edited, with the button that removes it.
@@ -343,8 +416,7 @@ fn auth_value_of(a: AuthEditors) -> Option<saved.SavedAuth> {
 }
 
 struct State {
-    items: [Item]
-    requests: controls.List
+    sidebar: Sidebar
     method: controls.Entry
     url: controls.Entry
     headers: PairTable
@@ -548,7 +620,7 @@ fn view(s: State, style: controls.Style, m: widget.Metrics) -> widget.Widget {
     val sidebar = widget.column_of(gap, [
         widget.fixed_of(0.0, gap, widget.flex()),
         widget.fixed_of(0.0, 18.0, mono_label("Requests", 12.0, style)),
-        widget.expand(controls.list_widget(s.requests, style))
+        widget.expand(controls.tree_widget(s.sidebar.tree, style))
     ])
     val bar = widget.row_of(gap, [
         widget.fixed_of(90.0, 0.0, controls.entry_widget(s.method, style, m)),
@@ -1073,11 +1145,7 @@ fn pair_row_set(rows: [PairRow], index: int, row: PairRow) -> [PairRow] {
 }
 
 fn selected_item(s: State) -> Option<Item> {
-    val index = s.requests.selected
-    if index < 0 || index >= len(s.items) {
-        return Option<Item>.None
-    }
-    return Option<Item>.Some(s.items[index])
+    return sidebar_item(s.sidebar)
 }
 
 fn env_name(s: State) -> Option<string> {
@@ -1194,16 +1262,23 @@ fn step(s: State, input: controls.Input, laid: widget.Laid, style: controls.Styl
     val name = controls.target(laid, input, focused_now)
     val after_click = with dismiss_other_menus(s, name, input) { focused: focused_now }
     if name == "requests" {
-        val taken = controls.list_input(after_click.requests, input, bounds_of(laid, "requests"))
-        val with_list = with after_click { requests: taken.list }
-        // **A moved selection loads the request, not only an activated one.** `ListStep` keeps the
-        // two apart on purpose -- selecting and opening are different intentions -- but for a
-        // request list they are the same one: a user arrowing down the list expects to see what
-        // they have landed on, and a pane still showing the previous request is a trap.
-        if (taken.moved || taken.activated) && taken.list.selected >= 0 && taken.list.selected < len(s.items) {
-            return kept(show_request(with_list, s.items[taken.list.selected]))
+        val taken = controls.tree_input(after_click.sidebar.tree, input, bounds_of(laid, "requests"))
+        val moved_to = with after_click { sidebar: with after_click.sidebar { tree: taken.tree } }
+        // **A moved selection loads the request, not only an activated one.** `TreeStep` keeps
+        // the two apart on purpose -- selecting and opening are different intentions -- but for a
+        // request tree they are the same one: a user arrowing down it expects to see what they
+        // have landed on, and a pane still showing the previous request is a trap.
+        //
+        // **A folder is not a request**, so landing on one leaves the editors alone rather than
+        // blanking them: a user opening a folder on the way to something has not asked to lose
+        // what they were looking at.
+        if taken.moved || taken.activated {
+            switch sidebar_item(moved_to.sidebar) {
+                Some(item) { return kept(show_request(moved_to, item)) }
+                None { return kept(moved_to) }
+            }
         }
-        return kept(with_list)
+        return kept(moved_to)
     }
     if name == "method" {
         val taken = controls.entry_input(after_click.method, input, bounds_of(laid, "method"), style, m)
@@ -1577,32 +1652,82 @@ fn load_font() -> Result<font.FontRef, string> {
 
 // ---- the collections, flattened
 
-fn walk_folder(items: MutableArray<Item>, collection: string, prefix: string, folder: Folder) {
-    for r in folder.requests {
-        push(items, Item {
-            collection: collection,
-            path: concat(prefix, r.name),
-            label: concat(prefix, r.name),
-            saved: r
-        })
+// The sidebar, and the requests behind it, built in one walk.
+//
+// **A parallel array from row to item rather than a payload on the row.** `controls.TreeRow` is
+// the library's type; a tree that carried an application's value would have to be generic, and in
+// this language that means every caller spelling the parameter out. Built together here, the two
+// cannot drift -- which is the thing a parallel array is usually wrong about.
+fn load_sidebar(store: Storage) -> Result<Sidebar, string> {
+    val items = mutable_array_new<Item>()
+    val rows = mutable_array_new<controls.TreeRow>()
+    val item_of = mutable_array_new<int>()
+    val key_of = mutable_array_new<string>()
+    for name in try list_collections(store) {
+        val c = try load_collection(store, name)
+        // **Open, because a sidebar that opened shut shows a user nothing they asked for.** A
+        // collection is the unit someone chose to make; its contents are the point of it.
+        push(rows, controls.tree_branch(name, 0, true))
+        push(item_of, 0 - 1)
+        push(key_of, name)
+        push_requests(items, rows, item_of, key_of, name, "", 1, c.requests)
+        for folder in c.folders {
+            push_folder(items, rows, item_of, key_of, name, concat(folder.name, "/"), 1, folder)
+        }
     }
-    for sub in folder.folders {
-        walk_folder(items, collection, concat(prefix, sub.name, "/"), sub)
+    val tree = with controls.tree_of("requests", "Saved requests", snapshot(rows)) { row_height: 20.0 }
+    return ok(Sidebar {
+        tree: tree,
+        items: snapshot(items),
+        item_of: snapshot(item_of),
+        key_of: snapshot(key_of)
+    })
+}
+
+fn push_requests(
+    items: MutableArray<Item>,
+    rows: MutableArray<controls.TreeRow>,
+    item_of: MutableArray<int>,
+    key_of: MutableArray<string>,
+    collection: string,
+    prefix: string,
+    depth: int,
+    requests: [SavedRequest]
+) {
+    for r in requests {
+        push(rows, controls.tree_row(r.name, depth))
+        push(item_of, len(items))
+        push(key_of, concat(collection, "/", prefix, r.name))
+        push(items, Item { collection: collection, path: concat(prefix, r.name), saved: r })
     }
 }
 
-fn load_items(store: Storage) -> Result<[Item], string> {
-    val items = mutable_array_new<Item>()
-    for name in try list_collections(store) {
-        val c = try load_collection(store, name)
-        for r in c.requests {
-            push(items, Item { collection: name, path: r.name, label: concat(name, "/", r.name), saved: r })
-        }
-        for folder in c.folders {
-            walk_folder(items, name, concat(folder.name, "/"), folder)
-        }
+fn push_folder(
+    items: MutableArray<Item>,
+    rows: MutableArray<controls.TreeRow>,
+    item_of: MutableArray<int>,
+    key_of: MutableArray<string>,
+    collection: string,
+    prefix: string,
+    depth: int,
+    folder: Folder
+) {
+    push(rows, controls.tree_branch(folder.name, depth, true))
+    push(item_of, 0 - 1)
+    push(key_of, concat(collection, "/", prefix))
+    push_requests(items, rows, item_of, key_of, collection, prefix, depth + 1, folder.requests)
+    for sub in folder.folders {
+        push_folder(
+            items,
+            rows,
+            item_of,
+            key_of,
+            collection,
+            concat(prefix, sub.name, "/"),
+            depth + 1,
+            sub
+        )
     }
-    return ok(snapshot(items))
 }
 
 // ---- events this loop reads for itself
@@ -1670,8 +1795,13 @@ val start_height = 700
 pub fn run(store: Storage) -> Result<unit, string> {
     val f = try load_font()
     val m = try widget.metrics_for(f)
-    val style = controls.default_style()
-    val items = try load_items(store)
+    // **The tree's marks have to be characters this font has.** `lib/ui` defaults to triangles,
+    // which is the right default for a toolkit and wrong for this application: the face vendored
+    // here is Caladea, a text face with no U+25B8, and `font.glyphs_of` raises rather than drawing
+    // a blank -- so the first frame died with "the face cannot draw U+25BE". That the field exists
+    // in `Style` is why this is two lines instead of a task.
+    val style = with controls.default_style() { collapsed_mark: ">", expanded_mark: "v" }
+    val sidebar = try load_sidebar(store)
     // The environments on disk, with the absence of one first. Read once: a window that re-read
     // them every frame would be asking the filesystem sixty times a second for an answer that
     // changes when a user runs `curly env create`, which is not something this window does.
@@ -1680,13 +1810,8 @@ pub fn run(store: Storage) -> Result<unit, string> {
     for one in try list_environments(store) {
         push(scopes, one)
     }
-    val labels = mutable_array_new<string>()
-    for one in items {
-        push(labels, one.label)
-    }
     val begin = State {
-        items: items,
-        requests: controls.list_of("requests", "Saved requests", snapshot(labels)),
+        sidebar: sidebar,
         method: controls.entry_of("method", "Method", "GET"),
         url: controls.entry_of("url", "URL", ""),
         headers: pair_table("header", "Header", "+ header", []),
@@ -1709,12 +1834,14 @@ pub fn run(store: Storage) -> Result<unit, string> {
         naming: Option<Naming>.None,
         response: response_entry(""),
         scroll: 0.0,
-        status: concat(str(len(items)), " request(s) loaded"),
+        status: concat(str(len(sidebar.items)), " request(s) loaded"),
         focused: "requests"
     }
-    // The list opens with its first row selected, so the fields open showing that row rather than
-    // blank -- a selection the pane disagrees with is the same trap as a stale one.
-    val opened = if len(items) > 0 { show_request(begin, items[0]) } else { begin }
+    // The tree opens with its first row selected, so the fields open showing a request rather
+    // than blank -- a selection the pane disagrees with is the same trap as a stale one. The
+    // first row is a *collection*, though, so this takes the first request rather than the
+    // selection: selecting it instead would move the user off the top of their own sidebar.
+    val opened = if len(sidebar.items) > 0 { show_request(begin, sidebar.items[0]) } else { begin }
     val options = with raster.options() {
         fonts: [f],
         samples: 1,
@@ -1852,10 +1979,10 @@ pub fn run(store: Storage) -> Result<unit, string> {
                             if Some(n) = st.naming {
                                 switch save_as_now(store, st, n) {
                                     Ok(said) {
-                                        switch load_items(store) {
+                                        switch load_sidebar(store) {
                                             Ok(fresh) {
                                                 st = with st {
-                                                    items: fresh,
+                                                    sidebar: relaid(st.sidebar, fresh),
                                                     naming: Option<Naming>.None,
                                                     status: said
                                                 }
@@ -1880,8 +2007,10 @@ pub fn run(store: Storage) -> Result<unit, string> {
                                     // The sidebar labels come from the collection, so a saved edit
                                     // that renamed nothing still needs the items reloaded: the
                                     // request behind the selected row is now a different value.
-                                    switch load_items(store) {
-                                        Ok(fresh) { st = with st { items: fresh, status: said } }
+                                    switch load_sidebar(store) {
+                                        Ok(fresh) {
+                                            st = with st { sidebar: relaid(st.sidebar, fresh), status: said }
+                                        }
                                         Err(why) { st = with st { status: concat(
                                             "saved, but reloading failed: ",
                                             why

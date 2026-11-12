@@ -4,6 +4,12 @@ Not-yet-committed feature ideas, kept separate from [DESIGN.md](DESIGN.md) §9 (
 
 ## Scenarios — multi-request orchestration (linear + parallel)
 
+> **Built.** `curly scenario {list,show,delete,run}` ships in both implementations and
+> `parity.sh` runs 45 real scenarios through each. What shipped is DESIGN.md §9's M6 entry; **this
+> section is deliberately kept rather than removed**, because M6 points back here for the *why* --
+> the modelling research, the shapes rejected and the reasons. The roadmap's own rule is that a
+> built idea moves out; this is the exception that rule has, and it is the exception on purpose.
+
 **Problem**: `curly run` executes one saved request at a time. Chaining several (e.g. login → create-patient → add-vitals → verify) currently means separate `curly run` invocations, relying on extraction/sessions (shipped, see DESIGN.md §9's FR-10 entry) to pass variables between them. A "scenario" would let a *sequence* of such steps be defined once and executed as a single command — and the user asked for scenarios that support both **linear** (must-happen-in-order) and **parallel** (can-happen-at-the-same-time) steps.
 
 **Explicitly not this**: REQUIREMENTS.md's non-goals list "automated test-suite runners with assertions" as out of v1 scope, deferred to a possible v2. A pure orchestration feature (run these requests, in this order/parallelism, using the existing session-chaining and `--fail`-style status handling) stays on the right side of that line. Adding per-step assertions ("expect status 200," "expect `body.role == 'admin'`") would cross it into test-framework territory — a real scope decision to make explicitly if/when this gets built, not something to back into.
@@ -172,7 +178,35 @@ An ordinary `request` node's 4xx/5xx (or an extraction failure) **halts its own 
 
 A **GUI scenario editor/designer** (a visual sequence/parallel/choice builder) is a real idea for later — raised by the user, explicitly not part of M6, not scoped or committed. Worth its own design pass whenever it's picked up, not backed into as a side effect of building the execution engine first.
 
-### Open questions (unresolved — next session should raise these, not assume answers)
+### Open questions — one answered, one still open (reviewed 2026-11-12)
 
-1. **DAG vs. nesting, finally confirmed?** — every worked example so far has used nesting without objection, and the recursive node format above has been adopted, but the user hasn't explicitly ruled out needing arbitrary "step D depends on both A and C, not just the previous step" dependency edges for some future scenario. Treat nesting as the working default, not a closed decision, until a real scenario surfaces that it can't express.
-2. **Output**: a per-step summary (status/ms/pass-fail, test-report-style) vs. each step's normal `run` output back-to-back vs. something configurable?
+This section asked two things before `curly scenario run` existed. It ships now, so the first is
+answered by what was built and the second is **not** -- a format shipped that its own source calls
+a first pass. What follows is read off the code rather than off the plan.
+
+1. **ANSWERED — DAG vs. nesting: nesting was built, and the caveat still stands.** `core/scenario.zm` has the
+   recursive node format: a `SequenceKind` of `Sequence` or `Parallel`, and a `ChoiceNode` of cases.
+   That expresses "these in order", "these at once" and "branch on a status", and it expresses
+   dependency only as containment. **It is still the working default rather than a closed
+   decision**: a scenario needing "step D depends on both A and C, and not on B in between" cannot
+   be written, and nothing has needed one yet. The day one does, this is a format change rather
+   than an addition, which is the thing worth knowing in advance.
+
+2. **STILL OPEN — output.** What shipped is the flat back-to-back log, and both implementations
+   say in their own source that it is provisional: `core/scenario_run.zm` calls it "a first pass
+   simple enough to build on rather than a settled output format", and DESIGN.md's M6 entry calls
+   it "a genuinely first-pass default ... not a considered final design". A run prints one line per
+   request node in the order it completed (`METHOD  url -> status`, or the error where there was no
+   response), an indented `~ extracted` line under any step that set variables, and a final
+   verdict. No timings, no pass/fail column, nothing configurable.
+
+   **What changed since the question was written is the cost of answering it.** The format is now
+   diffed between the two implementations -- `parity.sh` runs five multi-step scenarios through the
+   Rust binary and the Ziman one and compares the step log, the extractions and the verdict -- so
+   it is pinned by agreement rather than by preference, and changing it means changing it in both.
+   That is the right cost for something that is also a contract, but it is a cost the original
+   question did not have.
+
+   The test-report-style summary the question offered -- status, milliseconds, a pass/fail column
+   -- is still the obvious shape for reading a long scenario at a glance. Nobody has asked for it,
+   and nothing has made the current log painful enough to replace.

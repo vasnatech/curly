@@ -88,6 +88,10 @@ list of system paths — `lib/graphics` has no notion of a system font, so somet
 bytes, and an application that asked the user to find a TrueType file before it would open is not
 standalone.
 
+The response is a **read-only text area**, not a column of labels: Tab reaches it, the arrows read
+through it, and a screen reader can be *on* it and read it out. Labels cannot be focused, so before
+this the response was unreachable without a mouse.
+
 **A screen reader can read it.** The window publishes its accessibility tree over AT-SPI every time
 something changes and pumps the bridge every frame, so Orca sees the request list, the fields, the
 buttons, the combo box and which control has focus. A ziman without the backend, or a session with

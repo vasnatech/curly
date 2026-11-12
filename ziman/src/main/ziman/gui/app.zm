@@ -51,6 +51,7 @@ use core/storage.load_session
 use core/storage.save_collection
 use core/storage.save_session
 use desktop
+use edit
 use focus
 use font
 use fs
@@ -110,8 +111,15 @@ struct State {
     send: controls.Button
     save: controls.Button
     add_header: controls.Button
-    // The response as text, and how far it is scrolled.
-    response: string
+    // **The response is a read-only text area, not a column of labels.**
+    //
+    // It was labels, and labels are not focusable -- so Tab could not reach the response and the
+    // only way to scroll it was the wheel. For a keyboard-only user it was unreachable, and for a
+    // screen reader it was a run of static text with no way to be *on* it. A read-only `Entry` is
+    // reachable, moves a caret through the text with the arrows, and publishes its contents through
+    // `AtkText`, so a reader can read the response out. `readonly` is the difference from
+    // `disabled`: the caret still moves and the text can still be selected.
+    response: controls.Entry
     scroll: float
     // One line under everything: what just happened, or what went wrong.
     status: string
@@ -164,12 +172,11 @@ fn view(s: State, style: controls.Style, m: widget.Metrics) -> widget.Widget {
             widget.expand(widget.flex())
         ]))
     ])
-    val response = widget.named_scroll(
-        "response",
-        0.0,
-        s.scroll,
-        widget.column_of(2.0, body_lines(s.response, style))
-    )
+    // **No scroll of its own around it**: a text area scrolls itself to follow its caret, and a
+    // scroll measures as nothing, so wrapping one in another collapsed the pane to a sliver. The
+    // control owns its view now, which is the right place for it -- only the code that moved the
+    // caret knows where it went.
+    val response = controls.entry_widget(s.response, style, m)
     val editors_height = 16.0 + 4.0 + ((row_height + 4.0) * ((len(s.headers) + 1) as float)) + 16.0 + 4.0 + body_height + 4.0 + row_height + 8.0
     val main = widget.column_of(gap, [
         widget.fixed_of(0.0, gap, widget.flex()),
@@ -190,33 +197,32 @@ fn view(s: State, style: controls.Style, m: widget.Metrics) -> widget.Widget {
     ])
 }
 
-// The response body as one label per line.
+// The response as a read-only text area.
 //
-// **One widget per line rather than one per response**, because a `label` is a single text run and a
-// run has no notion of a newline: a 200-line body as one label would draw 200 lines on top of each
-// other. Capped, because a megabyte of JSON is 20,000 widgets to lay out for a window that can show
-// forty of them -- and the cap is reported rather than silent.
+// **Capped, because a megabyte of JSON is a line widget each.** The pane can show forty lines and
+// laying out twenty thousand to do it is a frame nobody waits for -- so the text is cut and the cut
+// is reported rather than silent. The cap is on lines rather than bytes because lines are what cost
+// anything here.
 val max_lines = 400
 
-fn body_lines(body: string, style: controls.Style) -> [widget.Widget] {
-    val out = mutable_array_new<widget.Widget>()
-    // **Tested on the string, not on the line count.** `split("", "\n")` answers one empty string
-    // rather than none, so a "did we add any lines" counter is 1 for an empty body and the
-    // placeholder below never appeared -- the response pane was simply blank until the first send.
-    if len(body) == 0 {
-        return [widget.fixed_of(0.0, 15.0, mono_label("Pick a request on the left, then press Send.", 11.0, style))]
-    }
-    var shown = 0
-    for line in split(body, "\n") {
-        if shown < max_lines {
-            push(out, widget.fixed_of(0.0, 15.0, mono_label(line, 11.0, style)))
-            shown = shown + 1
+fn response_entry(text: string) -> controls.Entry {
+    val shown = mutable_array_new<string>()
+    var count = 0
+    for line in split(text, "\n") {
+        if count < max_lines {
+            push(shown, line)
+            count = count + 1
         }
     }
-    if shown >= max_lines {
-        push(out, widget.fixed_of(0.0, 15.0, mono_label("... truncated", 11.0, style)))
+    if count >= max_lines {
+        push(shown, "... truncated")
     }
-    return snapshot(out)
+    val body = if len(text) == 0 {
+        "Pick a request on the left, then press Send."
+    } else {
+        join(separator: "\n", pieces: snapshot(shown))
+    }
+    return with controls.text_area_of("response", "Response", body, 2) { readonly: true }
 }
 
 // ---- input
@@ -506,6 +512,14 @@ fn step(s: State, input: controls.Input, laid: widget.Laid, style: controls.Styl
         }
         row = row + 1
     }
+    if name == "response" {
+        // The arrows read a long response rather than moving an invisible cursor around inside one:
+        // `readonly` keeps the caret moving while refusing every edit, and the control scrolls to
+        // follow it. That is the whole reason the response is a field and not a column of labels --
+        // labels cannot be focused, so Tab could not reach it and a reader had no way to be on it.
+        val taken = controls.entry_input(after_click.response, input, bounds_of(laid, "response"), style, m)
+        return kept(with after_click { response: taken.entry })
+    }
     // The wheel over anything else scrolls the response, which is the only scrollable thing here.
     return switch input {
         Wheel(w) { kept(with after_click { scroll: scrolled(after_click, w.vertical) }) }
@@ -524,7 +538,7 @@ val wheel_lines = 3.0
 
 fn scrolled(s: State, vertical: int) -> float {
     var lines = 0
-    for _ in split(s.response, "\n") {
+    for _ in split(s.response.editor.text, "\n") {
         lines = lines + 1
     }
     val content = (lines as float) * line_height
@@ -792,7 +806,7 @@ pub fn run(store: Storage) -> Result<unit, string> {
         send: controls.button_of("send", "Send"),
         save: controls.button_of("save", "Save"),
         add_header: controls.button_of("add-header", "+ header"),
-        response: "",
+        response: response_entry(""),
         scroll: 0.0,
         status: concat(str(len(items)), " request(s) loaded"),
         focused: "requests"
@@ -903,12 +917,16 @@ pub fn run(store: Storage) -> Result<unit, string> {
                             switch send_now(store, st) {
                                 Ok(r) {
                                     st = with st {
-                                        response: response_text(r),
+                                        response: response_entry(response_text(r)),
                                         scroll: 0.0,
                                         status: concat("HTTP ", str(r.status), " in ", str(r.elapsed_millis), " ms")
                                     }
                                 }
-                                Err(why) { st = with st { response: "", scroll: 0.0, status: concat("error: ", why) } }
+                                Err(why) { st = with st {
+                                    response: response_entry(""),
+                                    scroll: 0.0,
+                                    status: concat("error: ", why)
+                                } }
                             }
                         }
                         if stepped.save {

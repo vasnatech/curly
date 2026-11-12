@@ -34,6 +34,7 @@ use core/collection.replace_request
 use core/exec
 use core/exec.ResponseSummary
 use core/extraction.apply
+use core/model
 use core/saved
 use core/saved.Collection
 use core/saved.Folder
@@ -157,6 +158,71 @@ fn show_pane(s: State, which: Pane) -> State {
     return with s { panes: with s.panes { selected: at } }
 }
 
+// The three shapes of authorization a saved request can carry, and the absence of one.
+//
+// **"None" is one of the choices rather than an empty state**, for the reason `(global)` is in the
+// environment picker: `auth` is an `Option`, and a chooser with no way back to the absence of a
+// value is a trap -- a user who picked Basic by mistake could not undo it without editing the file
+// by hand.
+struct AuthEditors {
+    kind: controls.Menu
+    user: controls.Entry
+    secret: controls.Entry
+}
+
+val auth_none = 0
+val auth_basic = 1
+val auth_bearer = 2
+
+fn auth_editors(a: Option<saved.SavedAuth>) -> AuthEditors {
+    var chosen = auth_none
+    var user = ""
+    var secret = ""
+    if Some(one) = a {
+        switch one {
+            Basic(b) {
+                chosen = auth_basic
+                user = b.username
+                secret = b.password
+            }
+            Bearer(t) {
+                chosen = auth_bearer
+                secret = t
+            }
+        }
+    }
+    return AuthEditors {
+        kind: controls.choice_of("auth-kind", "Authorization", ["None", "Basic", "Bearer"], chosen),
+        user: controls.entry_of("auth-user", "Username", user),
+        // **`password_of`, so it is bullets on the screen and bullets on the accessibility bus.**
+        // A Basic password and a Bearer token are both secrets, and this window is the reason
+        // ziman's `lib/ui` has the control at all (F281).
+        secret: controls.password_of("auth-secret", "Password", secret)
+    }
+}
+
+// What a reader calls the secret field, which is not the same word for the two kinds. Applied
+// where the widget is built rather than stored, so the label cannot disagree with the choice.
+fn secret_label(a: AuthEditors) -> string {
+    return if a.kind.items.selected == auth_bearer { "Token" } else { "Password" }
+}
+
+// The authorization the editors have, or `None`. A Basic with nothing typed into it is still a
+// Basic: the user chose it, and silently answering `None` would make the choice look ignored.
+fn auth_value_of(a: AuthEditors) -> Option<saved.SavedAuth> {
+    val at = a.kind.items.selected
+    if at == auth_basic {
+        return Option<saved.SavedAuth>.Some(saved.SavedAuth.Basic(model.BasicAuth {
+            username: a.user.editor.text,
+            password: a.secret.editor.text
+        }))
+    }
+    if at == auth_bearer {
+        return Option<saved.SavedAuth>.Some(saved.SavedAuth.Bearer(a.secret.editor.text))
+    }
+    return Option<saved.SavedAuth>.None
+}
+
 struct State {
     items: [Item]
     requests: controls.List
@@ -164,6 +230,7 @@ struct State {
     url: controls.Entry
     headers: PairTable
     query: PairTable
+    auth: AuthEditors
     // Which editor the middle of the window is showing. Headers, query parameters and a body are
     // three tables deep between the URL and the response, and stacked they pushed the response off
     // the bottom of the window.
@@ -210,7 +277,8 @@ val row_height = 30.0
 val tab_width = 100.0
 val headers_editor = 0
 val query_editor = 1
-val body_editor = 2
+val auth_editor = 2
+val body_editor = 3
 val gap = 8.0
 
 // ---- building the view
@@ -268,6 +336,46 @@ fn table_widget(t: PairTable, style: controls.Style, m: widget.Metrics) -> widge
     return widget.column_of(4.0, snapshot(rows))
 }
 
+// The authorization editor: a picker, and the fields the picked kind needs.
+//
+// **The fields the other kinds need are not drawn at all**, rather than drawn disabled: a Bearer
+// token has no username, and a greyed-out box labelled Username invites a user to wonder what it
+// would do. Not drawing it also keeps it out of the tab order and out of the accessibility tree,
+// which "disabled" does not.
+fn auth_widget(a: AuthEditors, style: controls.Style, m: widget.Metrics) -> widget.Widget {
+    val label_width = 110.0
+    val rows = mutable_array_new<widget.Widget>()
+    push(rows, widget.fixed_of(0.0, row_height, widget.row_of(gap, [
+        widget.fixed_of(label_width, 0.0, mono_label("Authorization", 11.0, style)),
+        widget.fixed_of(160.0, 0.0, controls.menu_title_widget(a.kind, style)),
+        widget.expand(widget.flex())
+    ])))
+    if a.kind.items.selected == auth_basic {
+        push(rows, widget.fixed_of(0.0, row_height, widget.row_of(gap, [
+            widget.fixed_of(label_width, 0.0, mono_label("Username", 11.0, style)),
+            widget.expand(controls.entry_widget(a.user, style, m))
+        ])))
+    }
+    if a.kind.items.selected != auth_none {
+        push(rows, widget.fixed_of(0.0, row_height, widget.row_of(gap, [
+            widget.fixed_of(label_width, 0.0, mono_label(secret_label(a), 11.0, style)),
+            widget.expand(controls.entry_widget(with a.secret { label: secret_label(a) }, style, m))
+        ])))
+    }
+    return widget.column_of(4.0, snapshot(rows))
+}
+
+fn auth_height(a: AuthEditors) -> float {
+    var rows = 1
+    if a.kind.items.selected == auth_basic {
+        rows = rows + 1
+    }
+    if a.kind.items.selected != auth_none {
+        rows = rows + 1
+    }
+    return (row_height + 4.0) * (rows as float)
+}
+
 // What `table_widget` will measure, which the column above it has to know before it is built.
 fn table_height(t: PairTable) -> float {
     return (row_height + 4.0) * ((len(t.rows) + 1) as float)
@@ -293,20 +401,28 @@ fn view(s: State, style: controls.Style, m: widget.Metrics) -> widget.Widget {
     val chosen_editor = if s.editors.selected == query_editor {
         table_widget(s.query, style, m)
     } else {
-        if s.editors.selected == body_editor {
-            widget.fixed_of(0.0, body_height, controls.entry_widget(s.body, style, m))
+        if s.editors.selected == auth_editor {
+            auth_widget(s.auth, style, m)
         } else {
-            table_widget(s.headers, style, m)
+            if s.editors.selected == body_editor {
+                widget.fixed_of(0.0, body_height, controls.entry_widget(s.body, style, m))
+            } else {
+                table_widget(s.headers, style, m)
+            }
         }
     }
     val editor_height = if s.editors.selected == query_editor {
         table_height(s.query)
     } else {
-        if s.editors.selected == body_editor { body_height } else { table_height(s.headers) }
+        if s.editors.selected == auth_editor {
+            auth_height(s.auth)
+        } else {
+            if s.editors.selected == body_editor { body_height } else { table_height(s.headers) }
+        }
     }
     val editors = widget.column_of(4.0, [
         widget.fixed_of(0.0, row_height, widget.row_of(gap, [
-            widget.fixed_of(tab_width * 3.0, 0.0, controls.tabs_widget(s.editors, style)),
+            widget.fixed_of(tab_width * 4.0, 0.0, controls.tabs_widget(s.editors, style)),
             widget.expand(widget.flex())
         ])),
         widget.fixed_of(0.0, editor_height, chosen_editor),
@@ -403,6 +519,55 @@ struct Step {
     save: bool
     save_as: bool
     open_history: bool
+}
+
+// **A press that lands somewhere else closes an open dropdown.** A popup is a layer that lets
+// clicks through, so a press outside it is routed to whatever sits underneath and the menu never
+// sees the input -- it would stay open, hanging over a control the user has already moved on to.
+// Invisible while this window had one dropdown; the moment it had two, pressing one left the other
+// open on top of it. The menu cannot fix this itself: an input it is never handed is an input it
+// cannot answer.
+fn dismiss_other_menus(s: State, name: string, input: controls.Input) -> State {
+    if !is_press(input) {
+        return s
+    }
+    val env_now = if name == "env" || name == "env/items" {
+        s.env
+    } else {
+        with s.env { open: false }
+    }
+    val auth_now = if name == "auth-kind" || name == "auth-kind/items" {
+        s.auth.kind
+    } else {
+        with s.auth.kind { open: false }
+    }
+    return with s { env: env_now, auth: with s.auth { kind: auth_now } }
+}
+
+fn is_press(input: controls.Input) -> bool {
+    return switch input {
+        Press(_) { true }
+        Release(_) { false }
+        Move(_) { false }
+        Wheel(_) { false }
+        KeyDown(_) { false }
+        KeyUp(_) { false }
+        Text(_) { false }
+        Paste(_) { false }
+    }
+}
+
+// The dropdown that is open, if one is -- which the frame needs because a popup is drawn in a
+// layer of its own, under the collapsed control, and where that is cannot be known until the tree
+// has been laid out. One at a time, which `dismiss_other_menus` is what makes true.
+fn open_menu(s: State) -> Option<controls.Menu> {
+    if s.env.open {
+        return Option<controls.Menu>.Some(s.env)
+    }
+    if s.auth.kind.open {
+        return Option<controls.Menu>.Some(s.auth.kind)
+    }
+    return Option<controls.Menu>.None
 }
 
 fn kept(s: State) -> Step {
@@ -521,6 +686,7 @@ fn edited_request_from(s: State, source: saved.SavedRequest) -> saved.SavedReque
         url: s.url.editor.text,
         headers: pairs_of(s.headers),
         query_params: pairs_of(s.query),
+        auth: auth_value_of(s.auth),
         body: body
     }
 }
@@ -661,6 +827,7 @@ fn show_request(s: State, item: Item) -> State {
         url: controls.entry_of("url", "URL", item.saved.url),
         headers: pair_table("header", "Header", "+ header", item.saved.headers),
         query: pair_table("query", "Query", "+ parameter", item.saved.query_params),
+        auth: auth_editors(item.saved.auth),
         body: controls.text_area_of("body", "Body", body_text_of(item.saved.body), body_rows),
         status: concat(item.collection, "/", item.path)
     }
@@ -734,17 +901,18 @@ fn step(s: State, input: controls.Input, laid: widget.Laid, style: controls.Styl
         return kept(with s { focused: moved })
     }
     // A press moves the focus to whatever was pressed, before the press is delivered.
-    val after_click = switch input {
-        Press(at) { with s { focused: focus.clicked(laid, at, s.focused) } }
-        Wheel(_) { s }
-        Release(_) { s }
-        Move(_) { s }
-        KeyDown(_) { s }
-        KeyUp(_) { s }
-        Text(_) { s }
-        Paste(_) { s }
+    val focused_now = switch input {
+        Press(at) { focus.clicked(laid, at, s.focused) }
+        Wheel(_) { s.focused }
+        Release(_) { s.focused }
+        Move(_) { s.focused }
+        KeyDown(_) { s.focused }
+        KeyUp(_) { s.focused }
+        Text(_) { s.focused }
+        Paste(_) { s.focused }
     }
-    val name = controls.target(laid, input, after_click.focused)
+    val name = controls.target(laid, input, focused_now)
+    val after_click = with dismiss_other_menus(s, name, input) { focused: focused_now }
     if name == "requests" {
         val taken = controls.list_input(after_click.requests, input, bounds_of(laid, "requests"))
         val with_list = with after_click { requests: taken.list }
@@ -823,6 +991,23 @@ fn step(s: State, input: controls.Input, laid: widget.Laid, style: controls.Styl
     if in_query.handled {
         val next = with after_click { query: in_query.table }
         return kept(if in_query.dropped { with next { focused: "requests" } } else { next })
+    }
+    if name == "auth-kind" || name == "auth-kind/items" {
+        val taken = controls.menu_input(
+            after_click.auth.kind,
+            input,
+            bounds_of(laid, "auth-kind"),
+            bounds_of(laid, "auth-kind/items")
+        )
+        return kept(with after_click { auth: with after_click.auth { kind: taken.menu } })
+    }
+    if name == "auth-user" {
+        val taken = controls.entry_input(after_click.auth.user, input, bounds_of(laid, name), style, m)
+        return kept(with after_click { auth: with after_click.auth { user: taken.entry } })
+    }
+    if name == "auth-secret" {
+        val taken = controls.entry_input(after_click.auth.secret, input, bounds_of(laid, name), style, m)
+        return kept(with after_click { auth: with after_click.auth { secret: taken.entry } })
     }
     if name == "editors" {
         val taken = controls.tabs_input(after_click.editors, input, bounds_of(laid, name))
@@ -1221,7 +1406,8 @@ pub fn run(store: Storage) -> Result<unit, string> {
         url: controls.entry_of("url", "URL", ""),
         headers: pair_table("header", "Header", "+ header", []),
         query: pair_table("query", "Query", "+ parameter", []),
-        editors: with controls.tabs_of("editors", "Editors", ["Headers", "Query", "Body"]) {
+        auth: auth_editors(Option<saved.SavedAuth>.None),
+        editors: with controls.tabs_of("editors", "Editors", ["Headers", "Query", "Auth", "Body"]) {
             tab_width: tab_width
         },
         body: controls.text_area_of("body", "Body", "", body_rows),
@@ -1277,23 +1463,24 @@ pub fn run(store: Storage) -> Result<unit, string> {
                 val whole = geom.rect_of(0.0, 0.0, width_pt, height_pt)
                 val base = view(st, style, m)
                 val first = widget.layout(base, whole, m)
-                val laid = if st.env.open {
-                    val at = bounds_of(first, "env")
-                    val rows = (len(st.env.items.items) as float) * st.env.items.row_height
-                    widget.layout(
-                        widget.layered_of([
-                            widget.base_layer(base),
-                            controls.menu_popup_layer(
-                                st.env,
-                                style,
-                                geom.rect_of(at.x, at.y + at.height, at.width, rows)
-                            )
-                        ]),
-                        whole,
-                        m
-                    )
-                } else {
-                    first
+                val laid = switch open_menu(st) {
+                    Some(menu) {
+                        val at = bounds_of(first, menu.name)
+                        val rows = (len(menu.items.items) as float) * menu.items.row_height
+                        widget.layout(
+                            widget.layered_of([
+                                widget.base_layer(base),
+                                controls.menu_popup_layer(
+                                    menu,
+                                    style,
+                                    geom.rect_of(at.x, at.y + at.height, at.width, rows)
+                                )
+                            ]),
+                            whole,
+                            m
+                        )
+                    }
+                    None { first }
                 }
                 // **The focus is drawn, which it was not** -- Tab moved it, every control took
                 // its keys, and the window looked identical either way, so the only way to learn

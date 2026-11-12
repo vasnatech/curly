@@ -340,13 +340,28 @@ if [ -x "$ZCLI" ]; then
   # and prints "the graphical interface is a separate application"; the ziman side opens a desktop
   # window (`gui/app.zm`). Checking that they *differ* is what stops this quietly becoming parity
   # again if someone wires the rust side to the same message -- a skipped case would not notice.
+  #
+  # **With no display, and under a timeout, and both for one reason: this check opens a window.**
+  # It passed only because the `ziman` it happened to be handed was a build without the X11
+  # backend. Handed a `ziman-gui`, `curly gui` did exactly what it is supposed to do -- it opened
+  # the window and sat there -- and `run-all.sh` hung for ever with no output and no way to tell
+  # that from a slow test. Clearing the display makes the program say it cannot open one, which is
+  # still the ziman side *reaching for a window* and so still the divergence this asserts; the
+  # timeout is for the next way of hanging, which should fail this script rather than stop it.
   rust_gui="$("$RUST" gui --data-dir "$CURLY" 2>&1 | head -1)" || true
-  zim_gui="$(ZIMAN="$ZIMAN" "$ZCLI" gui --data-dir "$CURLY" 2>&1 | head -1)" || true
+  zim_gui="$(DISPLAY= WAYLAND_DISPLAY= ZIMAN="$ZIMAN" timeout 30 "$ZCLI" gui --data-dir "$CURLY" 2>&1 | head -1)" || true
   case "$rust_gui" in
     *"separate application"*)
       case "$zim_gui" in
         *"separate application"*) bad "cli: gui diverges on purpose" "ziman still prints rust's sentence: [$zim_gui]" ;;
-        *) ok "cli: gui diverges on purpose (rust refuses, ziman has a window)" ;;
+        # **Asserting what it *did* say, not merely that it said something else**, because "did not
+        # print rust's sentence" is also true of a ziman that crashed and of one that printed
+        # nothing because it is still running somewhere. There are two right answers and which one
+        # appears depends on the interpreter this was handed: a build without the X11 backend says
+        # so, and a build with it says it cannot open a display, because the line above clears
+        # both display variables. Either is the ziman side reaching for a window.
+        *"window backend"* | *display*) ok "cli: gui diverges on purpose (rust refuses, ziman reaches for a window)" ;;
+        *) bad "cli: gui diverges on purpose" "ziman neither refused nor reached for a window: [$zim_gui]" ;;
       esac
       ;;
     *) bad "cli: gui diverges on purpose" "rust no longer prints its sentence: [$rust_gui]" ;;

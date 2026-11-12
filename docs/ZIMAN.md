@@ -63,7 +63,7 @@ headers, body and environment below them, the response under that, Send and Save
 
 | | |
 |---|---|
-| **Edit** | method, URL, headers, query parameters, a raw body, the environment to resolve `{{variables}}` against |
+| **Edit** | method, URL, headers, query parameters, authorization, a raw body, the environment to resolve `{{variables}}` against |
 | **Send** | `core/exec.send` in this process — history written, extractions applied, exactly as `curly ui` does them |
 | **Save** | `replace_request` back into the collection, **keeping the request's position** |
 | **Save As** | a modal dialog naming a collection and a path, then `add_request`, which **refuses a path already taken** |
@@ -88,9 +88,23 @@ typing in one typed in the other). Each grows and shrinks -- `+ header` or `+ pa
 each row's `x` removes it, and removing one renames the rows below it because their names are their
 positions.
 
-What the window still cannot edit is **authorization and extraction rules**, which it carries
-through a save untouched: `edited_request_from` builds on the request it loaded, so a field with no
-editor keeps what was on disk rather than being written back empty.
+**Authorization** is its own tab: a picker of None, Basic and Bearer, and the fields the picked
+kind needs. The fields the other kinds need are **not drawn**, rather than drawn disabled -- a
+Bearer token has no username, and a greyed-out box labelled Username invites a user to wonder what
+it would do; not drawing it also keeps it out of the tab order and out of the accessibility tree,
+which "disabled" does not. "None" is one of the three choices rather than an empty state, for the
+same reason `(global)` is in the environment picker: a chooser with no way back to the absence of a
+value is a trap.
+
+**The secret is a masked field**, and this window is why ziman's `lib/ui` has one (F281). It is
+bullets on the screen *and* bullets on the accessibility bus -- read off the real bus, the node is
+`password text: "Password" = "••••••••"`, and the password itself appears nowhere in the tree. The
+one field is relabelled Token for a Bearer and keeps what was typed into it: losing a secret to a
+mis-click in a picker is worse than carrying one across, and either way it is a secret.
+
+What the window still cannot edit is **extraction rules**, which it carries through a save
+untouched: `edited_request_from` builds on the request it loaded, so a field with no editor keeps
+what was on disk rather than being written back empty.
 
 **It depends on no server.** `curly serve` exists so the React frontend can reach the same `.curly`
 storage over HTTP; this does not use it. The same collections are read from the same disk, variables

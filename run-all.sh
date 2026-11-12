@@ -90,6 +90,34 @@ else
   note "SKIPPED (--quick)"
 fi
 
+# ---------------------------------------------------------------- the web frontend
+
+# **The frontend had a type-checker that nothing ran.** `curly-gui-web` is part of this repository
+# and `tsc` is the only thing that reads its 24 TypeScript files, so until this phase existed a
+# change to `api.ts` could be committed with the build broken and every phase above would still
+# read green. It is not part of `--quick` for the same reason the Rust build is not.
+#
+# **Skipped, loudly, when `node_modules` is absent** rather than installing: a gate that reaches the
+# network is a gate that fails on a train, and `npm install` in a check is how a test run starts
+# writing to a lockfile.
+phase "frontend typecheck"
+if [ "$QUICK" = 1 ]; then
+  note "SKIPPED (--quick)"
+elif [ ! -d "$ROOT/curly-gui-web/node_modules" ]; then
+  note "SKIPPED (no curly-gui-web/node_modules -- run 'npm install' there)"
+else
+  log="$(mktemp)"
+  (cd "$ROOT/curly-gui-web" && npm run --silent typecheck) > "$log" 2>&1
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
+    note "PASS tsc --noEmit"
+  else
+    fail "npm run typecheck (exit $rc)"
+    head -12 "$log" | sed 's/^/       /'
+  fi
+  rm -f "$log"
+fi
+
 # ---------------------------------------------------------------- the two against each other
 
 phase "cross-check: both implementations over one .curly tree"

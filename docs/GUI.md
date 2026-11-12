@@ -1,6 +1,6 @@
 # Curly GUI — User Guide
 
-> Status: the GUI is now a **Tauri + React + TypeScript** app, living in `curly-gui-web/` (a sibling of `rust/`), replacing the earlier Rust/egui implementation (`crates/curly-gui`, **deleted 2026-11-09** after a period frozen and parked — see `DESIGN.md`'s M8 and M9 entries). It reaches the same feature set the M8 design pass specified: a sidebar Project/History switcher, a Collections tree with hover "⋯" menus (rename/duplicate/delete; new-folder/new-request/delete-folder; new-folder/new-request/save-all on the collection root), an Environments list with create/edit/delete, multiple request tabs with dirty `"*"` tracking, an editable breadcrumb for renaming, Save/Save As, Variables (ad-hoc overrides)/Authorization/Headers/Body/Extraction sub-tabs, dedicated Collection/Folder/Environment main tabs plus an "Active environment" selector, and a Response pane with Body/Headers/History sub-tabs, JSON syntax highlighting, and search with match navigation. Like the GUI it replaces, it shares the exact same `.curly` storage the CLI reads and writes (NFR-5) — nothing here is a separate data store.
+> Status: this page documents the **React + TypeScript web app** in `curly-gui-web/` (a sibling of `rust/`), served by `curly serve`. It began as a Tauri desktop shell; **that shell was deleted on 2026-11-11** and the directory was renamed from `curly-gui-tauri/` the next day, so where this page still says "Tauri", read it as history. It replaced the earlier Rust/egui implementation (`crates/curly-gui`, **deleted 2026-11-09** after a period frozen and parked — see `DESIGN.md`'s M8 and M9 entries). It reaches the same feature set the M8 design pass specified: a sidebar Project/History switcher, a Collections tree with hover "⋯" menus (rename/duplicate/delete; new-folder/new-request/delete-folder; new-folder/new-request/save-all on the collection root), an Environments list with create/edit/delete, multiple request tabs with dirty `"*"` tracking, an editable breadcrumb for renaming, Save/Save As, Variables (ad-hoc overrides)/Authorization/Headers/Body/Extraction sub-tabs, dedicated Collection/Folder/Environment main tabs plus an "Active environment" selector, and a Response pane with Body/Headers/History sub-tabs, JSON syntax highlighting, and search with match navigation. Like the GUI it replaces, it shares the exact same `.curly` storage the CLI reads and writes (NFR-5) — nothing here is a separate data store.
 
 > **There are two graphical front-ends now, and they are not rivals.** The React app documented
 > below is served by `curly serve` over HTTP; **its Tauri shell was deleted on 2026-11-11** and it is
@@ -11,26 +11,27 @@
 
 ## Launching it
 
-Unlike the CLI (a single `curly` binary), the GUI isn't bundled into that binary yet — it's a separate project you run directly:
+It is a web app and a server, so **two things run**: `curly serve` holds the `.curly` storage and
+answers `/api`, and Vite serves the page.
 
 ```sh
+curly serve                 # in one terminal; --port and --data-dir if you need them
 cd curly-gui-web
-npm install        # first time only
-npm run tauri dev  # launches the dev build (Vite + the Tauri window together)
+npm install                 # first time only
+npm run dev                 # in another; open the URL it prints
 ```
 
-There's no packaged/installable build documented yet (`npm run tauri build` exists and should produce one, but hasn't been exercised as part of this milestone — treat it as untested until someone runs it through).
+**The page reaches the server through Vite's proxy, and that is not a convenience.** `curly serve`
+sends no CORS headers and compares each request's `Origin` against its `Host`, because these
+commands read and write the user's files and a server that answered any origin would hand every
+open tab a file-writing API. The proxy makes the call same-origin. If you moved the server off its
+default port, set `CURLY_PORT` to match so the proxy follows it.
 
-### Linux build prerequisites
+There is no packaged build. `npm run build` type-checks and emits static files, which `curly serve`
+can then serve itself; nothing here has been through a release process.
 
-Tauri v2's Linux webview needs system packages this repo doesn't otherwise require. On Fedora:
-
-```sh
-sudo dnf install webkit2gtk4.1-devel openssl-devel curl wget file libappindicator-gtk3-devel librsvg2-devel libxdo-devel
-sudo dnf group install "c-development"
-```
-
-(Exact package names differ by distro — check Tauri's own prerequisites page for yours.) You'll also want the Tauri CLI available as a cargo subcommand: `cargo install tauri-cli`.
+**No system packages are needed.** The Tauri webview's Fedora prerequisites used to be documented
+here and are gone with the shell — a browser is the runtime now.
 
 ## What's there today
 
@@ -38,7 +39,7 @@ sudo dnf group install "c-development"
 
 The GUI auto-opens a project on launch the same way the CLI resolves storage by default: an auto-detected `.curly` walking up from the process's working directory, `CURLY_DATA_DIR`, or the OS-wide default location (labeled **"Default"** in the sidebar).
 
-**"Open Project…"**, top-right of the sidebar's project label, opens a native folder picker. Pick any directory: if it already has a `.curly` in it, that project opens; if not, one is created there on the spot (same as running `curly init` in that folder). Opening a different project resets the active environment selection and closes any open Collection/Folder/Environment tabs (their data belonged to the previous project) — but leaves your request tabs alone, so in-progress edits aren't lost just for switching projects.
+**"Open Project…"**, top-right of the sidebar's project label, asks for a path. It used to open a native folder picker, and could not keep doing so once the Tauri shell went: **a browser will not give a page a filesystem path** — the File System Access API answers an opaque handle and `<input webkitdirectory>` gives relative names — while `open_project` needs an absolute one, because the *server* is what opens it. So `OpenProjectDialog` asks the user to type or paste it. Give any directory: if it already has a `.curly` in it, that project opens; if not, one is created there on the spot (same as running `curly init` in that folder). Opening a different project resets the active environment selection and closes any open Collection/Folder/Environment tabs (their data belonged to the previous project) — but leaves your request tabs alone, so in-progress edits aren't lost just for switching projects.
 
 ### Sidebar: Project / History
 
@@ -130,11 +131,11 @@ Three sub-tabs:
 
 ## What's not there yet
 
-- **A frontend automated test suite** (Vitest/Playwright) — this milestone's TypeScript side was verified by `tsc --noEmit` plus manual exercise of every feature in the running window, not automated tests. `curly-core`/`curly-cli` keep their existing `cargo test` coverage untouched. (The parked `curly-gui` kept its own until it was deleted on 2026-11-09 -- see DESIGN.md's M8 entry.)
+- **A frontend automated test suite** (Vitest/Playwright) — this milestone's TypeScript side was verified by `npm run typecheck` plus manual exercise of every feature in the running window, not automated tests. `curly-core`/`curly-cli` keep their existing `cargo test` coverage untouched. (The parked `curly-gui` kept its own until it was deleted on 2026-11-09 -- see DESIGN.md's M8 entry.)
 - **Multiple simultaneously-open projects** (M7 — see `DESIGN.md` §9) — unaffected by this rewrite; still one project open at a time.
 - **A GUI scenario editor** — scenarios (`curly scenario`) stay CLI/JSON-file-only, same as before this rewrite.
 - Loading a form/multipart/binary body into the editor isn't supported (same limitation the egui GUI had).
 
 ## A note on this guide's own testing
 
-Every feature described above was manually exercised by the user in the actual running dev-mode window during the session this was built in, checkpoint by checkpoint as each slice landed — including one real bug they caught and got fixed same-session (the Response History sub-tab not live-refreshing when a send completed while it was already open). Nothing here is describing untested code. What *hasn't* happened yet: a packaged/production build (`npm run tauri build`) has never been run, and there's no automated test suite for the frontend — see "What's not there yet" above.
+Every feature described above was manually exercised by the user in the actual running dev-mode window during the session this was built in, checkpoint by checkpoint as each slice landed — including one real bug they caught and got fixed same-session (the Response History sub-tab not live-refreshing when a send completed while it was already open). Nothing here is describing untested code. What *hasn't* happened yet: no packaged or production build has been run, and there's no automated test suite for the frontend — see "What's not there yet" above. That testing predates the move off Tauri; the HTTP path the page takes now was checked by its own socket-level tests and by `parity.sh`, not by re-walking this guide.

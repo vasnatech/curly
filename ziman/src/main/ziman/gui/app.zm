@@ -1866,71 +1866,92 @@ pub fn run(store: Storage) -> Result<unit, string> {
             var height_pt = start_height as float
             var closing = false
             var readable = true
+            // **The laid-out tree outlives the frame that made it**, because the frames that
+            // follow may not make one: it is both what is drawn and what an input is routed by,
+            // and an idle window needs the second long after it has stopped needing the first.
+            var laid = widget.layout(
+                view(st, style, m),
+                geom.rect_of(0.0, 0.0, width_pt, height_pt),
+                m
+            )
+            // **Nothing is rebuilt until something changes it**, and the measurement is the whole
+            // argument. `repaint` skips a scene that has not changed, so the comment here used to
+            // say an idle window "costs this sleep and a poll" -- but everything *before* the
+            // repaint ran anyway: the widget tree rebuilt, laid out, painted into a scene and
+            // diffed against the last one, sixty times a second. With 200 saved requests an idle
+            // `curly gui` burned **66% of a core**; with seven it was 0%, which is why nobody had
+            // noticed. Skipping the whole frame when the state has not moved takes the 200-request
+            // window to 0% as well.
+            var dirty = true
             while !closing {
-                // Laid out once per pass and used for both halves: the scene to draw and the
-                // geometry an input is routed by. Two layouts could disagree, and a press would
-                // land on where a control used to be.
-                // **Laid out twice when the dropdown is open, and only then.** The popup belongs
-                // under the collapsed control, and where that is cannot be known until the tree has
-                // been laid out -- so the first pass finds it and the second puts the popup there.
-                // Computing the position from the layout arithmetic instead would be a second copy
-                // of the layout, in a comment, drifting.
-                val whole = geom.rect_of(0.0, 0.0, width_pt, height_pt)
-                val base = view(st, style, m)
-                val first = widget.layout(base, whole, m)
-                val laid = switch open_menu(st) {
-                    Some(menu) {
-                        val at = bounds_of(first, menu.name)
-                        val rows = (len(menu.items.items) as float) * menu.items.row_height
-                        widget.layout(
-                            widget.layered_of([
-                                widget.base_layer(base),
-                                controls.menu_popup_layer(
-                                    menu,
-                                    style,
-                                    geom.rect_of(at.x, at.y + at.height, at.width, rows)
-                                )
-                            ]),
-                            whole,
-                            m
-                        )
+                if dirty {
+                    // Laid out once per pass and used for both halves: the scene to draw and the
+                    // geometry an input is routed by. Two layouts could disagree, and a press would
+                    // land on where a control used to be.
+                    // **Laid out twice when the dropdown is open, and only then.** The popup belongs
+                    // under the collapsed control, and where that is cannot be known until the tree has
+                    // been laid out -- so the first pass finds it and the second puts the popup there.
+                    // Computing the position from the layout arithmetic instead would be a second copy
+                    // of the layout, in a comment, drifting.
+                    val whole = geom.rect_of(0.0, 0.0, width_pt, height_pt)
+                    val base = view(st, style, m)
+                    val first = widget.layout(base, whole, m)
+                    laid = switch open_menu(st) {
+                        Some(menu) {
+                            val at = bounds_of(first, menu.name)
+                            val rows = (len(menu.items.items) as float) * menu.items.row_height
+                            widget.layout(
+                                widget.layered_of([
+                                    widget.base_layer(base),
+                                    controls.menu_popup_layer(
+                                        menu,
+                                        style,
+                                        geom.rect_of(at.x, at.y + at.height, at.width, rows)
+                                    )
+                                ]),
+                                whole,
+                                m
+                            )
+                        }
+                        None { first }
                     }
-                    None { first }
-                }
-                // **The focus is drawn, which it was not** -- Tab moved it, every control took
-                // its keys, and the window looked identical either way, so the only way to learn
-                // what was focused was to type into something. It also fixes the accessibility
-                // tree being stale: this window republishes when the scene changes, and a focus
-                // move changed nothing a reader could see *because nothing drew it*.
-                val scene_now = widget.paint_focused(laid, m, st.focused, paint.rgb(0.15, 0.4, 0.85), 2.0)
-                val painted = try desktop.repaint(painter, w, scene_now, options)
-                painter = painted.next
+                    // **The focus is drawn, which it was not** -- Tab moved it, every control took
+                    // its keys, and the window looked identical either way, so the only way to learn
+                    // what was focused was to type into something. It also fixes the accessibility
+                    // tree being stale: this window republishes when the scene changes, and a focus
+                    // move changed nothing a reader could see *because nothing drew it*.
+                    val scene_now = widget.paint_focused(laid, m, st.focused, paint.rgb(0.15, 0.4, 0.85), 2.0)
+                    val painted = try desktop.repaint(painter, w, scene_now, options)
+                    painter = painted.next
 
-                // **Published when something changed, pumped every frame.** The accessibility tree
-                // describes the same widgets the scene draws, so it is stale in exactly the cases
-                // the scene is -- which `repaint` has already worked out. Republishing an unchanged
-                // tree sixty times a second would be the same waste the damage path exists to
-                // avoid.
-                //
-                // The pump is unconditional because it is the other direction: it lets the bridge
-                // *answer* what a reader has asked, which happens whether or not anything moved.
-                if readable {
-                    switch painted.region {
-                        Some(_) {
-                            switch atspi.publish(a11y.tree_of(laid, "curly", st.focused), "curly") {
-                                Ok(_) { unit }
-                                // **Stop trying rather than fail.** A window with no accessibility
-                                // bus is a window, not an error: this build may have no backend, or
-                                // the session may have no registry. Said once, in the status line,
-                                // and then left alone.
-                                Err(why) {
-                                    readable = false
-                                    st = with st { status: concat("accessibility off: ", why) }
+                    // **Published when something changed.** The accessibility tree describes
+                    // the same widgets the scene draws, so it is stale in exactly the cases the
+                    // scene is -- which `repaint` has already worked out. Republishing an
+                    // unchanged tree would be the same waste the damage path exists to avoid.
+                    if readable {
+                        switch painted.region {
+                            Some(_) {
+                                switch atspi.publish(a11y.tree_of(laid, "curly", st.focused), "curly") {
+                                    Ok(_) { unit }
+                                    // **Stop trying rather than fail.** A window with no
+                                    // accessibility bus is a window, not an error: this build may
+                                    // have no backend, or the session may have no registry. Said
+                                    // once, in the status line, and then left alone.
+                                    Err(why) {
+                                        readable = false
+                                        st = with st { status: concat("accessibility off: ", why) }
+                                    }
                                 }
                             }
+                            None { unit }
                         }
-                        None { unit }
                     }
+                    dirty = false
+                }
+                // **Pumped every frame, inside no `if`**, because it is the other direction: it
+                // lets the bridge *answer* what a reader has asked, which happens whether or not
+                // anything moved -- and an idle window is exactly when a reader is reading.
+                if readable {
                     atspi.pump()
                 }
 
@@ -1939,15 +1960,26 @@ pub fn run(store: Storage) -> Result<unit, string> {
                         closing = true
                     }
                     // The contents are gone and the scene has not changed, so without this the
-                    // window would stay as the compositor left it.
+                    // window would stay as the compositor left it. **`forget` is not enough on
+                    // its own now**: it clears what `repaint` remembers, and a frame that is
+                    // never built never reaches `repaint` to find out.
                     if is_exposed(e) {
                         painter = desktop.forget(painter)
+                        dirty = true
                     }
                     if Some(size) = resized_to(e) {
                         width_pt = size.width as float
                         height_pt = size.height as float
+                        dirty = true
                     }
                     if Some(input) = desktop.input_of(e, density) {
+                        // **Every input marks the frame dirty, rather than each branch below
+                        // deciding.** A control that took a key and changed nothing a user can
+                        // see is the rare case; one that changed something and did not say so is
+                        // a window that stops repainting, and there is no way to tell from the
+                        // outside which happened. The cheap wrong answer here is a wasted frame;
+                        // the expensive one is a frozen window.
+                        dirty = true
                         val stepped = step(st, input, laid, style, m)
                         st = stepped.state
                         if stepped.send {
@@ -2024,9 +2056,10 @@ pub fn run(store: Storage) -> Result<unit, string> {
                         }
                     }
                 }
-                // **A frame budget, not a frame rate.** `repaint` draws nothing when the scene has
-                // not changed, so an idle window costs this sleep and a poll; a busy one redraws
-                // only what moved.
+                // **A frame budget, not a frame rate.** An idle window now really does cost
+                // this sleep and a poll -- the comment here used to claim that while the frame
+                // above was built, laid out, painted and diffed anyway, and only the last step
+                // was skipped.
                 clock.sleep_millis(16)
             }
             return ok(unit)

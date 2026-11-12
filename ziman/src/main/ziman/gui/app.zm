@@ -1797,9 +1797,11 @@ pub fn run(store: Storage) -> Result<unit, string> {
     val m = try widget.metrics_for(f)
     // **The tree's marks have to be characters this font has.** `lib/ui` defaults to triangles,
     // which is the right default for a toolkit and wrong for this application: the face vendored
-    // here is Caladea, a text face with no U+25B8, and `font.glyphs_of` raises rather than drawing
-    // a blank -- so the first frame died with "the face cannot draw U+25BE". That the field exists
-    // in `Style` is why this is two lines instead of a task.
+    // here is Caladea, a text face with no U+25B8. It used to be worse than wrong -- the first
+    // frame *died*, because `font.glyphs_of` raised on a glyph the face lacked, which ziman F283
+    // then fixed by substituting `.notdef`. With that fix the triangles would draw as Caladea's
+    // own `.notdef`, which has no outline, so every folder would look identical and nothing would
+    // say which was open. That the field exists in `Style` is why this is two lines.
     val style = with controls.default_style() { collapsed_mark: ">", expanded_mark: "v" }
     val sidebar = try load_sidebar(store)
     // The environments on disk, with the absence of one first. Read once: a window that re-read

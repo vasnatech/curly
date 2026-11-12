@@ -866,7 +866,13 @@ pub fn run(store: Storage) -> Result<unit, string> {
                 } else {
                     first
                 }
-                val painted = try desktop.repaint(painter, w, widget.paint(laid, m), options)
+                // **The focus is drawn, which it was not** -- Tab moved it, every control took
+                // its keys, and the window looked identical either way, so the only way to learn
+                // what was focused was to type into something. It also fixes the accessibility
+                // tree being stale: this window republishes when the scene changes, and a focus
+                // move changed nothing a reader could see *because nothing drew it*.
+                val scene_now = widget.paint_focused(laid, m, st.focused, paint.rgb(0.15, 0.4, 0.85), 2.0)
+                val painted = try desktop.repaint(painter, w, scene_now, options)
                 painter = painted.next
 
                 // **Published when something changed, pumped every frame.** The accessibility tree

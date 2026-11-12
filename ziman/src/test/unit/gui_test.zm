@@ -1,0 +1,345 @@
+// `curly gui`'s pure half: what a gesture does to the window, asserted rather than squinted at.
+//
+// **This file is the reason `gui/state.zm` is separate from `gui/app.zm`**, the same split
+// `tui/` already has: `app.zm` opens a window, reads a font and talks to the network, while
+// `state.zm` takes a state and an input and answers a new state. Every case below is one the
+// window was driven by hand to find, and none of them would have been caught twice.
+//
+// `step` needs a laid-out tree to route an input by, so each test lays the real `view` out at a
+// window-sized box with the metrics below. That is not a stub for the layout -- it *is* the
+// layout, with a stub for the font.
+use controls
+use core/saved
+use core/saved.Collection
+use core/saved.Folder
+use core/saved.SavedRequest
+use core/storage
+use focus
+use geom
+use gui/state
+use gui/state.Loaded
+use gui/state.State
+use gui/state.opening_state
+use gui/state.sidebar_of
+use test
+use uuid.uuid_new
+use widget
+
+fn metrics() -> widget.Metrics {
+    return widget.metrics_of(
+        fn(text: string, size: float) -> float { return (len(text) as float) * 7.0 },
+        fn(size: float) -> float { return size * 1.4 }
+    )
+}
+
+fn style() -> controls.Style {
+    return with controls.default_style() { collapsed_mark: ">", expanded_mark: "v" }
+}
+
+val window_box = geom.rect_of(0.0, 0.0, 1100.0, 700.0)
+
+fn request_of(name: string, url: string) -> SavedRequest {
+    return SavedRequest {
+        id: uuid_new(),
+        name: name,
+        method: "GET",
+        url: url,
+        query_params: [],
+        headers: [saved_pair("Accept", "application/json")],
+        body: None,
+        auth: None,
+        extract: []
+    }
+}
+
+fn saved_pair(name: string, value: string) -> saved.KvPair {
+    return saved.kv_pair_of(name, value)
+}
+
+// One collection with two requests and a folder holding a third, which is the shape that made the
+// sidebar a tree in the first place.
+fn demo() -> [Loaded] {
+    return [Loaded {
+        name: "demo",
+        collection: Collection {
+            id: uuid_new(),
+            name: "demo",
+            folders: [Folder {
+                id: uuid_new(),
+                name: "local",
+                folders: [],
+                requests: [request_of("index", "http://127.0.0.1/index")]
+            }],
+            requests: [
+                request_of("hello", "http://127.0.0.1/hello"),
+                request_of("goodbye", "http://127.0.0.1/goodbye")
+            ]
+        }
+    }]
+}
+
+fn opened() -> State {
+    return opening_state(sidebar_of(demo()), ["(global)"])
+}
+
+fn laid_of(s: State) -> widget.Laid {
+    return widget.layout(state.view(s, style(), metrics()), window_box, metrics())
+}
+
+fn acted(s: State, input: controls.Input) -> state.Step {
+    return state.step(s, input, laid_of(s), style(), metrics())
+}
+
+fn pressed(s: State, name: string, dx: float, dy: float) -> state.Step {
+    val box = state.bounds_of(laid_of(s), name)
+    return acted(s, controls.Input.Press(geom.point_of(box.x + dx, box.y + dy)))
+}
+
+fn typed(s: State, k: controls.Key) -> state.Step {
+    return acted(s, controls.Input.KeyDown(controls.keystroke_of(k)))
+}
+
+fn shown_url(s: State) -> string {
+    return s.url.editor.text
+}
+
+// ---- the sidebar
+
+#[test]
+fn a_collection_a_folder_and_three_requests_become_five_rows() {
+    val side = sidebar_of(demo())
+    test.assert_len(5, side.tree.rows)
+    test.assert_len(3, side.items)
+    // The collection row and the folder row map to no request; the three leaves do.
+    test.assert_eq(side.item_of[0], 0 - 1)
+    test.assert_eq(side.key_of[0], "demo")
+    test.assert_eq(side.key_of[3], "demo/local/")
+    test.assert_eq(side.items[2].path, "local/index")
+}
+
+// **The window opens showing a request, not a blank form.** The first *row* is a collection, so
+// opening on the selection would show nothing -- it takes the first item instead.
+#[test]
+fn the_window_opens_on_the_first_request() {
+    test.assert_eq(shown_url(opened()), "http://127.0.0.1/hello")
+}
+
+// A press on a leaf loads it. The row is 20 points tall and `hello` is the second row.
+#[test]
+fn pressing_a_request_row_loads_that_request() {
+    val step = pressed(opened(), "requests", 60.0, 30.0)
+    test.assert_eq(shown_url(step.state), "http://127.0.0.1/hello")
+    val next = pressed(step.state, "requests", 60.0, 50.0)
+    test.assert_eq(shown_url(next.state), "http://127.0.0.1/goodbye")
+}
+
+// **A folder is not a request, so landing on one leaves the editors alone.** A user opening a
+// folder on the way to something has not asked to lose what they were looking at -- and blanking
+// the form would be the obvious implementation.
+#[test]
+fn landing_on_a_folder_leaves_the_editors_alone() {
+    val on_goodbye = pressed(opened(), "requests", 60.0, 50.0).state
+    test.assert_eq(shown_url(on_goodbye), "http://127.0.0.1/goodbye")
+    val on_folder = pressed(on_goodbye, "requests", 60.0, 70.0)
+    test.assert_eq(shown_url(on_folder.state), "http://127.0.0.1/goodbye")
+}
+
+// A press on a branch's mark opens and closes it rather than selecting it.
+#[test]
+fn pressing_the_mark_collapses_the_collection() {
+    val shut = pressed(opened(), "requests", 8.0, 10.0)
+    test.assert_len(1, controls.visible_rows(shut.state.sidebar.tree))
+    val open_again = pressed(shut.state, "requests", 8.0, 10.0)
+    test.assert_len(5, controls.visible_rows(open_again.state.sidebar.tree))
+}
+
+// ---- what the window was driven by hand to find
+
+fn exchange(at: string, url: string, body: string) -> storage.HistoryEntry {
+    return storage.HistoryEntry {
+        sent_at: at,
+        method: "GET",
+        url: url,
+        request_headers: [],
+        request_body: None,
+        request_body_truncated: false,
+        request_auth_kind: None,
+        status: 200,
+        elapsed_ms: 3,
+        response_headers: [],
+        response_body: body,
+        response_body_truncated: false
+    }
+}
+
+// **The entries have to be real.** The first version of these two tests left `past` empty, and
+// the handler skips everything when there is nothing behind the highlighted row -- so both passed
+// against the defect they exist for. Mutation is what said so: putting the old behaviour back
+// changed nothing.
+fn browsing_history() -> State {
+    val entries = [
+        exchange("2026-11-12T10:00:00Z", "http://a.test/one", "first"),
+        exchange("2026-11-12T11:00:00Z", "http://b.test/two", "second")
+    ]
+    val showing = with opened() {
+        past: entries,
+        history: controls.list_of("history", "History", state.history_rows(entries)),
+        // **Focused on the list, because a key goes where the focus is.** Without this the Down
+        // below is routed to the request tree and both tests pass for the wrong reason.
+        focused: "history"
+    }
+    return state.show_pane(showing, state.Pane.History)
+}
+
+// **Moving in the history list loads the exchange; only Enter leaves the list.** Switching the
+// pane on a move threw a keyboard user out of the list on their first Down, which made history
+// unreachable without a mouse. `controls.list_input` reports `moved` for an arrow key *and* for a
+// mouse press, so the two cannot be told apart by the kind of input.
+#[test]
+fn arrowing_the_history_list_does_not_leave_it() {
+    val moved = typed(browsing_history(), controls.Key.Down)
+    test.assert(state.Pane.is_History(state.showing(moved.state)))
+    // It still loaded what it landed on, which is the half that must not be lost in fixing the
+    // other one.
+    test.assert(contains(moved.state.response.editor.text, "second"))
+}
+
+// Enter is what leaves the list, and it shows the exchange the user was on.
+#[test]
+fn enter_on_a_history_row_shows_the_response() {
+    val chosen = typed(browsing_history(), controls.Key.Enter)
+    test.assert(state.Pane.is_Response(state.showing(chosen.state)))
+    test.assert(contains(chosen.state.response.editor.text, "first"))
+}
+
+// **A press anywhere else closes an open dropdown.** A popup is a layer that lets clicks through,
+// so the press is routed to whatever is underneath and the menu never sees it -- it cannot answer
+// an input it is not handed. Invisible while the window had one dropdown; with two, opening one
+// left the other hanging open over it.
+#[test]
+fn a_press_elsewhere_closes_an_open_dropdown() {
+    val s = opened()
+    val opened_menu = with s { env: with s.env { open: true } }
+    test.assert(opened_menu.env.open)
+    val away = pressed(opened_menu, "url", 10.0, 10.0)
+    test.assert_false(away.state.env.open)
+}
+
+// ...and a press on the dropdown itself does not.
+#[test]
+fn a_press_on_the_open_dropdown_leaves_it_open() {
+    val s = opened()
+    val opened_menu = with s { env: with s.env { open: true } }
+    val on_items = state.step(
+        opened_menu,
+        controls.Input.Press(geom.point_of(0.0 - 50.0, 0.0 - 50.0)),
+        laid_of(opened_menu),
+        style(),
+        metrics()
+    )
+    // A press that reaches no control at all must not be read as "somewhere else" either.
+    test.assert_false(on_items.state.env.open)
+}
+
+// ---- the editors
+
+// **A row with no name is not a header**, which is how one is deleted without the `x`.
+#[test]
+fn a_blank_row_is_not_a_header() {
+    val s = opened()
+    test.assert_len(1, state.pairs_of(s.headers))
+    test.assert_eq(state.pairs_of(s.headers)[0].name, "Accept")
+}
+
+// **A field with no editor survives a save; a field with one is taken from it.** The first half
+// is what makes it safe for this window not to have an editor for everything -- `id` and `name`
+// have none and a save must not invent a new identity. The second is the newer half, and the two
+// are easy to get backwards: this test was first written asserting that `query_params` survived,
+// which stopped being true the day they got a tab of their own.
+#[test]
+fn a_save_keeps_what_has_no_editor_and_takes_what_has_one() {
+    val source = with request_of("x", "http://example.test/x") {
+        query_params: [saved_pair("limit", "50")]
+    }
+    val built = state.edited_request_from(opened(), source)
+    test.assert_eq(built.id, source.id)
+    test.assert_eq(built.name, "x")
+    // The editors are the opening ones, which hold no query parameters -- so the saved ones go,
+    // which is what a user emptying the Query tab means.
+    test.assert_len(0, built.query_params)
+
+    // ...and with the tab filled, what is in it is what is written.
+    val s = opened()
+    val filled = with s { query: state.pair_table("query", "Query", "+ parameter", [saved_pair("page", "2")]) }
+    val second = state.edited_request_from(filled, source)
+    test.assert_len(1, second.query_params)
+    test.assert_eq(second.query_params[0].name, "page")
+}
+
+// **A reload matches rows by path, not by index.** Saving under a new name adds a row and moves
+// every index below it, so carrying the numbers over would reopen the wrong folders and select a
+// different request.
+#[test]
+fn a_reload_keeps_the_shape_by_path_and_not_by_index() {
+    val before = sidebar_of(demo())
+    val shut = controls.tree_input(
+        with before.tree { selected: 4 },
+        controls.Input.Press(geom.point_of(24.0, 70.0)),
+        geom.rect_of(0.0, 0.0, 280.0, 400.0)
+    )
+    val collapsed = with before { tree: shut.tree }
+    test.assert_false(collapsed.tree.rows[3].expanded)
+
+    // A request added at the top moves every index below it by one.
+    val grown = sidebar_of([Loaded {
+        name: "demo",
+        collection: Collection {
+            id: uuid_new(),
+            name: "demo",
+            folders: [Folder {
+                id: uuid_new(),
+                name: "local",
+                folders: [],
+                requests: [request_of("index", "http://127.0.0.1/index")]
+            }],
+            requests: [
+                request_of("aardvark", "http://127.0.0.1/aardvark"),
+                request_of("hello", "http://127.0.0.1/hello"),
+                request_of("goodbye", "http://127.0.0.1/goodbye")
+            ]
+        }
+    }])
+    val kept = state.relaid(collapsed, grown)
+    // The folder is still shut though it has moved down a row, and the selection still names the
+    // same thing it named before.
+    test.assert_eq(kept.key_of[4], "demo/local/")
+    test.assert_false(kept.tree.rows[4].expanded)
+    test.assert_eq(kept.key_of[kept.tree.selected], collapsed.key_of[collapsed.tree.selected])
+}
+
+// ---- the keyboard
+
+// Tab moves the focus and reaches no control, which is why `step` takes it before routing.
+#[test]
+fn tab_moves_the_focus_without_reaching_a_control() {
+    val s = opened()
+    val moved = typed(s, controls.Key.Tab)
+    test.assert(moved.state.focused != s.focused)
+    test.assert_false(moved.send)
+    test.assert_false(moved.save)
+}
+
+// Every control the window draws is reachable by Tab, which is the only check that a new editor
+// has been wired into the focus order rather than merely drawn.
+#[test]
+fn every_editor_is_reachable_by_tab() {
+    val s = opened()
+    val names = mutable_array_new<string>()
+    for one in focus.controls(laid_of(s)) {
+        push(names, one.name)
+    }
+    val reachable = snapshot(names)
+    for wanted in ["requests", "method", "url", "send", "save", "save-as", "editors", "panes"] {
+        test.assert(contains(reachable, wanted))
+    }
+}

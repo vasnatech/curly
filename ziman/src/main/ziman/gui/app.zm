@@ -85,10 +85,25 @@ struct Item {
 // removes it, and the buttons are `controls.Button`. What `lib/ui` was actually missing was a
 // *picker* that announces itself as a value rather than a command, which is `controls.choice_of`
 // and is what the environment below uses.
-struct HeaderRow {
+struct PairRow {
     name: controls.Entry
     value: controls.Entry
     remove: controls.Button
+}
+
+// A growable table of name/value rows.
+//
+// **Headers and query parameters are the same thing twice** -- a list of `KvPair`, a row per pair,
+// an `x` that drops one and a button that adds one -- so they are one set of functions with the
+// control-name prefix as an argument rather than two copies with "header" and "query" written
+// through them. The prefix is not decoration: a control is addressed by name, so two tables sharing
+// one would be a single table as far as focus, hit testing and the accessibility tree are
+// concerned, and typing in one would type in the other.
+struct PairTable {
+    kind: string
+    title: string
+    rows: [PairRow]
+    add: controls.Button
 }
 
 // How many empty rows a request opens with, so there is always somewhere to type.
@@ -147,7 +162,12 @@ struct State {
     requests: controls.List
     method: controls.Entry
     url: controls.Entry
-    headers: [HeaderRow]
+    headers: PairTable
+    query: PairTable
+    // Which editor the middle of the window is showing. Headers, query parameters and a body are
+    // three tables deep between the URL and the response, and stacked they pushed the response off
+    // the bottom of the window.
+    editors: controls.Tabs
     // **A text area**, which this application is the reason `lib/ui` has: it was a one-line field
     // until `controls.text_area_of` existed, and a REST client where a JSON body has to be typed on
     // one line is a REST client nobody would use. Enter inserts a newline here, Up and Down move by
@@ -160,7 +180,6 @@ struct State {
     send: controls.Button
     save: controls.Button
     save_as: controls.Button
-    add_header: controls.Button
     // **Open when a request is being named.** `None` is the ordinary state, which is why this is an
     // `Option` rather than a flag beside the fields: a dialog that is not open has no name being
     // typed into it, and keeping the three apart lets the closed state hold nothing at all.
@@ -189,6 +208,9 @@ val sidebar_width = 280.0
 val row_height = 30.0
 // Both tabs, and the box the strip is laid out in, come from this one number.
 val tab_width = 100.0
+val headers_editor = 0
+val query_editor = 1
+val body_editor = 2
 val gap = 8.0
 
 // ---- building the view
@@ -229,6 +251,28 @@ fn naming_widget(n: Naming, style: controls.Style, m: widget.Metrics) -> widget.
     )
 }
 
+// A table as a column of rows with its add button under them.
+fn table_widget(t: PairTable, style: controls.Style, m: widget.Metrics) -> widget.Widget {
+    val rows = mutable_array_new<widget.Widget>()
+    for row in t.rows {
+        push(rows, widget.fixed_of(0.0, row_height, widget.row_of(gap, [
+            widget.fixed_of(220.0, 0.0, controls.entry_widget(row.name, style, m)),
+            widget.expand(controls.entry_widget(row.value, style, m)),
+            widget.fixed_of(28.0, 0.0, controls.button_widget(row.remove, style))
+        ])))
+    }
+    push(rows, widget.fixed_of(0.0, row_height, widget.row_of(gap, [
+        widget.fixed_of(120.0, 0.0, controls.button_widget(t.add, style)),
+        widget.expand(widget.flex())
+    ])))
+    return widget.column_of(4.0, snapshot(rows))
+}
+
+// What `table_widget` will measure, which the column above it has to know before it is built.
+fn table_height(t: PairTable) -> float {
+    return (row_height + 4.0) * ((len(t.rows) + 1) as float)
+}
+
 fn view(s: State, style: controls.Style, m: widget.Metrics) -> widget.Widget {
     val body_height = (body_rows as float) * 17.0 + 8.0
     val sidebar = widget.column_of(gap, [
@@ -243,23 +287,29 @@ fn view(s: State, style: controls.Style, m: widget.Metrics) -> widget.Widget {
         widget.fixed_of(90.0, 0.0, controls.button_widget(s.save, style)),
         widget.fixed_of(90.0, 0.0, controls.button_widget(s.save_as, style))
     ])
-    val header_widgets = mutable_array_new<widget.Widget>()
-    for row in s.headers {
-        push(header_widgets, widget.fixed_of(0.0, row_height, widget.row_of(gap, [
-            widget.fixed_of(220.0, 0.0, controls.entry_widget(row.name, style, m)),
-            widget.expand(controls.entry_widget(row.value, style, m)),
-            widget.fixed_of(28.0, 0.0, controls.button_widget(row.remove, style))
-        ])))
+    // **One editor at a time.** Headers, query parameters and a body stacked between the URL and
+    // the response left the response a sliver, and a request with eight headers pushed it off the
+    // window entirely. The strip costs one row and the shown editor gets its natural height.
+    val chosen_editor = if s.editors.selected == query_editor {
+        table_widget(s.query, style, m)
+    } else {
+        if s.editors.selected == body_editor {
+            widget.fixed_of(0.0, body_height, controls.entry_widget(s.body, style, m))
+        } else {
+            table_widget(s.headers, style, m)
+        }
     }
-    push(header_widgets, widget.fixed_of(0.0, row_height, widget.row_of(gap, [
-        widget.fixed_of(120.0, 0.0, controls.button_widget(s.add_header, style)),
-        widget.expand(widget.flex())
-    ])))
+    val editor_height = if s.editors.selected == query_editor {
+        table_height(s.query)
+    } else {
+        if s.editors.selected == body_editor { body_height } else { table_height(s.headers) }
+    }
     val editors = widget.column_of(4.0, [
-        widget.fixed_of(0.0, 16.0, mono_label("Headers", 11.0, style)),
-        widget.column_of(4.0, snapshot(header_widgets)),
-        widget.fixed_of(0.0, 16.0, mono_label("Body", 11.0, style)),
-        widget.fixed_of(0.0, body_height, controls.entry_widget(s.body, style, m)),
+        widget.fixed_of(0.0, row_height, widget.row_of(gap, [
+            widget.fixed_of(tab_width * 3.0, 0.0, controls.tabs_widget(s.editors, style)),
+            widget.expand(widget.flex())
+        ])),
+        widget.fixed_of(0.0, editor_height, chosen_editor),
         widget.fixed_of(0.0, row_height, widget.row_of(gap, [
             widget.fixed_of(110.0, 0.0, mono_label("Environment", 11.0, style)),
             widget.fixed_of(200.0, 0.0, controls.menu_title_widget(s.env, style)),
@@ -278,7 +328,8 @@ fn view(s: State, style: controls.Style, m: widget.Metrics) -> widget.Widget {
         Response { controls.entry_widget(s.response, style, m) }
         History { controls.list_widget(s.history, style) }
     }
-    val editors_height = 16.0 + 4.0 + ((row_height + 4.0) * ((len(s.headers) + 1) as float)) + 16.0 + 4.0 + body_height + 4.0 + row_height + 8.0
+    // The strip, the shown editor and the environment row, with the column's own 4-point gaps.
+    val editors_height = row_height + 4.0 + editor_height + 4.0 + row_height + 8.0
     val main = widget.column_of(gap, [
         widget.fixed_of(0.0, gap, widget.flex()),
         widget.fixed_of(0.0, row_height, bar),
@@ -360,11 +411,11 @@ fn kept(s: State) -> Step {
 
 // Builds the header rows for a request, padded out to `header_rows` so the layout does not change
 // shape with the request -- an empty row is how one is added.
-fn header_row(index: int, name: string, value: string) -> HeaderRow {
-    return HeaderRow {
-        name: controls.entry_of(concat("header", str(index), "name"), "Header name", name),
-        value: controls.entry_of(concat("header", str(index), "value"), "Header value", value),
-        remove: controls.button_of(concat("header", str(index), "remove"), "x")
+fn pair_row(kind: string, title: string, index: int, name: string, value: string) -> PairRow {
+    return PairRow {
+        name: controls.entry_of(concat(kind, str(index), "name"), concat(title, " name"), name),
+        value: controls.entry_of(concat(kind, str(index), "value"), concat(title, " value"), value),
+        remove: controls.button_of(concat(kind, str(index), "remove"), "x")
     }
 }
 
@@ -372,38 +423,43 @@ fn header_row(index: int, name: string, value: string) -> HeaderRow {
 // a control is addressed by name, so a row removed from the middle must leave the rows after it
 // holding the names the layout will give them. Rebuilding beats patching -- the alternative is
 // stable ids and a map from id to control, which is a lot of machinery for a list of headers.
-fn renamed(rows: [HeaderRow]) -> [HeaderRow] {
-    val out = mutable_array_new<HeaderRow>()
+fn renamed(t: PairTable) -> PairTable {
+    val out = mutable_array_new<PairRow>()
     var i = 0
-    while i < len(rows) {
-        push(out, header_row(i, rows[i].name.editor.text, rows[i].value.editor.text))
+    while i < len(t.rows) {
+        push(out, pair_row(t.kind, t.title, i, t.rows[i].name.editor.text, t.rows[i].value.editor.text))
         i = i + 1
     }
-    return snapshot(out)
+    return with t { rows: snapshot(out) }
 }
 
-fn header_editors(pairs: [saved.KvPair]) -> [HeaderRow] {
-    val out = mutable_array_new<HeaderRow>()
+fn pair_table(kind: string, title: string, add_label: string, pairs: [saved.KvPair]) -> PairTable {
+    val out = mutable_array_new<PairRow>()
     var i = 0
     while i < len(pairs) {
-        push(out, header_row(i, pairs[i].name, pairs[i].value))
+        push(out, pair_row(kind, title, i, pairs[i].name, pairs[i].value))
         i = i + 1
     }
     // Always somewhere to type: a request with no headers would otherwise show an empty section
     // and a button, and the first thing anyone would do is press the button.
     var blank = 0
     while blank < blank_header_rows {
-        push(out, header_row(len(pairs) + blank, "", ""))
+        push(out, pair_row(kind, title, len(pairs) + blank, "", ""))
         blank = blank + 1
     }
-    return snapshot(out)
+    return PairTable {
+        kind: kind,
+        title: title,
+        rows: snapshot(out),
+        add: controls.button_of(concat(kind, "-add"), add_label)
+    }
 }
 
 // The non-empty rows, as the pairs a request carries. A row whose name is blank is not a header,
 // whatever its value says -- which is how one is deleted.
-fn headers_of(rows: [HeaderRow]) -> [saved.KvPair] {
+fn pairs_of(t: PairTable) -> [saved.KvPair] {
     val out = mutable_array_new<saved.KvPair>()
-    for row in rows {
+    for row in t.rows {
         val name = trim(row.name.editor.text)
         if len(name) > 0 {
             push(out, saved.kv_pair_of(name, row.value.editor.text))
@@ -463,13 +519,106 @@ fn edited_request_from(s: State, source: saved.SavedRequest) -> saved.SavedReque
     return with source {
         method: s.method.editor.text,
         url: s.url.editor.text,
-        headers: headers_of(s.headers),
+        headers: pairs_of(s.headers),
+        query_params: pairs_of(s.query),
         body: body
     }
 }
 
-fn header_row_set(rows: [HeaderRow], index: int, row: HeaderRow) -> [HeaderRow] {
-    val out = mutable_array_new<HeaderRow>()
+// What an input did to a table, and whether it was for this one at all.
+//
+// **`handled` rather than an `Option`,** because the caller has two tables to try in turn and a
+// miss has to be distinguishable from a table that answered without changing: a `None` would say
+// the same thing as "nothing happened here", and the second table would then never be asked.
+struct TableStep {
+    table: PairTable
+    // A row was removed, so the focus was sitting on a control that no longer exists.
+    dropped: bool
+    handled: bool
+}
+
+// Everything that can happen inside one table: its add button, each row's `x`, and the two fields.
+//
+// **The rows are addressed by position**, so one test finds the row and the field at once rather
+// than a branch per control -- and the whole point of taking `t.kind` is that the same walk serves
+// the headers and the query parameters without either knowing the other exists.
+fn table_input(
+    t: PairTable,
+    name: string,
+    input: controls.Input,
+    laid: widget.Laid,
+    style: controls.Style,
+    m: widget.Metrics
+) -> TableStep {
+    if name == concat(t.kind, "-add") {
+        val taken = controls.button_input(t.add, input, bounds_of(laid, name))
+        val rows = mutable_array_new<PairRow>()
+        for row in t.rows {
+            push(rows, row)
+        }
+        if taken.activated {
+            push(rows, pair_row(t.kind, t.title, len(t.rows), "", ""))
+        }
+        return TableStep {
+            table: with t { add: taken.button, rows: snapshot(rows) },
+            dropped: false,
+            handled: true
+        }
+    }
+    var row = 0
+    while row < len(t.rows) {
+        val name_field = concat(t.kind, str(row), "name")
+        val value_field = concat(t.kind, str(row), "value")
+        val remove_field = concat(t.kind, str(row), "remove")
+        if name == remove_field {
+            val taken = controls.button_input(t.rows[row].remove, input, bounds_of(laid, name))
+            if taken.activated {
+                val rows = mutable_array_new<PairRow>()
+                var at = 0
+                while at < len(t.rows) {
+                    if at != row {
+                        push(rows, t.rows[at])
+                    }
+                    at = at + 1
+                }
+                // Renamed, because the rows after this one have just moved up and a control is
+                // addressed by name.
+                return TableStep {
+                    table: renamed(with t { rows: snapshot(rows) }),
+                    dropped: true,
+                    handled: true
+                }
+            }
+            val held = with t.rows[row] { remove: taken.button }
+            return TableStep {
+                table: with t { rows: pair_row_set(t.rows, row, held) },
+                dropped: false,
+                handled: true
+            }
+        }
+        if name == name_field || name == value_field {
+            val editing_name = name == name_field
+            val current = t.rows[row]
+            val target = if editing_name { current.name } else { current.value }
+            val taken = controls.entry_input(target, input, bounds_of(laid, name), style, m)
+            val replaced = if editing_name {
+                with current { name: taken.entry }
+            } else {
+                with current { value: taken.entry }
+            }
+            return TableStep {
+                table: with t { rows: pair_row_set(t.rows, row, replaced) },
+                dropped: false,
+                handled: true
+            }
+        }
+        row = row + 1
+    }
+    return TableStep { table: t, dropped: false, handled: false }
+}
+
+fn pair_row_set(rows: [PairRow], index: int, row: PairRow) -> [PairRow] {
+    val out = mutable_array_new<PairRow>()
     var i = 0
     while i < len(rows) {
         push(out, if i == index { row } else { rows[i] })
@@ -510,7 +659,8 @@ fn show_request(s: State, item: Item) -> State {
     return with s {
         method: controls.entry_of("method", "Method", item.saved.method),
         url: controls.entry_of("url", "URL", item.saved.url),
-        headers: header_editors(item.saved.headers),
+        headers: pair_table("header", "Header", "+ header", item.saved.headers),
+        query: pair_table("query", "Query", "+ parameter", item.saved.query_params),
         body: controls.text_area_of("body", "Body", body_text_of(item.saved.body), body_rows),
         status: concat(item.collection, "/", item.path)
     }
@@ -644,20 +794,6 @@ fn step(s: State, input: controls.Input, laid: widget.Laid, style: controls.Styl
         }
         return kept(with after_click { save_as: taken.button, naming: opened })
     }
-    if name == "add-header" {
-        val taken = controls.button_input(after_click.add_header, input, bounds_of(laid, "add-header"))
-        val grown = if taken.activated {
-            val rows = mutable_array_new<HeaderRow>()
-            for row in after_click.headers {
-                push(rows, row)
-            }
-            push(rows, header_row(len(after_click.headers), "", ""))
-            snapshot(rows)
-        } else {
-            after_click.headers
-        }
-        return kept(with after_click { add_header: taken.button, headers: grown })
-    }
     if name == "send" {
         val taken = controls.button_input(after_click.send, input, bounds_of(laid, "send"))
         return Step {
@@ -678,44 +814,19 @@ fn step(s: State, input: controls.Input, laid: widget.Laid, style: controls.Styl
             open_history: false
         }
     }
-    // The header rows are named by position, so one test finds the row and the field at once
-    // rather than eight branches naming themselves.
-    var row = 0
-    while row < len(after_click.headers) {
-        val name_field = concat("header", str(row), "name")
-        val value_field = concat("header", str(row), "value")
-        val remove_field = concat("header", str(row), "remove")
-        if name == remove_field {
-            val taken = controls.button_input(after_click.headers[row].remove, input, bounds_of(laid, name))
-            if taken.activated {
-                val rows = mutable_array_new<HeaderRow>()
-                var at = 0
-                while at < len(after_click.headers) {
-                    if at != row {
-                        push(rows, after_click.headers[at])
-                    }
-                    at = at + 1
-                }
-                // Renamed, because the rows after this one have just moved up and a control is
-                // addressed by name. The focus follows them: it was on a row that is gone.
-                return kept(with after_click { headers: renamed(snapshot(rows)), focused: "requests" })
-            }
-            val held = with after_click.headers[row] { remove: taken.button }
-            return kept(with after_click { headers: header_row_set(after_click.headers, row, held) })
-        }
-        if name == name_field || name == value_field {
-            val editing_name = name == name_field
-            val current = after_click.headers[row]
-            val target = if editing_name { current.name } else { current.value }
-            val taken = controls.entry_input(target, input, bounds_of(laid, name), style, m)
-            val replaced = if editing_name {
-                with current { name: taken.entry }
-            } else {
-                with current { value: taken.entry }
-            }
-            return kept(with after_click { headers: header_row_set(after_click.headers, row, replaced) })
-        }
-        row = row + 1
+    val in_headers = table_input(after_click.headers, name, input, laid, style, m)
+    if in_headers.handled {
+        val next = with after_click { headers: in_headers.table }
+        return kept(if in_headers.dropped { with next { focused: "requests" } } else { next })
+    }
+    val in_query = table_input(after_click.query, name, input, laid, style, m)
+    if in_query.handled {
+        val next = with after_click { query: in_query.table }
+        return kept(if in_query.dropped { with next { focused: "requests" } } else { next })
+    }
+    if name == "editors" {
+        val taken = controls.tabs_input(after_click.editors, input, bounds_of(laid, name))
+        return kept(with after_click { editors: taken.tabs })
     }
     if name == "panes" {
         val taken = controls.tabs_input(after_click.panes, input, bounds_of(laid, name))
@@ -1108,13 +1219,16 @@ pub fn run(store: Storage) -> Result<unit, string> {
         requests: controls.list_of("requests", "Saved requests", snapshot(labels)),
         method: controls.entry_of("method", "Method", "GET"),
         url: controls.entry_of("url", "URL", ""),
-        headers: header_editors([]),
+        headers: pair_table("header", "Header", "+ header", []),
+        query: pair_table("query", "Query", "+ parameter", []),
+        editors: with controls.tabs_of("editors", "Editors", ["Headers", "Query", "Body"]) {
+            tab_width: tab_width
+        },
         body: controls.text_area_of("body", "Body", "", body_rows),
         env: controls.choice_of("env", "Environment", snapshot(scopes), 0),
         send: controls.button_of("send", "Send"),
         save: controls.button_of("save", "Save"),
         save_as: controls.button_of("save-as", "Save As"),
-        add_header: controls.button_of("add-header", "+ header"),
         panes: with controls.tabs_of("panes", "Panes", ["Response", "History"]) {
             tab_width: tab_width
         },

@@ -63,7 +63,7 @@ headers, body and environment below them, the response under that, Send and Save
 
 | | |
 |---|---|
-| **Edit** | method, URL, four headers, a raw body, the environment to resolve `{{variables}}` against |
+| **Edit** | method, URL, headers, query parameters, a raw body, the environment to resolve `{{variables}}` against |
 | **Send** | `core/exec.send` in this process — history written, extractions applied, exactly as `curly ui` does them |
 | **Save** | `replace_request` back into the collection, **keeping the request's position** |
 | **Save As** | a modal dialog naming a collection and a path, then `add_request`, which **refuses a path already taken** |
@@ -75,9 +75,22 @@ not exist yet is created with it, as `curly collections create` would -- refusin
 leaving the window to run a command and coming back.
 
 Only a raw body is editable: a binary, form or multipart body is shown as what it is and left
-alone, rather than flattened into something that would save back wrong. Headers grow and shrink --
-`+ header` adds a row and each row's `x` removes it -- and the environment is picked from the ones
-on disk, with `(global)` meaning the absence of one rather than an environment named that.
+alone, rather than flattened into something that would save back wrong. The environment is picked
+from the ones on disk, with `(global)` meaning the absence of one rather than an environment named
+that.
+
+**The editors share a tab strip** -- Headers, Query, Body -- because stacked between the URL and the
+response they left the response a sliver, and a request with eight headers pushed it off the window
+entirely. **Headers and query parameters are one set of functions**, not two copies of it: both are
+a list of `KvPair`, so a table takes the control-name prefix as an argument, which is what keeps
+them two tables rather than one (a control is addressed by name, so sharing a prefix would mean
+typing in one typed in the other). Each grows and shrinks -- `+ header` or `+ parameter` adds a row,
+each row's `x` removes it, and removing one renames the rows below it because their names are their
+positions.
+
+What the window still cannot edit is **authorization and extraction rules**, which it carries
+through a save untouched: `edited_request_from` builds on the request it loaded, so a field with no
+editor keeps what was on disk rather than being written back empty.
 
 **It depends on no server.** `curly serve` exists so the React frontend can reach the same `.curly`
 storage over HTTP; this does not use it. The same collections are read from the same disk, variables

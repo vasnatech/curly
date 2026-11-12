@@ -33,6 +33,8 @@ use core/collection.find_request
 use core/collection.replace_request
 use core/exec
 use core/exec.ResponseSummary
+use core/extraction
+use core/extraction.Extraction
 use core/extraction.apply
 use core/model
 use core/saved
@@ -158,6 +160,123 @@ fn show_pane(s: State, which: Pane) -> State {
     return with s { panes: with s.panes { selected: at } }
 }
 
+// An extraction rule as five controls: what kind it is, the variable it defines, where the value
+// comes from, whether it is a secret, and the `x` that removes it.
+//
+// **Not a `PairTable` with more columns.** A pair is two strings; a rule is a tagged union whose
+// third field *means* something different in each variant -- a JSON path, a header name, a
+// template -- and the row has to say which. The two tables share the shape of the problem and
+// nothing of the code, so sharing the code would have meant a `PairTable` carrying an optional
+// menu and an optional check box for the benefit of one caller each.
+struct RuleRow {
+    kind: controls.Menu
+    name: controls.Entry
+    source: controls.Entry
+    secret: controls.CheckBox
+    remove: controls.Button
+}
+
+struct RuleTable {
+    rows: [RuleRow]
+    add: controls.Button
+}
+
+val rule_body = 0
+val rule_header = 1
+val rule_template = 2
+
+// What the third column holds, which is a different thing in each kind -- so a reader is told the
+// difference and a user is not left guessing what to type.
+fn source_label(at: int) -> string {
+    if at == rule_header {
+        return "Header"
+    }
+    if at == rule_template {
+        return "Template"
+    }
+    return "Path"
+}
+
+fn rule_row(index: int, kind: int, name: string, source: string, secret: bool) -> RuleRow {
+    val tag = concat("rule", str(index))
+    return RuleRow {
+        kind: controls.choice_of(concat(tag, "kind"), "Rule kind", ["Body", "Header", "Template"], kind),
+        name: controls.entry_of(concat(tag, "name"), "Variable", name),
+        source: controls.entry_of(concat(tag, "source"), source_label(kind), source),
+        secret: controls.check_box_of(
+            concat(tag, "secret"),
+            "Secret",
+            if secret { widget.Toggle.On } else { widget.Toggle.Off }
+        ),
+        remove: controls.button_of(concat(tag, "remove"), "x")
+    }
+}
+
+fn rule_table(rules: [Extraction]) -> RuleTable {
+    val out = mutable_array_new<RuleRow>()
+    var i = 0
+    while i < len(rules) {
+        switch rules[i] {
+            Body(r) { push(out, rule_row(i, rule_body, r.name, r.path, r.secret)) }
+            Header(r) { push(out, rule_row(i, rule_header, r.name, r.header, r.secret)) }
+            Template(r) { push(out, rule_row(i, rule_template, r.name, r.template, r.secret)) }
+        }
+        i = i + 1
+    }
+    // One blank row, so there is always somewhere to type -- the same reason the pair tables have
+    // two. One rather than two because a rule is five controls wide and an empty one is not free
+    // to look at.
+    push(out, rule_row(len(rules), rule_body, "", "", false))
+    return RuleTable { rows: snapshot(out), add: controls.button_of("rule-add", "+ rule") }
+}
+
+// Renamed by position, because a control is addressed by name and a removed row moves the ones
+// after it. The pair tables' rule, for the pair tables' reason.
+fn rules_renamed(t: RuleTable) -> RuleTable {
+    val out = mutable_array_new<RuleRow>()
+    var i = 0
+    while i < len(t.rows) {
+        val row = t.rows[i]
+        push(out, rule_row(
+            i,
+            row.kind.items.selected,
+            row.name.editor.text,
+            row.source.editor.text,
+            widget.Toggle.is_On(row.secret.checked)
+        ))
+        i = i + 1
+    }
+    return with t { rows: snapshot(out) }
+}
+
+// The rules the rows hold. **A row with no variable name is not a rule**, whatever else is typed
+// into it -- which is how one is deleted without the `x`, and the same rule the pair tables use.
+fn rules_of(t: RuleTable) -> [Extraction] {
+    val out = mutable_array_new<Extraction>()
+    for row in t.rows {
+        val name = trim(row.name.editor.text)
+        if len(name) > 0 {
+            val source = row.source.editor.text
+            val secret = widget.Toggle.is_On(row.secret.checked)
+            val at = row.kind.items.selected
+            if at == rule_header {
+                push(out, Extraction.Header(extraction.HeaderRule { name: name, header: source, secret: secret }))
+            } else {
+                if at == rule_template {
+                    push(out, Extraction.Template(extraction.TemplateRule {
+                        name: name,
+                        template: source,
+                        secret: secret
+                    }))
+                } else {
+                    push(out, Extraction.Body(extraction.BodyRule { name: name, path: source, secret: secret }))
+                }
+            }
+        }
+    }
+    return snapshot(out)
+}
+
 // The three shapes of authorization a saved request can carry, and the absence of one.
 //
 // **"None" is one of the choices rather than an empty state**, for the reason `(global)` is in the
@@ -231,6 +350,7 @@ struct State {
     headers: PairTable
     query: PairTable
     auth: AuthEditors
+    rules: RuleTable
     // Which editor the middle of the window is showing. Headers, query parameters and a body are
     // three tables deep between the URL and the response, and stacked they pushed the response off
     // the bottom of the window.
@@ -279,6 +399,7 @@ val headers_editor = 0
 val query_editor = 1
 val auth_editor = 2
 val body_editor = 3
+val extract_editor = 4
 val gap = 8.0
 
 // ---- building the view
@@ -376,6 +497,47 @@ fn auth_height(a: AuthEditors) -> float {
     return (row_height + 4.0) * (rows as float)
 }
 
+// The extraction rules: one row of five controls per rule, and a button that adds one.
+fn rules_widget(t: RuleTable, style: controls.Style, m: widget.Metrics) -> widget.Widget {
+    val rows = mutable_array_new<widget.Widget>()
+    for row in t.rows {
+        rows_push_rule(rows, row, style, m)
+    }
+    push(rows, widget.fixed_of(0.0, row_height, widget.row_of(gap, [
+        widget.fixed_of(120.0, 0.0, controls.button_widget(t.add, style)),
+        widget.expand(widget.flex())
+    ])))
+    return widget.column_of(4.0, snapshot(rows))
+}
+
+fn rows_push_rule(
+    rows: MutableArray<widget.Widget>,
+    row: RuleRow,
+    style: controls.Style,
+    m: widget.Metrics
+) {
+    val said = source_label(row.kind.items.selected)
+    push(rows, widget.fixed_of(0.0, row_height, widget.row_of(gap, [
+        widget.fixed_of(120.0, 0.0, controls.menu_title_widget(row.kind, style)),
+        widget.fixed_of(160.0, 0.0, controls.entry_widget(row.name, style, m)),
+        // **The word is drawn as well as declared**, which a column header could not do: every row
+        // picks its own kind, so the third box is a JSON path on one line and a header name on the
+        // next. Declaring it only to the accessibility tree would have left a sighted user looking
+        // at three empty boxes with nothing to say which is which -- the reader would have been
+        // better informed than the screen.
+        widget.fixed_of(70.0, 0.0, mono_label(said, 11.0, style)),
+        // **Relabelled rather than rebuilt**, so the reader hears "Header" or "Template" where it
+        // would otherwise hear "Path", and the text a user typed survives changing their mind.
+        widget.expand(controls.entry_widget(with row.source { label: said }, style, m)),
+        widget.fixed_of(90.0, 0.0, controls.check_box_widget(row.secret, style)),
+        widget.fixed_of(28.0, 0.0, controls.button_widget(row.remove, style))
+    ])))
+}
+
+fn rules_height(t: RuleTable) -> float {
+    return (row_height + 4.0) * ((len(t.rows) + 1) as float)
+}
+
 // What `table_widget` will measure, which the column above it has to know before it is built.
 fn table_height(t: PairTable) -> float {
     return (row_height + 4.0) * ((len(t.rows) + 1) as float)
@@ -404,10 +566,14 @@ fn view(s: State, style: controls.Style, m: widget.Metrics) -> widget.Widget {
         if s.editors.selected == auth_editor {
             auth_widget(s.auth, style, m)
         } else {
-            if s.editors.selected == body_editor {
-                widget.fixed_of(0.0, body_height, controls.entry_widget(s.body, style, m))
+            if s.editors.selected == extract_editor {
+                rules_widget(s.rules, style, m)
             } else {
-                table_widget(s.headers, style, m)
+                if s.editors.selected == body_editor {
+                    widget.fixed_of(0.0, body_height, controls.entry_widget(s.body, style, m))
+                } else {
+                    table_widget(s.headers, style, m)
+                }
             }
         }
     }
@@ -417,12 +583,16 @@ fn view(s: State, style: controls.Style, m: widget.Metrics) -> widget.Widget {
         if s.editors.selected == auth_editor {
             auth_height(s.auth)
         } else {
-            if s.editors.selected == body_editor { body_height } else { table_height(s.headers) }
+            if s.editors.selected == extract_editor {
+                rules_height(s.rules)
+            } else {
+                if s.editors.selected == body_editor { body_height } else { table_height(s.headers) }
+            }
         }
     }
     val editors = widget.column_of(4.0, [
         widget.fixed_of(0.0, row_height, widget.row_of(gap, [
-            widget.fixed_of(tab_width * 4.0, 0.0, controls.tabs_widget(s.editors, style)),
+            widget.fixed_of(tab_width * 5.0, 0.0, controls.tabs_widget(s.editors, style)),
             widget.expand(widget.flex())
         ])),
         widget.fixed_of(0.0, editor_height, chosen_editor),
@@ -527,6 +697,94 @@ struct Step {
 // Invisible while this window had one dropdown; the moment it had two, pressing one left the other
 // open on top of it. The menu cannot fix this itself: an input it is never handed is an input it
 // cannot answer.
+struct RuleStep {
+    table: RuleTable
+    dropped: bool
+    handled: bool
+}
+
+// Everything that can happen inside the rule table. Addressed by position, as the pair tables are.
+fn rules_input(
+    t: RuleTable,
+    name: string,
+    input: controls.Input,
+    laid: widget.Laid,
+    style: controls.Style,
+    m: widget.Metrics
+) -> RuleStep {
+    if name == "rule-add" {
+        val taken = controls.button_input(t.add, input, bounds_of(laid, name))
+        val rows = mutable_array_new<RuleRow>()
+        for row in t.rows {
+            push(rows, row)
+        }
+        if taken.activated {
+            push(rows, rule_row(len(t.rows), rule_body, "", "", false))
+        }
+        return RuleStep {
+            table: with t { add: taken.button, rows: snapshot(rows) },
+            dropped: false,
+            handled: true
+        }
+    }
+    var at = 0
+    while at < len(t.rows) {
+        val tag = concat("rule", str(at))
+        if name == concat(tag, "remove") {
+            val taken = controls.button_input(t.rows[at].remove, input, bounds_of(laid, name))
+            if taken.activated {
+                val rows = mutable_array_new<RuleRow>()
+                var i = 0
+                while i < len(t.rows) {
+                    if i != at {
+                        push(rows, t.rows[i])
+                    }
+                    i = i + 1
+                }
+                return RuleStep {
+                    table: rules_renamed(with t { rows: snapshot(rows) }),
+                    dropped: true,
+                    handled: true
+                }
+            }
+            return rule_held(t, at, with t.rows[at] { remove: taken.button })
+        }
+        if name == concat(tag, "kind") || name == concat(tag, "kind/items") {
+            val taken = controls.menu_input(
+                t.rows[at].kind,
+                input,
+                bounds_of(laid, concat(tag, "kind")),
+                bounds_of(laid, concat(tag, "kind/items"))
+            )
+            return rule_held(t, at, with t.rows[at] { kind: taken.menu })
+        }
+        if name == concat(tag, "name") {
+            val taken = controls.entry_input(t.rows[at].name, input, bounds_of(laid, name), style, m)
+            return rule_held(t, at, with t.rows[at] { name: taken.entry })
+        }
+        if name == concat(tag, "source") {
+            val taken = controls.entry_input(t.rows[at].source, input, bounds_of(laid, name), style, m)
+            return rule_held(t, at, with t.rows[at] { source: taken.entry })
+        }
+        if name == concat(tag, "secret") {
+            val taken = controls.check_box_input(t.rows[at].secret, input, bounds_of(laid, name))
+            return rule_held(t, at, with t.rows[at] { secret: taken.check_box })
+        }
+        at = at + 1
+    }
+    return RuleStep { table: t, dropped: false, handled: false }
+}
+
+fn rule_held(t: RuleTable, at: int, row: RuleRow) -> RuleStep {
+    val rows = mutable_array_new<RuleRow>()
+    var i = 0
+    while i < len(t.rows) {
+        push(rows, if i == at { row } else { t.rows[i] })
+        i = i + 1
+    }
+    return RuleStep { table: with t { rows: snapshot(rows) }, dropped: false, handled: true }
+}
+
 fn dismiss_other_menus(s: State, name: string, input: controls.Input) -> State {
     if !is_press(input) {
         return s
@@ -541,7 +799,22 @@ fn dismiss_other_menus(s: State, name: string, input: controls.Input) -> State {
     } else {
         with s.auth.kind { open: false }
     }
-    return with s { env: env_now, auth: with s.auth { kind: auth_now } }
+    // Every rule row has a picker of its own, so this cannot be a list of names any more: a row's
+    // menu is left alone only when the press was for that row.
+    val rows = mutable_array_new<RuleRow>()
+    var at = 0
+    while at < len(s.rules.rows) {
+        val tag = concat("rule", str(at))
+        val row = s.rules.rows[at]
+        val mine = name == concat(tag, "kind") || name == concat(tag, "kind/items")
+        push(rows, if mine { row } else { with row { kind: with row.kind { open: false } } })
+        at = at + 1
+    }
+    return with s {
+        env: env_now,
+        auth: with s.auth { kind: auth_now },
+        rules: with s.rules { rows: snapshot(rows) }
+    }
 }
 
 fn is_press(input: controls.Input) -> bool {
@@ -566,6 +839,11 @@ fn open_menu(s: State) -> Option<controls.Menu> {
     }
     if s.auth.kind.open {
         return Option<controls.Menu>.Some(s.auth.kind)
+    }
+    for row in s.rules.rows {
+        if row.kind.open {
+            return Option<controls.Menu>.Some(row.kind)
+        }
     }
     return Option<controls.Menu>.None
 }
@@ -687,6 +965,7 @@ fn edited_request_from(s: State, source: saved.SavedRequest) -> saved.SavedReque
         headers: pairs_of(s.headers),
         query_params: pairs_of(s.query),
         auth: auth_value_of(s.auth),
+        extract: rules_of(s.rules),
         body: body
     }
 }
@@ -828,6 +1107,7 @@ fn show_request(s: State, item: Item) -> State {
         headers: pair_table("header", "Header", "+ header", item.saved.headers),
         query: pair_table("query", "Query", "+ parameter", item.saved.query_params),
         auth: auth_editors(item.saved.auth),
+        rules: rule_table(item.saved.extract),
         body: controls.text_area_of("body", "Body", body_text_of(item.saved.body), body_rows),
         status: concat(item.collection, "/", item.path)
     }
@@ -991,6 +1271,11 @@ fn step(s: State, input: controls.Input, laid: widget.Laid, style: controls.Styl
     if in_query.handled {
         val next = with after_click { query: in_query.table }
         return kept(if in_query.dropped { with next { focused: "requests" } } else { next })
+    }
+    val in_rules = rules_input(after_click.rules, name, input, laid, style, m)
+    if in_rules.handled {
+        val next = with after_click { rules: in_rules.table }
+        return kept(if in_rules.dropped { with next { focused: "requests" } } else { next })
     }
     if name == "auth-kind" || name == "auth-kind/items" {
         val taken = controls.menu_input(
@@ -1407,7 +1692,8 @@ pub fn run(store: Storage) -> Result<unit, string> {
         headers: pair_table("header", "Header", "+ header", []),
         query: pair_table("query", "Query", "+ parameter", []),
         auth: auth_editors(Option<saved.SavedAuth>.None),
-        editors: with controls.tabs_of("editors", "Editors", ["Headers", "Query", "Auth", "Body"]) {
+        rules: rule_table([]),
+        editors: with controls.tabs_of("editors", "Editors", ["Headers", "Query", "Auth", "Body", "Extract"]) {
             tab_width: tab_width
         },
         body: controls.text_area_of("body", "Body", "", body_rows),

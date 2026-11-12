@@ -63,7 +63,7 @@ headers, body and environment below them, the response under that, Send and Save
 
 | | |
 |---|---|
-| **Edit** | method, URL, headers, query parameters, authorization, a raw body, the environment to resolve `{{variables}}` against |
+| **Edit** | method, URL, headers, query parameters, authorization, extraction rules, a raw body, the environment to resolve `{{variables}}` against |
 | **Send** | `core/exec.send` in this process — history written, extractions applied, exactly as `curly ui` does them |
 | **Save** | `replace_request` back into the collection, **keeping the request's position** |
 | **Save As** | a modal dialog naming a collection and a path, then `add_request`, which **refuses a path already taken** |
@@ -102,9 +102,26 @@ bullets on the screen *and* bullets on the accessibility bus -- read off the rea
 one field is relabelled Token for a Bearer and keeps what was typed into it: losing a secret to a
 mis-click in a picker is worse than carrying one across, and either way it is a secret.
 
-What the window still cannot edit is **extraction rules**, which it carries through a save
-untouched: `edited_request_from` builds on the request it loaded, so a field with no editor keeps
-what was on disk rather than being written back empty.
+**Extraction rules** are the fifth tab: one row per rule, holding its kind (Body, Header or
+Template), the variable it defines, where the value comes from, a Secret tick and an `x`. A row
+with no variable name is not a rule, which is how one is deleted without the `x`.
+
+Not a pair table with more columns, though it looks like one: a pair is two strings, while a rule
+is a tagged union whose third field *means* something different in each variant -- a JSON path, a
+header name, a template -- so the row has to say which. **It says so on the screen and not only to
+a reader**: each row draws the word beside the box, because every row picks its own kind and a
+column header could not name a third column that is a path on one line and a header name on the
+next. Declaring it only to the accessibility tree would have left a sighted user looking at three
+empty boxes while the screen reader was better informed than the screen.
+
+A rule is applied by the same `core/exec.send` the terminal uses, so a send from this window writes
+the session exactly as `curly run` does -- verified by sending against a server answering
+`{"data": {"token": "s3cr3t"}}` and reading `token` back out of `session/global.json` with its
+`secret` flag set.
+
+Every field of a saved request is now editable here. What is still carried through a save untouched
+is anything a future field adds: `edited_request_from` builds on the request it loaded, so a field
+with no editor keeps what was on disk rather than being written back empty.
 
 **It depends on no server.** `curly serve` exists so the React frontend can reach the same `.curly`
 storage over HTTP; this does not use it. The same collections are read from the same disk, variables

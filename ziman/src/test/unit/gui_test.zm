@@ -79,7 +79,7 @@ fn demo() -> [Loaded] {
 }
 
 fn opened() -> State {
-    return opening_state(sidebar_of(demo()), ["(global)"])
+    return opening_state(demo(), ["(global)"])
 }
 
 fn laid_of(s: State) -> widget.Laid {
@@ -107,7 +107,7 @@ fn shown_url(s: State) -> string {
 
 #[test]
 fn a_collection_a_folder_and_three_requests_become_five_rows() {
-    val side = sidebar_of(demo())
+    val side = sidebar_of(demo(), "")
     test.assert_len(5, side.tree.rows)
     test.assert_len(3, side.items)
     // The collection row and the folder row map to no request; the three leaves do.
@@ -281,7 +281,7 @@ fn a_save_keeps_what_has_no_editor_and_takes_what_has_one() {
 // different request.
 #[test]
 fn a_reload_keeps_the_shape_by_path_and_not_by_index() {
-    val before = sidebar_of(demo())
+    val before = sidebar_of(demo(), "")
     val shut = controls.tree_input(
         with before.tree { selected: 4 },
         controls.Input.Press(geom.point_of(24.0, 70.0)),
@@ -308,7 +308,7 @@ fn a_reload_keeps_the_shape_by_path_and_not_by_index() {
                 request_of("goodbye", "http://127.0.0.1/goodbye")
             ]
         }
-    }])
+    }], "")
     val kept = state.relaid(collapsed, grown)
     // The folder is still shut though it has moved down a row, and the selection still names the
     // same thing it named before.
@@ -343,3 +343,84 @@ fn every_editor_is_reachable_by_tab() {
         test.assert(contains(reachable, wanted))
     }
 }
+
+// ---- the filter
+
+fn filtered(query: string) -> state.Sidebar {
+    return sidebar_of(demo(), query)
+}
+
+fn rows_of(side: state.Sidebar) -> string {
+    val out = mutable_array_new<string>()
+    for row in side.tree.rows {
+        push(out, row.label)
+    }
+    return join(separator: " ", pieces: snapshot(out))
+}
+
+#[test]
+fn an_empty_query_keeps_everything() {
+    test.assert_eq(rows_of(filtered("")), "demo hello goodbye local index")
+    test.assert_eq(rows_of(filtered("   ")), "demo hello goodbye local index")
+}
+
+// **A match keeps the folders above it**, or what is left is a handful of orphans at depths that
+// mean nothing.
+#[test]
+fn a_match_keeps_the_folders_above_it() {
+    test.assert_eq(rows_of(filtered("index")), "demo local index")
+}
+
+// **A folder's name matches its contents**, because a request's key begins with the folder it sits
+// in -- which is why this matches on the path and not on the row's own label.
+#[test]
+fn naming_a_folder_shows_what_is_in_it() {
+    test.assert_eq(rows_of(filtered("local")), "demo local index")
+}
+
+#[test]
+fn naming_the_collection_shows_all_of_it() {
+    test.assert_eq(rows_of(filtered("demo")), "demo hello goodbye local index")
+}
+
+#[test]
+fn the_query_ignores_capitals() {
+    test.assert_eq(rows_of(filtered("INDEX")), rows_of(filtered("index")))
+}
+
+// **A collection or folder with nothing left in it goes too**, rather than standing as an empty
+// heading over nothing -- which is what a filter that only dropped leaves would leave behind.
+#[test]
+fn a_branch_with_nothing_left_goes_with_its_rows() {
+    test.assert_eq(rows_of(filtered("hello")), "demo hello")
+    test.assert_eq(rows_of(filtered("nothing-matches-this")), "")
+}
+
+// The three arrays stay in step, which is the thing a filter in place would get wrong.
+#[test]
+fn the_rows_items_and_keys_still_agree() {
+    val side = filtered("index")
+    test.assert_len(3, side.tree.rows)
+    test.assert_len(3, side.item_of)
+    test.assert_len(3, side.key_of)
+    test.assert_len(1, side.items)
+    test.assert_eq(side.item_of[0], 0 - 1)
+    test.assert_eq(side.item_of[1], 0 - 1)
+    test.assert_eq(side.item_of[2], 0)
+    test.assert_eq(side.items[side.item_of[2]].path, "local/index")
+}
+
+// Typing in the box narrows the tree, and `step` is what connects the two.
+#[test]
+fn typing_in_the_filter_narrows_the_sidebar() {
+    val s = with opened() { focused: "filter" }
+    val typed = acted(s, controls.Input.Text("index"))
+    test.assert_eq(rows_of(typed.state.sidebar), "demo local index")
+    test.assert_eq(typed.state.filter.editor.text, "index")
+}
+
+// **There is no test here for the `!changed` guard, and that is deliberate.** A caret move
+// rebuilding the sidebar produces exactly the same sidebar, so nothing an assertion can reach
+// tells the two apart -- a test for it passes whether the guard is there or not, which mutation
+// said out loud: removing it failed nothing. It is a performance choice and belongs in a
+// measurement, not in a gate that only looks like one.

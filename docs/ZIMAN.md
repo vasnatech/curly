@@ -70,6 +70,7 @@ the top, the editors below them, the response under that, Send and Save on the r
 | **Save As** | a modal dialog naming a collection and a path, then `add_request`, which **refuses a path already taken** |
 | **History** | every past exchange on disk, read back into the same response pane |
 | **Browse** | collections and folders as a tree, with the keyboard contract a tree owes |
+| **Filter** | a box above the tree narrowing it by path, so a collection of hundreds is navigable |
 | **Scroll** | the tree and the response both show a bar saying there is more and where you are |
 
 Save As is how a request is *created*: until it existed this window could only edit what was
@@ -89,6 +90,15 @@ from a request climbs to the folder holding it. Its shape survives a save: the r
 **by path, not by index**, because saving under a new name adds a row and moves every index below
 it, so carrying the numbers over would reopen the wrong folders and quietly select a different
 request.
+
+**A filter box narrows it.** The query matches the whole path rather than a row's own label, so
+typing a folder's name shows what is in it and typing a collection's shows all of it; a match
+keeps the folders above it, or what is left would be orphans at depths that mean nothing; and a
+collection or folder with nothing left in it goes too, rather than standing as an empty heading.
+The sidebar is rebuilt per query rather than flagged per row -- the rows, the items, the map back
+to a request and the keys are four arrays that have to agree, and filtering them in place is four
+chances to disagree. A save while a filter is on re-derives through the query, or it would quietly
+widen the sidebar back to everything.
 
 **The flat list had been labelling nested requests wrong and nobody had noticed.** A request
 directly in a collection read `demo/missing` while one inside a folder read `local/index` -- the

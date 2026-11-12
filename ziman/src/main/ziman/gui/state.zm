@@ -402,7 +402,14 @@ fn auth_value_of(a: AuthEditors) -> Option<saved.SavedAuth> {
 }
 
 pub struct State {
+    // **What is on disk**, which the filter re-derives the sidebar from on every keystroke. Kept
+    // because a filtered sidebar cannot answer what a wider query would show, and re-reading the
+    // collections to find out would put the filesystem in the path of a key press.
+    loaded: [Loaded]
     sidebar: Sidebar
+    // Narrows the sidebar by path. A `lib/ui` entry and nothing more -- the whole feature is
+    // `sidebar_of` taking a query.
+    filter: controls.Entry
     method: controls.Entry
     url: controls.Entry
     headers: PairTable
@@ -466,9 +473,12 @@ val gap = 8.0
 // cannot reach any other way: every assertion about a gesture starts from a state, and a test
 // that built one field by field would be asserting against its own idea of the window rather
 // than the window's.
-pub fn opening_state(sidebar: Sidebar, scopes: [string]) -> State {
+pub fn opening_state(loaded: [Loaded], scopes: [string]) -> State {
+    val sidebar = sidebar_of(loaded, "")
     val begin = State {
+        loaded: loaded,
         sidebar: sidebar,
+        filter: controls.entry_of("filter", "Filter requests", ""),
         method: controls.entry_of("method", "Method", "GET"),
         url: controls.entry_of("url", "URL", ""),
         headers: pair_table("header", "Header", "+ header", []),
@@ -515,20 +525,38 @@ pub struct Loaded {
 // a tree carrying an application's value would have to be generic, which in this language means
 // every caller spelling the parameter out. The three are built in one walk and reconciled in one
 // function, which is what a parallel array is usually wrong about and here is not.
-pub fn sidebar_of(found: [Loaded]) -> Sidebar {
+// Which rows a query keeps: the ones whose path contains it, **and every folder above them**,
+// so what is left is a tree rather than a handful of orphans. Matching the whole path and not
+// just the name is what makes typing a folder's name show its contents -- a request's key starts
+// with the folder it is in.
+//
+// **A fresh sidebar per query rather than a flag on each row.** The rows, the items, the map back
+// and the keys are four arrays that have to agree; filtering them in place is four chances to
+// disagree, and building them is one pass over data already in memory. Measured at nothing worth
+// naming for 200 requests, which is the size this was wanted at.
+pub fn sidebar_of(found: [Loaded], query: string) -> Sidebar {
     val items = mutable_array_new<Item>()
     val rows = mutable_array_new<controls.TreeRow>()
     val item_of = mutable_array_new<int>()
     val key_of = mutable_array_new<string>()
+    val wanted = to_lower(trim(query))
     for one in found {
         // **Open, because a sidebar that opened shut shows a user nothing they asked for.** A
         // collection is the unit someone chose to make; its contents are the point of it.
+        val before = len(rows)
         push(rows, controls.tree_branch(one.name, 0, true))
         push(item_of, 0 - 1)
         push(key_of, one.name)
-        push_requests(items, rows, item_of, key_of, one.name, "", 1, one.collection.requests)
+        push_requests(items, rows, item_of, key_of, one.name, "", 1, one.collection.requests, wanted)
         for folder in one.collection.folders {
-            push_folder(items, rows, item_of, key_of, one.name, concat(folder.name, "/"), 1, folder)
+            push_folder(items, rows, item_of, key_of, one.name, concat(folder.name, "/"), 1, folder, wanted)
+        }
+        // A collection whose every request was filtered away goes with them, rather than standing
+        // as an empty heading over nothing.
+        if len(rows) == before + 1 && wanted != "" {
+            drop_last(rows)
+            drop_last_int(item_of)
+            drop_last_text(key_of)
         }
     }
     val tree = with controls.tree_of("requests", "Saved requests", snapshot(rows)) { row_height: 20.0 }
@@ -548,12 +576,17 @@ fn push_requests(
     collection: string,
     prefix: string,
     depth: int,
-    requests: [SavedRequest]
+    requests: [SavedRequest],
+    wanted: string
 ) {
     for r in requests {
+        val key = concat(collection, "/", prefix, r.name)
+        if !keeps(key, wanted) {
+            continue
+        }
         push(rows, controls.tree_row(r.name, depth))
         push(item_of, len(items))
-        push(key_of, concat(collection, "/", prefix, r.name))
+        push(key_of, key)
         push(items, Item { collection: collection, path: concat(prefix, r.name), saved: r })
     }
 }
@@ -566,12 +599,14 @@ fn push_folder(
     collection: string,
     prefix: string,
     depth: int,
-    folder: Folder
+    folder: Folder,
+    wanted: string
 ) {
+    val before = len(rows)
     push(rows, controls.tree_branch(folder.name, depth, true))
     push(item_of, 0 - 1)
     push(key_of, concat(collection, "/", prefix))
-    push_requests(items, rows, item_of, key_of, collection, prefix, depth + 1, folder.requests)
+    push_requests(items, rows, item_of, key_of, collection, prefix, depth + 1, folder.requests, wanted)
     for sub in folder.folders {
         push_folder(
             items,
@@ -581,8 +616,65 @@ fn push_folder(
             collection,
             concat(prefix, sub.name, "/"),
             depth + 1,
-            sub
+            sub,
+            wanted
         )
+    }
+    // An empty folder goes the way an empty collection does -- unless it is empty on disk too,
+    // which is a fact about the storage and not about the query.
+    if len(rows) == before + 1 && wanted != "" {
+        drop_last(rows)
+        drop_last_int(item_of)
+        drop_last_text(key_of)
+    }
+}
+
+// **A path matches, not a name.** Typing a folder shows what is in it, because a request's key
+// begins with the folder it sits in; typing a collection shows the collection. Case-insensitive,
+// because nobody filtering a list is thinking about capitals.
+fn keeps(key: string, wanted: string) -> bool {
+    if wanted == "" {
+        return true
+    }
+    return contains(to_lower(key), wanted)
+}
+
+fn drop_last(xs: MutableArray<controls.TreeRow>) {
+    val kept = mutable_array_new<controls.TreeRow>()
+    var i = 0
+    while i < len(xs) - 1 {
+        push(kept, xs[i])
+        i = i + 1
+    }
+    clear(xs)
+    for one in snapshot(kept) {
+        push(xs, one)
+    }
+}
+
+fn drop_last_int(xs: MutableArray<int>) {
+    val kept = mutable_array_new<int>()
+    var i = 0
+    while i < len(xs) - 1 {
+        push(kept, xs[i])
+        i = i + 1
+    }
+    clear(xs)
+    for one in snapshot(kept) {
+        push(xs, one)
+    }
+}
+
+fn drop_last_text(xs: MutableArray<string>) {
+    val kept = mutable_array_new<string>()
+    var i = 0
+    while i < len(xs) - 1 {
+        push(kept, xs[i])
+        i = i + 1
+    }
+    clear(xs)
+    for one in snapshot(kept) {
+        push(xs, one)
     }
 }
 
@@ -732,6 +824,7 @@ pub fn view(s: State, style: controls.Style, m: widget.Metrics) -> widget.Widget
     val sidebar = widget.column_of(gap, [
         widget.fixed_of(0.0, gap, widget.flex()),
         widget.fixed_of(0.0, 18.0, mono_label("Requests", 12.0, style)),
+        widget.fixed_of(0.0, row_height, controls.entry_widget(s.filter, style, m)),
         widget.expand(controls.tree_widget(s.sidebar.tree, style))
     ])
     val bar = widget.row_of(gap, [
@@ -1374,6 +1467,25 @@ pub fn step(s: State, input: controls.Input, laid: widget.Laid, style: controls.
     }
     val name = controls.target(laid, input, focused_now)
     val after_click = with dismiss_other_menus(s, name, input) { focused: focused_now }
+    if name == "filter" {
+        val taken = controls.entry_input(after_click.filter, input, bounds_of(laid, name), style, m)
+        val typed = with after_click { filter: taken.entry }
+        if !taken.changed {
+            return kept(typed)
+        }
+        // **Rebuilt only when the text changed**, not on every caret move: `EntryStep.changed`
+        // keeps those apart precisely so a caller can tell. Arrowing along a query would
+        // otherwise rebuild the tree once per key -- for the same answer, which is why no test
+        // guards this line: removing it fails nothing, because the sidebar it produces is
+        // identical. It is a saving, not a behaviour.
+        //
+        // The shape is carried over the way a save carries it: by path, so a folder the user
+        // opened stays open as the query narrows and the selected request stays selected while it
+        // still matches.
+        return kept(with typed {
+            sidebar: relaid(typed.sidebar, sidebar_of(typed.loaded, taken.entry.editor.text))
+        })
+    }
     if name == "requests" {
         val taken = controls.tree_input(after_click.sidebar.tree, input, bounds_of(laid, "requests"))
         val moved_to = with after_click { sidebar: with after_click.sidebar { tree: taken.tree } }

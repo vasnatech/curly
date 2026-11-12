@@ -243,17 +243,17 @@ fn load_font() -> Result<font.FontRef, string> {
 // decide whether a window should close -- so they are the application's to handle, and this is the
 // application.
 
-// The sidebar, read off the disk.
+// The collections, read off the disk.
 //
-// **Five lines of reading and nothing else**: the walk that turns collections into a tree lives in
-// `gui/state.sidebar_of`, where a test can reach it. That split is the whole reason this file and
-// that one are separate.
-fn load_sidebar(store: Storage) -> Result<Sidebar, string> {
+// **Five lines of reading and nothing else**: the walk that turns them into a tree lives in
+// `gui/state.sidebar_of`, where a test can reach it and where the filter can re-run it. That
+// split is the whole reason this file and that one are separate.
+fn load_sidebar(store: Storage) -> Result<[Loaded], string> {
     val found = mutable_array_new<Loaded>()
     for name in try list_collections(store) {
         push(found, Loaded { name: name, collection: try load_collection(store, name) })
     }
-    return ok(sidebar_of(snapshot(found)))
+    return ok(snapshot(found))
 }
 
 fn is_close(e: window.Event) -> bool {
@@ -352,7 +352,7 @@ pub fn run(store: Storage) -> Result<unit, string> {
     // own `.notdef`, which has no outline, so every folder would look identical and nothing would
     // say which was open. That the field exists in `Style` is why this is two lines.
     val style = with controls.default_style() { collapsed_mark: ">", expanded_mark: "v" }
-    val sidebar = try load_sidebar(store)
+    val loaded = try load_sidebar(store)
     // The environments on disk, with the absence of one first. Read once: a window that re-read
     // them every frame would be asking the filesystem sixty times a second for an answer that
     // changes when a user runs `curly env create`, which is not something this window does.
@@ -361,7 +361,7 @@ pub fn run(store: Storage) -> Result<unit, string> {
     for one in try list_environments(store) {
         push(scopes, one)
     }
-    val opened = opening_state(sidebar, snapshot(scopes))
+    val opened = opening_state(loaded, snapshot(scopes))
     val density = chosen_density().density
     val scale = density.px_per_pt
     val options = with raster.options() {
@@ -550,7 +550,11 @@ pub fn run(store: Storage) -> Result<unit, string> {
                                         switch load_sidebar(store) {
                                             Ok(fresh) {
                                                 st = with st {
-                                                    sidebar: relaid(st.sidebar, fresh),
+                                                    loaded: fresh,
+                                                    sidebar: relaid(
+                                                        st.sidebar,
+                                                        sidebar_of(fresh, st.filter.editor.text)
+                                                    ),
                                                     naming: Option<Naming>.None,
                                                     status: said
                                                 }
@@ -577,7 +581,17 @@ pub fn run(store: Storage) -> Result<unit, string> {
                                     // request behind the selected row is now a different value.
                                     switch load_sidebar(store) {
                                         Ok(fresh) {
-                                            st = with st { sidebar: relaid(st.sidebar, fresh), status: said }
+                                            st = with st {
+                                                loaded: fresh,
+                                                // **Through the live query**, or a save made
+                                                // while a filter is on would quietly widen the
+                                                // sidebar back to everything.
+                                                sidebar: relaid(
+                                                    st.sidebar,
+                                                    sidebar_of(fresh, st.filter.editor.text)
+                                                ),
+                                                status: said
+                                            }
                                         }
                                         Err(why) { st = with st { status: concat(
                                             "saved, but reloading failed: ",

@@ -70,6 +70,7 @@ the top, the editors below them, the response under that, Send and Save on the r
 | **Save As** | a modal dialog naming a collection and a path, then `add_request`, which **refuses a path already taken** |
 | **History** | every past exchange on disk, read back into the same response pane |
 | **Browse** | collections and folders as a tree, with the keyboard contract a tree owes |
+| **Scroll** | the tree and the response both show a bar saying there is more and where you are |
 
 Save As is how a request is *created*: until it existed this window could only edit what was
 already on disk, so a fresh install had an empty sidebar and no way forward. A collection that does

@@ -409,7 +409,12 @@ pub fn run(store: Storage) -> Result<unit, string> {
                     // what was focused was to type into something. It also fixes the accessibility
                     // tree being stale: this window republishes when the scene changes, and a focus
                     // move changed nothing a reader could see *because nothing drew it*.
-                    val scene_now = widget.paint_focused(laid, m, st.focused, paint.rgb(0.15, 0.4, 0.85), 2.0)
+                    val with_focus = widget.paint_focused(laid, m, st.focused, paint.rgb(0.15, 0.4, 0.85), 2.0)
+                    // **Painted after the layout, because only the layout knows how tall a
+                    // viewport turned out to be** -- and a thumb's length is the view's share of
+                    // the content. The alternative was to lay the window out, read the extents and
+                    // lay it out again, which measured at 5 ms a frame over 200 rows.
+                    val scene_now = controls.paint_scroll_bars(laid, with_focus, style, 8.0)
                     val painted = try desktop.repaint(painter, w, scene_now, options)
                     painter = painted.next
 

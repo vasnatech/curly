@@ -309,8 +309,37 @@ fn resized_to(e: window.Event) -> Option<window.Size> {
 
 // ---- the loop
 
+// The window's size **in points**, which is not its size in pixels on a display that says one
+// point is more than one of them.
 val start_width = 1100
 val start_height = 700
+
+// How many device pixels a point is: the user's own setting, what the display reports, or 1.0.
+//
+// **This was hard-coded to 1.0 while the display had been saying 2.0 all along**, so every window
+// this application ever opened was drawn at half the resolution of the screen it was on --
+// legible, and soft in a way that looks like the font rather than like a bug. `lib/ui` had the
+// arbitration ready (`widget.resolve_density`: the user, then the display, then 1.0) and the
+// question was simply never asked.
+//
+// `CURLY_SCALE` is the user's half of it. A display's number is a guess about someone's eyes and
+// their desk from the pixels on a panel: right often enough to be the default, wrong often enough
+// that overriding it has to be possible. Text that is not a number is treated as absent rather
+// than refused, and so is one outside `(0, 64]`, which `resolve_density` decides -- a mistyped
+// setting should leave a usable window rather than none.
+fn chosen_density() -> widget.Resolved {
+    return widget.resolve_density(asked_scale(), window.display_scale())
+}
+
+fn asked_scale() -> Option<float> {
+    if Some(text) = os.get_env("CURLY_SCALE") {
+        switch parse_float(trim(text)) {
+            Ok(v) { return Option<float>.Some(v) }
+            Err(_) { return Option<float>.None }
+        }
+    }
+    return Option<float>.None
+}
 
 pub fn run(store: Storage) -> Result<unit, string> {
     val f = try load_font()
@@ -333,23 +362,33 @@ pub fn run(store: Storage) -> Result<unit, string> {
         push(scopes, one)
     }
     val opened = opening_state(sidebar, snapshot(scopes))
+    val density = chosen_density().density
+    val scale = density.px_per_pt
     val options = with raster.options() {
         fonts: [f],
         samples: 1,
         background: Option<paint.Color>.Some(paint.rgb(0.98, 0.98, 0.99)),
-        max_pixels: 8000000
+        // Four times the pixels at twice the scale, so the budget is in *pixels* and has to grow
+        // with the square of it rather than stay a constant.
+        max_pixels: ((8000000 as float) * scale * scale) as int,
+        // **This is the one that decides, and the painter's own is not.** `desktop.repaint`
+        // compares the two and rebuilds the painter from *these* options whenever they differ, so
+        // a scale set only on `painter_of` is discarded on the first frame -- silently, and the
+        // window then draws at 1.0 in the corner of itself.
+        px_per_pt: scale
     }
-    val density = widget.density_of(1.0)
 
     // **Every mutable thing lives inside the closure.** A lambda in this language captures by
     // value, so a `var` declared outside and assigned in here would not be the same variable -- the
     // compiler says so rather than letting it drift, which is how this shape was arrived at.
     val outcome = window.with_window<unit>(
         "curly",
-        start_width,
-        start_height,
+        // **Pixels here, points everywhere else.** A window is asked for in the display's own
+        // units; everything inside it is laid out in points.
+        ((start_width as float) * scale) as int,
+        ((start_height as float) * scale) as int,
         fn(w: window.Window) -> Result<unit, string> {
-            var painter = try desktop.painter_of(start_width as float, start_height as float, 1.0)
+            var painter = try desktop.painter_of(start_width as float, start_height as float, scale)
             var st = opened
             var width_pt = start_width as float
             var height_pt = start_height as float
@@ -462,8 +501,9 @@ pub fn run(store: Storage) -> Result<unit, string> {
                         dirty = true
                     }
                     if Some(size) = resized_to(e) {
-                        width_pt = size.width as float
-                        height_pt = size.height as float
+                        // A resize arrives in pixels and the layout wants points.
+                        width_pt = (size.width as float) / scale
+                        height_pt = (size.height as float) / scale
                         dirty = true
                     }
                     if Some(input) = desktop.input_of(e, density) {

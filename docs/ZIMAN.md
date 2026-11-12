@@ -151,6 +151,22 @@ flag so an ordinary `ziman` does not depend on a display, so the natives live on
 `make gui` produces. `bin/curly` picks `ziman-gui` up automatically when it is on PATH; otherwise
 `ZIMAN=/path/to/ziman-gui curly gui`. Run without one it says so, and says what to do.
 
+**It draws at the display's own resolution.** How many device pixels a point is comes from
+`CURLY_SCALE` if it is set, then from what the display reports, then 1.0 -- the order
+`widget.resolve_density` arbitrates, and the reason the user's setting comes first is that a
+display's number is a guess about someone's eyes and their desk from the pixels on a panel. A
+`CURLY_SCALE` that is not a number, or is outside `(0, 64]`, is treated as absent rather than
+refused: a mistyped setting should leave a usable window, not none.
+
+This was hard-coded to 1.0 until 2026-11-12, on a machine whose display had been reporting 2.0 the
+whole time -- so every window the application had ever opened was drawn at half the resolution of
+the screen it was on. It looks like a soft font rather than like a bug, which is why it survived
+so long. Two traps are worth knowing for anything else built on `lib/ui`: the scale has to reach
+**`raster.Options.px_per_pt`**, because `desktop.repaint` rebuilds the painter from the options
+whenever the two disagree and a scale set only on `painter_of` is discarded on the first frame;
+and the window is opened in **pixels** while everything inside it is laid out in **points**, so a
+resize has to be divided back down.
+
 **The font** comes from `CURLY_FONT` if set, then a copy vendored in `vendor/fonts/`, then a short
 list of system paths — `lib/graphics` has no notion of a system font, so something has to hand it
 bytes, and an application that asked the user to find a TrueType file before it would open is not

@@ -261,6 +261,20 @@ fn call(name: string, args: [Value], style: controls.Style, m: widget.Metrics) -
     if name == "widget.filled" {
         return Value.Srf(widget.filled(ink_of(args[0], style)))
     }
+    if name == "widget.rounded" {
+        return Value.Srf(widget.rounded(ink_of(args[0], style), float_of(args[1])))
+    }
+    if name == "widget.outlined" {
+        return Value.Srf(widget.outlined(ink_of(args[0], style), float_of(args[1]), float_of(args[2])))
+    }
+    if name == "widget.edged" {
+        return Value.Srf(widget.edged(
+            ink_of(args[0], style),
+            ink_of(args[1], style),
+            float_of(args[2]),
+            float_of(args[3])
+        ))
+    }
     if name == "widget.stretched" {
         return Value.Aln(widget.stretched())
     }
@@ -529,6 +543,9 @@ pub fn eval(
             val text = leaf.text
             if text == "style.ink" {
                 return Value.Col(style.ink)
+            }
+            if text == "style.face" {
+                return Value.Col(style.face)
             }
             val bound = look_up(text, env)
             if Value.is_None(bound) {

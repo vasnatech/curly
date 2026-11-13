@@ -32,8 +32,24 @@ pub fn panel(child: widget.Widget, style: controls.Style) -> widget.Widget {
         direction: widget.Direction.Column,
         spacing: gap,
         padding: widget.insets_all(width),
-        surface: widget.filled(style.ink),
+        surface: widget.edged(style.face, style.ink, 1.0, 4.0),
         align: widget.centred(),
+        name: "",
+        children: [child]
+    })
+}
+
+// **A bordered, rounded container, which until widget.edged existed could not be written here at
+// all.** `Surface.fill` and `Surface.border` are `Option`s and this dialect has no syntax for one
+// -- `Option<paint.Color>.Some(...)` is three tokens outside it -- so a design could say a
+// container's padding and its alignment but not its border or its corners.
+pub fn ghost_panel(child: widget.Widget, style: controls.Style) -> widget.Widget {
+    return widget.Widget.Group(widget.Stack {
+        direction: widget.Direction.Column,
+        spacing: gap,
+        padding: widget.insets_all(width),
+        surface: widget.outlined(style.ink, 2.0, 6.0),
+        align: widget.stretched(),
         name: "",
         children: [child]
     })

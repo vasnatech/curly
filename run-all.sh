@@ -78,7 +78,16 @@ if (cd "$ROOT/ziman" && ZIMAN_MODULE_PATH=src/main/ziman \
         "$ZIMAN" tools/read_design.zm -- --check src/test/resources/design_lint >/dev/null 2>&1); then
     fail "read_design parsed a fixture it should have refused"
   else
-    note "design files parse; the fixture does not"
+    # **And the clean half must pass**, which is not the same statement. It holds a
+    # `widget.Stack` literal -- the only way a design file can put a surface behind a container or
+    # align its children -- so a reader that stopped treating a struct's values as nodes fails
+    # here. No real design file contains one, so without this fixture that branch had no input.
+    if (cd "$ROOT/ziman" && ZIMAN_MODULE_PATH=src/main/ziman \
+          "$ZIMAN" tools/read_design.zm -- --check src/test/resources/design_lint/breaks_nothing_ui.zm); then
+      note "design files parse; the fixture does not; its clean half does"
+    else
+      fail "read_design refused the fixture it should have accepted"
+    fi
   fi
 else
   fail "a design file cannot be read by a builder"

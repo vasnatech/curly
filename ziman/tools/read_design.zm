@@ -666,7 +666,12 @@ pub fn with_span_replaced(text: string, at: Span, replacement: string) -> string
     return concat(substring(text, 0, at.from), replacement, substring(text, at.to, len(text)))
 }
 
+// A directory to sweep, or one file to check on its own -- which is how a gate can say "this
+// file must pass" about a fixture that lives beside one that must fail.
 fn design_files(root: string) -> [string] {
+    if ends_with(root, ".zm") {
+        return [root]
+    }
     val out = mutable_array_new<string>()
     walk(root, out)
     return snapshot(out)
@@ -691,10 +696,34 @@ fn walk(dir: string, out: MutableArray<string>) {
 }
 
 // Every node's span, in the order `paths_in` walks them: a node, then each child's subtree.
+//
+// **Written out by hand rather than over `children_of`, and that is the point.** The check below
+// compares this walk against the paths, and the paths are built from `children_of` -- so if this
+// used it too, both sides would move together and a `children_of` that forgot a node kind would
+// pass. It did: dropping a struct's values from `children_of` changed nothing until this walk
+// stopped sharing it. Matching the variants here is the only thing in the comparison that does
+// not depend on what `children_of` thinks a child is.
 fn spans_in(node: Node, out: MutableArray<Span>) {
     push(out, span_of(node))
-    for child in children_of(node) {
-        spans_in(child, out)
+    switch node {
+        Call(c) {
+            for a in c.args {
+                spans_in(a, out)
+            }
+        }
+        Struct(f) {
+            for v in f.values {
+                spans_in(v, out)
+            }
+        }
+        List(items) {
+            for one in items.items {
+                spans_in(one, out)
+            }
+        }
+        Str(_) { unit }
+        Num(_) { unit }
+        Path(_) { unit }
     }
 }
 

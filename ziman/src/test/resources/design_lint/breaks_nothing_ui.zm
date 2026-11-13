@@ -20,3 +20,21 @@ pub fn verify_notify(b: controls.Button, style: controls.Style) -> widget.Widget
 pub fn with_strings(style: controls.Style) -> widget.Widget {
     return widget.label_of("if you var a val, for while", 12.0, style.ink)
 }
+
+// **A `widget.Stack` literal, which the dialect permits and this fixture exists to exercise.**
+// `row_of` and `column_of` take spacing and children and nothing else, so a literal is the only
+// way a design file can put a surface behind a container or align its children other than the
+// default -- the two things lib/ui gained surfaces and alignment for. It is here because without
+// it no design file contains one, and a reader that stopped treating a struct's values as
+// children would pass every check.
+pub fn panel(child: widget.Widget, style: controls.Style) -> widget.Widget {
+    return widget.Widget.Group(widget.Stack {
+        direction: widget.Direction.Column,
+        spacing: gap,
+        padding: widget.insets_all(width),
+        surface: widget.filled(style.ink),
+        align: widget.centred(),
+        name: "",
+        children: [child]
+    })
+}

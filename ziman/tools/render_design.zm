@@ -42,6 +42,8 @@ pub enum Value {
     Sty(controls.Style)
     Met(widget.Metrics)
     Ins(widget.Insets)
+    Srf(widget.Surface)
+    Aln(widget.Alignment)
     None
 }
 
@@ -66,6 +68,8 @@ fn widget_of(v: Value) -> widget.Widget {
         Sty(_) { widget.flex() }
         Met(_) { widget.flex() }
         Ins(_) { widget.flex() }
+        Srf(_) { widget.flex() }
+        Aln(_) { widget.flex() }
         None { widget.flex() }
     }
 }
@@ -86,6 +90,8 @@ fn float_of(v: Value) -> float {
         Sty(_) { 0.0 }
         Met(_) { 0.0 }
         Ins(_) { 0.0 }
+        Srf(_) { 0.0 }
+        Aln(_) { 0.0 }
         None { 0.0 }
     }
 }
@@ -106,6 +112,8 @@ fn string_of(v: Value) -> string {
         Sty(_) { "" }
         Met(_) { "" }
         Ins(_) { "" }
+        Srf(_) { "" }
+        Aln(_) { "" }
         None { "" }
     }
 }
@@ -126,6 +134,8 @@ fn widgets_of(v: Value) -> [widget.Widget] {
         Sty(_) { [] }
         Met(_) { [] }
         Ins(_) { [] }
+        Srf(_) { [] }
+        Aln(_) { [] }
         None { [] }
     }
 }
@@ -245,6 +255,26 @@ fn call(name: string, args: [Value], style: controls.Style, m: widget.Metrics) -
             float_of(args[3])
         ))
     }
+    if name == "widget.no_surface" {
+        return Value.Srf(widget.no_surface())
+    }
+    if name == "widget.filled" {
+        return Value.Srf(widget.filled(ink_of(args[0], style)))
+    }
+    if name == "widget.stretched" {
+        return Value.Aln(widget.stretched())
+    }
+    if name == "widget.centred" {
+        return Value.Aln(widget.centred())
+    }
+    // A Group is its Stack: the literal inside has already become a widget by the time this is
+    // called, so this passes it through rather than wrapping it twice.
+    if name == "widget.Widget.Group" {
+        return args[0]
+    }
+    if name == "widget.no_insets" {
+        return Value.Ins(widget.no_insets())
+    }
     if name == "widget.insets_all" {
         return Value.Ins(widget.insets_all(float_of(args[0])))
     }
@@ -270,6 +300,8 @@ fn call(name: string, args: [Value], style: controls.Style, m: widget.Metrics) -
             Sty(_) { Value.None }
             Met(_) { Value.None }
             Ins(_) { Value.None }
+            Srf(_) { Value.None }
+            Aln(_) { Value.None }
             None { Value.None }
         }
     }
@@ -289,6 +321,8 @@ fn call(name: string, args: [Value], style: controls.Style, m: widget.Metrics) -
             Sty(_) { Value.None }
             Met(_) { Value.None }
             Ins(_) { Value.None }
+            Srf(_) { Value.None }
+            Aln(_) { Value.None }
             None { Value.None }
         }
     }
@@ -308,6 +342,8 @@ fn call(name: string, args: [Value], style: controls.Style, m: widget.Metrics) -
             Sty(_) { Value.None }
             Met(_) { Value.None }
             Ins(_) { Value.None }
+            Srf(_) { Value.None }
+            Aln(_) { Value.None }
             None { Value.None }
         }
     }
@@ -327,6 +363,8 @@ fn call(name: string, args: [Value], style: controls.Style, m: widget.Metrics) -
             Sty(_) { Value.None }
             Met(_) { Value.None }
             Ins(_) { Value.None }
+            Srf(_) { Value.None }
+            Aln(_) { Value.None }
             None { Value.None }
         }
     }
@@ -346,6 +384,8 @@ fn call(name: string, args: [Value], style: controls.Style, m: widget.Metrics) -
             Sty(_) { Value.None }
             Met(_) { Value.None }
             Ins(_) { Value.None }
+            Srf(_) { Value.None }
+            Aln(_) { Value.None }
             None { Value.None }
         }
     }
@@ -365,15 +405,67 @@ fn call(name: string, args: [Value], style: controls.Style, m: widget.Metrics) -
             Sty(_) { Value.None }
             Met(_) { Value.None }
             Ins(_) { Value.None }
+            Srf(_) { Value.None }
+            Aln(_) { Value.None }
             None { Value.None }
         }
     }
     return Value.None
 }
 
+fn text_of_node(node: read_design.Node) -> string {
+    return read_design.text_of(node)
+}
+
+fn surface_of(v: Value) -> widget.Surface {
+    return switch v {
+        Srf(sf) { sf }
+        W(_) { widget.no_surface() }
+        F(_) { widget.no_surface() }
+        S(_) { widget.no_surface() }
+        E(_) { widget.no_surface() }
+        B(_) { widget.no_surface() }
+        T(_) { widget.no_surface() }
+        M(_) { widget.no_surface() }
+        R(_) { widget.no_surface() }
+        C(_) { widget.no_surface() }
+        L(_) { widget.no_surface() }
+        Col(_) { widget.no_surface() }
+        Sty(_) { widget.no_surface() }
+        Met(_) { widget.no_surface() }
+        Ins(_) { widget.no_surface() }
+        Aln(_) { widget.no_surface() }
+        None { widget.no_surface() }
+    }
+}
+
+fn align_of(v: Value) -> widget.Alignment {
+    return switch v {
+        Aln(a) { a }
+        W(_) { widget.stretched() }
+        F(_) { widget.stretched() }
+        S(_) { widget.stretched() }
+        E(_) { widget.stretched() }
+        B(_) { widget.stretched() }
+        T(_) { widget.stretched() }
+        M(_) { widget.stretched() }
+        R(_) { widget.stretched() }
+        C(_) { widget.stretched() }
+        L(_) { widget.stretched() }
+        Col(_) { widget.stretched() }
+        Sty(_) { widget.stretched() }
+        Met(_) { widget.stretched() }
+        Ins(_) { widget.stretched() }
+        Srf(_) { widget.stretched() }
+        None { widget.stretched() }
+    }
+}
+
 fn insets_of(v: Value) -> widget.Insets {
     return switch v {
         Ins(i) { i }
+        Srf(_) { widget.no_insets() }
+        Aln(_) { widget.no_insets() }
         W(_) { widget.no_insets() }
         F(_) { widget.no_insets() }
         S(_) { widget.no_insets() }
@@ -407,6 +499,8 @@ fn ink_of(v: Value, style: controls.Style) -> paint.Color {
         Sty(_) { style.ink }
         Met(_) { style.ink }
         Ins(_) { style.ink }
+        Srf(_) { style.ink }
+        Aln(_) { style.ink }
         None { style.ink }
     }
 }
@@ -456,11 +550,63 @@ pub fn eval(
             }
             return Value.L(Widgets { items: snapshot(out) })
         }
-        Struct(_) {
-            // A struct literal is a `widget.Stack`, which only an internal helper builds; a
-            // builder never needs to place one.
-            push(missing, "struct literal")
-            return Value.None
+        Struct(f) {
+            // **A `widget.Stack` literal, which is how a design file says the things the helpers
+            // cannot**: a surface behind a container, or an alignment other than the default.
+            // `row_of` and `column_of` take spacing and children and nothing else, so this is not
+            // an escape hatch a design file could do without -- it is the only way to express two
+            // of the features `lib/ui` has.
+            if f.name != "widget.Stack" {
+                push(missing, concat(f.name, " { }"))
+                return Value.None
+            }
+            var direction = widget.Direction.Column
+            var spacing = 0.0
+            var padding = widget.no_insets()
+            var surface = widget.no_surface()
+            var align = widget.stretched()
+            var children: [widget.Widget] = []
+            var i = 0
+            for key in f.keys {
+                // **The direction is read, not evaluated.** `widget.Direction.Row` is an enum
+                // case, not a value this registry builds, and evaluating it would report a name
+                // nobody declared. Its text is the whole of its meaning.
+                if key == "direction" {
+                    direction = if text_of_node(f.values[i]) == "widget.Direction.Row" {
+                        widget.Direction.Row
+                    } else {
+                        widget.Direction.Column
+                    }
+                    i = i + 1
+                    continue
+                }
+                val v = eval(f.values[i], env, known, all, records, style, m, missing)
+                if key == "spacing" {
+                    spacing = float_of(v)
+                }
+                if key == "padding" {
+                    padding = insets_of(v)
+                }
+                if key == "surface" {
+                    surface = surface_of(v)
+                }
+                if key == "align" {
+                    align = align_of(v)
+                }
+                if key == "children" {
+                    children = widgets_of(v)
+                }
+                i = i + 1
+            }
+            return Value.W(widget.Widget.Group(widget.Stack {
+                direction: direction,
+                spacing: spacing,
+                padding: padding,
+                surface: surface,
+                align: align,
+                children: children,
+                name: ""
+            }))
         }
         Call(c) {
             val args = mutable_array_new<Value>()

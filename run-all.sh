@@ -84,6 +84,17 @@ else
   fail "a design file cannot be read by a builder"
 fi
 
+# **And what the reader understood must print back to the same thing.** If it does not, the reader
+# is guessing somewhere, and a builder built on it would save something nobody wrote. Compared
+# against the source's own tokens rather than against a second printing, which would compare the
+# writer with itself.
+if (cd "$ROOT/ziman" && ZIMAN_MODULE_PATH=src/main/ziman:. \
+      "$ZIMAN" tools/write_design.zm -- --check src/main/ziman); then
+  :
+else
+  fail "a design file does not survive a round trip"
+fi
+
 phase "ziman unit tests"
 if (cd "$ROOT/ziman" && ZIMAN_MODULE_PATH=src/main/ziman ZIMAN_RESOURCE_PATH=src/test/resources \
       "$ZIMAN" test src/test/unit/*.zm) | tail -1; then

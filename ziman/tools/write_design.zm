@@ -1,0 +1,228 @@
+// Writes a design file back out from what the reader understood, and checks that the reader
+// understood all of it.
+//
+// **The round trip settled how a builder must edit, and the answer is: not like this.** Writing
+// the file back from the tree is semantically lossless -- every component parses to an identical
+// tree afterwards, which is the property `--check` keeps -- and it is still the wrong way to save,
+// for three reasons the experiment measured rather than guessed:
+//
+//   * **Half the file is explanation.** 7,701 bytes of comments out of 16,079, 96 lines out of
+//     336. A regenerating editor deletes them on the first save.
+//   * **Derived constants collapse to their values.** `editor_strip_width = tab_width *
+//     editor_tabs` comes back as `500.0`, so the one-number-in-one-place rule is quietly undone
+//     and changing `tab_width` stops changing the strip.
+//   * **`pub val tab_width` comes back as `val tab_width`**, and the logic file imports it. That
+//     is not a loss of niceties; the regenerated file does not compile.
+//
+// So an editor edits **in place**: it rewrites the span one node occupies and leaves every other
+// byte alone, which is what a refactoring tool does and what this tree cannot yet support, because
+// its nodes carry no source positions. That is the next thing the builder needs.
+//
+// What `--check` is worth keeping for: it proves the reader is faithful. If what the reader
+// understood no longer prints back to the same tree, the reader has started guessing.
+use fs
+use os
+use tools/read_design
+use tools/read_design.Component
+use tools/read_design.Constant
+use tools/read_design.Node
+use tools/read_design.Record
+
+fn literal_of(node: Node) -> string {
+    return switch node {
+        Str(text) { concat("\"", text, "\"") }
+        Num(text) { text }
+        Path(text) { text }
+        Call(c) {
+            var out = concat(c.name, "(")
+            var first = true
+            for a in c.args {
+                if !first {
+                    out = concat(out, ", ")
+                }
+                out = concat(out, literal_of(a))
+                first = false
+            }
+            concat(out, ")")
+        }
+        List(items) {
+            var out = "["
+            var first = true
+            for one in items.items {
+                if !first {
+                    out = concat(out, ", ")
+                }
+                out = concat(out, literal_of(one))
+                first = false
+            }
+            concat(out, "]")
+        }
+        Struct(f) {
+            var out = concat(f.name, " { ")
+            var i = 0
+            for key in f.keys {
+                if i > 0 {
+                    out = concat(out, ", ")
+                }
+                out = concat(out, key, ": ", literal_of(f.values[i]))
+                i = i + 1
+            }
+            concat(out, " }")
+        }
+    }
+}
+
+fn params_text(c: Component) -> string {
+    var out = ""
+    var first = true
+    for p in c.params {
+        if !first {
+            out = concat(out, ", ")
+        }
+        out = concat(out, p.name, ": ", p.said)
+        first = false
+    }
+    return out
+}
+
+fn design_files(root: string) -> [string] {
+    val out = mutable_array_new<string>()
+    walk(root, out)
+    return snapshot(out)
+}
+
+fn walk(dir: string, out: MutableArray<string>) {
+    switch fs.list_dir(dir) {
+        Ok(names) {
+            for name in names {
+                val path = fs.path_join(dir, name)
+                if fs.is_dir(path) {
+                    walk(path, out)
+                } else {
+                    if ends_with(name, "_ui.zm") {
+                        push(out, path)
+                    }
+                }
+            }
+        }
+        Err(_) { unit }
+    }
+}
+
+fn tree_text(body: string) -> string {
+    val ts = read_design.tokens_of(body)
+    val start = if len(ts) > 0 && ts[0].text == "return" { 1 } else { 0 }
+    return literal_of(read_design.expr_at(ts, start).node)
+}
+
+// The tokens of a body, minus a leading `return`, which is what the writer does not emit.
+fn body_tokens(body: string) -> [read_design.Token] {
+    val ts = read_design.tokens_of(body)
+    val out = mutable_array_new<read_design.Token>()
+    var i = if len(ts) > 0 && ts[0].text == "return" { 1 } else { 0 }
+    while i < len(ts) {
+        push(out, ts[i])
+        i = i + 1
+    }
+    return snapshot(out)
+}
+
+// **Compared against the source's own tokens, not against a second printing.** The first version
+// of this check printed the tree, read it back, printed it again and compared the two -- which
+// compares the writer with itself. A writer that renamed every string to "x" consistently was a
+// fixed point and passed. Mutation found it. The original's tokens are the only thing in this
+// comparison the writer did not produce.
+fn same_tokens(left: [read_design.Token], right: [read_design.Token]) -> bool {
+    if len(left) != len(right) {
+        return false
+    }
+    var i = 0
+    while i < len(left) {
+        if left[i].kind != right[i].kind || left[i].text != right[i].text {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn check(root: string) {
+    var components = 0
+    var bad = 0
+    for file in design_files(root) {
+        val text = switch fs.read_text(file) {
+            Ok(t) { t }
+            Err(why) {
+                print(format("write_design: cannot read {}: {}", file, why))
+                os.exit(1)
+                ""
+            }
+        }
+        for c in read_design.components_of(text) {
+            components = components + 1
+            val written = tree_text(c.body)
+            if !same_tokens(body_tokens(c.body), read_design.tokens_of(written)) {
+                bad = bad + 1
+                print(format("{}: {} does not survive a round trip", file, c.name))
+                print(format("  wrote: {}", written))
+            }
+        }
+    }
+    if bad > 0 {
+        print(format("write_design: {} of {} component(s) changed meaning", str(bad), str(components)))
+        os.exit(1)
+    }
+    print(format("write_design: {} component(s) survive a round trip unchanged", str(components)))
+}
+
+fn main() {
+    val args = os.args()
+    if len(args) > 0 && args[0] == "--check" {
+        check(if len(args) > 1 { args[1] } else { "src/main/ziman" })
+        return
+    }
+    val path = if len(args) > 0 { args[0] } else { "src/main/ziman/gui/request_ui.zm" }
+    val out_path = if len(args) > 1 { args[1] } else { "/tmp/round_trip.zm" }
+    val text = switch fs.read_text(path) {
+        Ok(t) { t }
+        Err(why) {
+            print(format("cannot read {}: {}", path, why))
+            return
+        }
+    }
+    var out = ""
+    // The imports, copied rather than understood: nothing in the tree records them.
+    for line in lines(text) {
+        if starts_with(line, "use ") {
+            out = concat(out, line, "\n")
+        }
+    }
+    out = concat(out, "\n")
+    for c in read_design.constants_of(text) {
+        out = concat(out, format("val {} = {}\n", c.name, str(c.value)))
+    }
+    for r in read_design.records_of(text) {
+        out = concat(out, format("\npub struct {} {{\n", r.name))
+        for f in r.fields {
+            out = concat(out, format("    {}: {}\n", f.name, f.said))
+        }
+        out = concat(out, "}\n")
+    }
+    for c in read_design.components_of(text) {
+        val ts = read_design.tokens_of(c.body)
+        val start = if len(ts) > 0 && ts[0].text == "return" { 1 } else { 0 }
+        val tree = read_design.expr_at(ts, start).node
+        val shown = if c.exported { "pub fn" } else { "fn" }
+        out = concat(out, format(
+            "\n{} {}({}) -> widget.Widget {{\n    return {}\n}}\n",
+            shown,
+            c.name,
+            params_text(c),
+            literal_of(tree)
+        ))
+    }
+    switch fs.write_bytes(out_path, to_bytes(out)) {
+        Ok(_) { print(format("wrote {} ({} bytes from {})", out_path, str(len(out)), str(len(text)))) }
+        Err(why) { print(format("write: {}", why)) }
+    }
+}

@@ -645,7 +645,7 @@ fn drop_last(xs: MutableArray<controls.TreeRow>) {
         i = i + 1
     }
     clear(xs)
-    for one in snapshot(kept) {
+    for one in kept {
         push(xs, one)
     }
 }
@@ -658,7 +658,7 @@ fn drop_last_int(xs: MutableArray<int>) {
         i = i + 1
     }
     clear(xs)
-    for one in snapshot(kept) {
+    for one in kept {
         push(xs, one)
     }
 }
@@ -671,7 +671,7 @@ fn drop_last_text(xs: MutableArray<string>) {
         i = i + 1
     }
     clear(xs)
-    for one in snapshot(kept) {
+    for one in kept {
         push(xs, one)
     }
 }

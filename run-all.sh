@@ -104,6 +104,23 @@ else
   fail "a design file does not survive a round trip"
 fi
 
+# **ziman's own linter, which nothing here had ever run.** It finds the quadratic shapes a
+# reviewer does not: a string rebuilt from a copy of itself on every pass of a loop, or a
+# `snapshot` of a builder taken inside the loop that is still filling it. It had 22 findings
+# across the design tools the first time it was pointed at them. Like `--fmt --check`, it reports
+# by PRINTING and still exits 0, so the output is what has to be checked.
+phase "ziman lint"
+findings="$(cd "$ROOT/ziman" && ZIMAN_MODULE_PATH=src/main/ziman:. "$ZIMAN" --lint --check \
+  src/main/ziman/*.zm src/main/ziman/core/*.zm src/main/ziman/core/import/*.zm \
+  src/main/ziman/cli/*.zm src/main/ziman/cli/commands/*.zm \
+  src/main/ziman/tui/*.zm src/main/ziman/server/*.zm \
+  src/main/ziman/gui/*.zm tools/*.zm 2>&1 | grep -E "^(src|\./tools|tools)/" || true)"
+if [ -n "$findings" ]; then
+  fail "lint: $findings"
+else
+  note "no lint findings"
+fi
+
 phase "ziman unit tests"
 if (cd "$ROOT/ziman" && ZIMAN_MODULE_PATH=src/main/ziman ZIMAN_RESOURCE_PATH=src/test/resources \
       "$ZIMAN" test src/test/unit/*.zm) | tail -1; then

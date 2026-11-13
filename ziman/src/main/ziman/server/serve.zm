@@ -136,7 +136,7 @@ fn resolved_path(root: string, path: string) -> Option<string> {
         return Option<string>.Some(fs.path_join(root, "index.html"))
     }
     var joined = root
-    for segment in snapshot(out) {
+    for segment in out {
         joined = fs.path_join(joined, segment)
     }
     return Option<string>.Some(joined)

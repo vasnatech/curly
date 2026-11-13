@@ -29,60 +29,73 @@ use tools/read_design.Node
 use tools/read_design.Record
 
 fn literal_of(node: Node) -> string {
-    return switch node {
-        Str(leaf) { concat("\"", leaf.text, "\"") }
-        Num(leaf) { leaf.text }
-        Path(leaf) { leaf.text }
+    val out = mutable_string_new()
+    write_node(node, out)
+    return snapshot(out)
+}
+
+// **Appended into one buffer rather than rebuilt per piece.** `out = concat(out, ...)` inside a
+// loop copies everything written so far on every pass, which is quadratic in the length of what
+// it is building -- and a component's body is the whole tree. ziman's own `--lint` says so, and
+// said so about fourteen places in this file before anyone ran it.
+fn write_node(node: Node, out: MutableString) {
+    switch node {
+        Str(leaf) {
+            append(out, "\"", leaf.text, "\"")
+        }
+        Num(leaf) { append(out, leaf.text) }
+        Path(leaf) { append(out, leaf.text) }
         Call(c) {
-            var out = concat(c.name, "(")
+            append(out, c.name, "(")
             var first = true
             for a in c.args {
                 if !first {
-                    out = concat(out, ", ")
+                    append(out, ", ")
                 }
-                out = concat(out, literal_of(a))
+                write_node(a, out)
                 first = false
             }
-            concat(out, ")")
+            append(out, ")")
         }
         List(items) {
-            var out = "["
+            append(out, "[")
             var first = true
             for one in items.items {
                 if !first {
-                    out = concat(out, ", ")
+                    append(out, ", ")
                 }
-                out = concat(out, literal_of(one))
+                write_node(one, out)
                 first = false
             }
-            concat(out, "]")
+            append(out, "]")
         }
         Struct(f) {
-            var out = concat(f.name, " { ")
+            append(out, f.name, " { ")
             var i = 0
             for key in f.keys {
                 if i > 0 {
-                    out = concat(out, ", ")
+                    append(out, ", ")
                 }
-                out = concat(out, key, ": ", literal_of(f.values[i]))
+                append(out, key, ": ")
+                write_node(f.values[i], out)
                 i = i + 1
             }
-            concat(out, " }")
+            append(out, " }")
         }
     }
 }
 
 fn params_text(c: Component) -> string {
-    var out = ""
+    val out = mutable_string_new()
     var first = true
     for p in c.params {
         if !first {
-            out = concat(out, ", ")
+            append(out, ", ")
         }
-        out = concat(out, p.name, ": ", p.said)
+        append(out, p.name, ": ", p.said)
         first = false
     }
-    return out
+    return snapshot(out)
 }
 
 fn design_files(root: string) -> [string] {
@@ -190,30 +203,30 @@ fn main() {
             return
         }
     }
-    var out = ""
+    val out = mutable_string_new()
     // The imports, copied rather than understood: nothing in the tree records them.
     for line in lines(text) {
         if starts_with(line, "use ") {
-            out = concat(out, line, "\n")
+            append(out, line, "\n")
         }
     }
-    out = concat(out, "\n")
+    append(out, "\n")
     for c in read_design.constants_of(text) {
-        out = concat(out, format("val {} = {}\n", c.name, str(c.value)))
+        append(out, format("val {} = {}\n", c.name, str(c.value)))
     }
     for r in read_design.records_of(text) {
-        out = concat(out, format("\npub struct {} {{\n", r.name))
+        append(out, format("\npub struct {} {{\n", r.name))
         for f in r.fields {
-            out = concat(out, format("    {}: {}\n", f.name, f.said))
+            append(out, format("    {}: {}\n", f.name, f.said))
         }
-        out = concat(out, "}\n")
+        append(out, "}\n")
     }
     for c in read_design.components_of(text) {
         val ts = read_design.tokens_of(c.body)
         val start = if len(ts) > 0 && ts[0].text == "return" { 1 } else { 0 }
         val tree = read_design.expr_at(ts, start).node
         val shown = if c.exported { "pub fn" } else { "fn" }
-        out = concat(out, format(
+        append(out, format(
             "\n{} {}({}) -> widget.Widget {{\n    return {}\n}}\n",
             shown,
             c.name,
@@ -221,8 +234,11 @@ fn main() {
             literal_of(tree)
         ))
     }
-    switch fs.write_bytes(out_path, to_bytes(out)) {
-        Ok(_) { print(format("wrote {} ({} bytes from {})", out_path, str(len(out)), str(len(text)))) }
+    val written = snapshot(out)
+    switch fs.write_bytes(out_path, to_bytes(written)) {
+        Ok(_) {
+            print(format("wrote {} ({} bytes from {})", out_path, str(len(written)), str(len(text))))
+        }
         Err(why) { print(format("write: {}", why)) }
     }
 }

@@ -775,7 +775,7 @@ fn main() {
             val drawn = render(c, [], known, all, records, style, m, missing)
             if len(missing) > 0 {
                 print(format("  {} thing(s) the builder could not place:", str(len(missing))))
-                for one in snapshot(missing) {
+                for one in missing {
                     print(format("    {}", one))
                 }
             }

@@ -38,7 +38,7 @@ pub struct Finding {
 // Everything that is not code on this line: a string literal, then a comment. In that order,
 // because a `//` inside a string is not a comment and a quote inside a comment is not a string.
 pub fn code_of(line: string) -> string {
-    var out = ""
+    val out = mutable_string_new()
     var i = 0
     var in_string = false
     val n = len(line)
@@ -53,14 +53,14 @@ pub fn code_of(line: string) -> string {
                 in_string = true
             } else {
                 if i + 2 <= n && substring(line, i, i + 2) == "//" {
-                    return out
+                    return snapshot(out)
                 }
-                out = concat(out, ch)
+                append(out, ch)
             }
         }
         i = i + 1
     }
-    return out
+    return snapshot(out)
 }
 
 // Whether `word` appears in `code` as a word rather than inside a longer name -- so `if` is found
@@ -107,7 +107,7 @@ pub fn findings_of(file: string, text: string) -> [Finding] {
     var in_body = false
     var in_header = false
     var number = 0
-    var header = ""
+    val header = mutable_string_new()
     var exported = false
     var header_line = 0
     for raw in lines(text) {
@@ -118,7 +118,8 @@ pub fn findings_of(file: string, text: string) -> [Finding] {
             continue
         }
         if !in_body && !in_header && starts_function(code) {
-            header = trimmed
+            clear(header)
+            append(header, trimmed)
             exported = starts_with(trimmed, "pub fn ")
             header_line = number
             // A signature may wrap, so the body starts at the line that opens the brace.
@@ -135,7 +136,7 @@ pub fn findings_of(file: string, text: string) -> [Finding] {
             continue
         }
         if in_header {
-            header = concat(header, " ", trimmed)
+            append(header, " ", trimmed)
             if ends_with(trimmed, "{") {
                 in_header = false
                 in_body = true

@@ -570,40 +570,93 @@ pub fn span_in_file(c: Component, node: Node) -> Span {
     return Span { from: c.body_from + at.from, to: c.body_from + at.to }
 }
 
-// The first node whose text matches, depth first. A real editor would address a node by a path
-// from the root -- the builder knows which box was clicked -- so this is the probe's way of
-// naming one, not the interface.
-pub fn find(node: Node, wanted: string) -> Option<Node> {
-    if text_of(node) == wanted {
-        return Option<Node>.Some(node)
+// Where a node sits in the tree: the child index at each level, from the root down. **This is how
+// a node is named**, and the reason is that nothing else is stable. Addressing by the text a node
+// reads -- which this probe did first -- picks the wrong one the moment two nodes read the same
+// thing, and `gap` appears eleven times in one component. A click cannot produce text either: a
+// builder knows which box was pressed, and a box is a position.
+pub struct Path {
+    steps: [int]
+}
+
+// A node's children, in the order they are written. The three kinds that have any.
+pub fn children_of(node: Node) -> [Node] {
+    return switch node {
+        Call(c) { c.args }
+        Struct(f) { f.values }
+        List(items) { items.items }
+        Str(_) { [] }
+        Num(_) { [] }
+        Path(_) { [] }
     }
-    switch node {
-        Call(c) {
-            for a in c.args {
-                if Some(found) = find(a, wanted) {
-                    return Option<Node>.Some(found)
-                }
-            }
+}
+
+pub fn node_at(root: Node, path: Path) -> Option<Node> {
+    var here = root
+    for step in path.steps {
+        val kids = children_of(here)
+        if step < 0 || step >= len(kids) {
+            return Option<Node>.None
         }
-        Struct(f) {
-            for v in f.values {
-                if Some(found) = find(v, wanted) {
-                    return Option<Node>.Some(found)
-                }
-            }
-        }
-        List(items) {
-            for one in items.items {
-                if Some(found) = find(one, wanted) {
-                    return Option<Node>.Some(found)
-                }
-            }
-        }
-        Str(_) { unit }
-        Num(_) { unit }
-        Path(_) { unit }
+        here = kids[step]
     }
-    return Option<Node>.None
+    return Option<Node>.Some(here)
+}
+
+// Every path in the tree, root first. What a builder would hold one of per box it drew.
+pub fn paths_in(root: Node) -> [Path] {
+    val out = mutable_array_new<Path>()
+    push(out, Path { steps: [] })
+    collect_paths(root, [], out)
+    return snapshot(out)
+}
+
+fn collect_paths(node: Node, prefix: [int], out: MutableArray<Path>) {
+    var index = 0
+    for child in children_of(node) {
+        val here = mutable_array_new<int>()
+        for step in prefix {
+            push(here, step)
+        }
+        push(here, index)
+        val steps = snapshot(here)
+        push(out, Path { steps: steps })
+        collect_paths(child, steps, out)
+        index = index + 1
+    }
+}
+
+pub fn path_text(path: Path) -> string {
+    if len(path.steps) == 0 {
+        return "root"
+    }
+    var out = ""
+    var first = true
+    for step in path.steps {
+        if !first {
+            out = concat(out, ".")
+        }
+        out = concat(out, str(step))
+        first = false
+    }
+    return out
+}
+
+// The path of the first node reading `wanted`, depth first. **A probe's way of naming a node, not
+// the interface**: a builder addresses by path because it knows which box was clicked. This is how
+// a command line names one.
+pub fn path_of_text(root: Node, wanted: string) -> Option<Path> {
+    for path in paths_in(root) {
+        switch node_at(root, path) {
+            Some(node) {
+                if text_of(node) == wanted {
+                    return Option<Path>.Some(path)
+                }
+            }
+            None { unit }
+        }
+    }
+    return Option<Path>.None
 }
 
 // **One span rewritten, every other byte kept.** This is what the round trip said an editor has
@@ -634,6 +687,14 @@ fn walk(dir: string, out: MutableArray<string>) {
             }
         }
         Err(_) { unit }
+    }
+}
+
+// Every node's span, in the order `paths_in` walks them: a node, then each child's subtree.
+fn spans_in(node: Node, out: MutableArray<Span>) {
+    push(out, span_of(node))
+    for child in children_of(node) {
+        spans_in(child, out)
     }
 }
 
@@ -669,6 +730,47 @@ fn check(root: string) {
                     str(left),
                     str(trailing)
                 ))
+            }
+            // **Every path must name exactly one node, and the same one tomorrow.** A builder
+            // holds a path per box it drew and asks for that node when the box is clicked, so a
+            // path resolving to nothing -- or to a node whose span is not where the walk found it
+            // -- is a selection landing on the wrong thing. Checked by walking the tree and the
+            // paths side by side: the nth path must be the nth node.
+            val walked = mutable_array_new<Span>()
+            spans_in(parsed.node, walked)
+            val addressed = paths_in(parsed.node)
+            val wanted = snapshot(walked)
+            if len(wanted) != len(addressed) {
+                bad = bad + 1
+                print(format(
+                    "{}: {} has {} node(s) but {} path(s)",
+                    file,
+                    c.name,
+                    str(len(wanted)),
+                    str(len(addressed))
+                ))
+            } else {
+                var n = 0
+                for path in addressed {
+                    val found = switch node_at(parsed.node, path) {
+                        Some(node) { span_of(node) }
+                        None { Span { from: 0 - 1, to: 0 - 1 } }
+                    }
+                    if found.from != wanted[n].from || found.to != wanted[n].to {
+                        bad = bad + 1
+                        print(format(
+                            "{}: {} path {} resolves to {}..{}, not {}..{}",
+                            file,
+                            c.name,
+                            path_text(path),
+                            str(found.from),
+                            str(found.to),
+                            str(wanted[n].from),
+                            str(wanted[n].to)
+                        ))
+                    }
+                    n = n + 1
+                }
             }
         }
     }

@@ -37,6 +37,10 @@ val env_width = 200.0
 val below_editors = 8.0
 val sidebar_width = 280.0
 val status_height = 18.0
+val pair_name_width = 220.0
+val pair_remove_width = 28.0
+val pair_add_width = 120.0
+val table_gap = 4.0
 // **One number, five tabs.** `tab_width` is the number the tab control and the box the strip is
 // laid out in both come from, and writing 500.0 here would be the second place it lives -- which
 // is the thing this codebase keeps removing. So the dialect allows arithmetic **in a constant**,
@@ -185,5 +189,42 @@ pub fn main_column(it: Screen, style: controls.Style, m: widget.Metrics) -> widg
         widget.expand(it.lower),
         widget.fixed_of(0.0, status_height, mono_label(it.status, small_size, style)),
         widget.fixed_of(0.0, gap, widget.flex())
+    ])
+}
+
+// ------------------------------------------------- a table, which is the repetition case
+
+// One row of a name-and-value table.
+//
+// **This is the row template, and splitting it out is how the dialect answers repetition.** A
+// table is a `for` over data, and a design file has no loops -- so the loop stays in the logic
+// file and calls this once per row, while the layout of a row, which is the design-y part, lives
+// here. It is the shape every UI system converges on: a template and a container.
+pub fn pair_row(
+    name: controls.Entry,
+    value: controls.Entry,
+    remove: controls.Button,
+    style: controls.Style,
+    m: widget.Metrics
+) -> widget.Widget {
+    return widget.fixed_of(0.0, row_height, widget.row_of(gap, [
+        widget.fixed_of(pair_name_width, 0.0, controls.entry_widget(name, style, m)),
+        widget.expand(controls.entry_widget(value, style, m)),
+        widget.fixed_of(pair_remove_width, 0.0, controls.button_widget(remove, style))
+    ]))
+}
+
+// The rows, and the button that adds another under them.
+//
+// **`rows` is a repeated slot**, which is the only new idea here: a slot was a widget, and it can
+// be a list of them. An editor draws a few placeholders and calls it repeated content, which is
+// what every editor already does with a list.
+pub fn pair_table(rows: [widget.Widget], add: controls.Button, style: controls.Style) -> widget.Widget {
+    return widget.column_of(table_gap, [
+        widget.column_of(table_gap, rows),
+        widget.fixed_of(0.0, row_height, widget.row_of(gap, [
+            widget.fixed_of(pair_add_width, 0.0, controls.button_widget(add, style)),
+            widget.expand(widget.flex())
+        ]))
     ])
 }

@@ -713,20 +713,15 @@ fn naming_widget(n: Naming, style: controls.Style, m: widget.Metrics) -> widget.
 }
 
 // A table as a column of rows with its add button under them.
+// **The loop, and nothing else.** A table is a repeat over data and a design file has no loops,
+// so what is left here is the iteration: the row's layout and the table's arrangement both live
+// in `request_ui`, and this calls the row template once per row.
 fn table_widget(t: PairTable, style: controls.Style, m: widget.Metrics) -> widget.Widget {
     val rows = mutable_array_new<widget.Widget>()
     for row in t.rows {
-        push(rows, widget.fixed_of(0.0, row_height, widget.row_of(gap, [
-            widget.fixed_of(220.0, 0.0, controls.entry_widget(row.name, style, m)),
-            widget.expand(controls.entry_widget(row.value, style, m)),
-            widget.fixed_of(28.0, 0.0, controls.button_widget(row.remove, style))
-        ])))
+        push(rows, request_ui.pair_row(row.name, row.value, row.remove, style, m))
     }
-    push(rows, widget.fixed_of(0.0, row_height, widget.row_of(gap, [
-        widget.fixed_of(120.0, 0.0, controls.button_widget(t.add, style)),
-        widget.expand(widget.flex())
-    ])))
-    return widget.column_of(4.0, snapshot(rows))
+    return request_ui.pair_table(snapshot(rows), t.add, style)
 }
 
 // The authorization editor: a picker, and the fields the picked kind needs.

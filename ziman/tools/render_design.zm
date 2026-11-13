@@ -673,18 +673,25 @@ fn record(v: Value, shop: Shop, here: [int]) -> Value {
 //
 // The lookup is linear because the table is small and built once per render; a builder redrawing
 // on every mouse move would index it.
-pub fn spot_at(laid: widget.Laid, p: geom.Point, spots: [Spot]) -> Option<Spot> {
+pub struct Picked {
+    spot: Spot
+    // Where it was drawn. **Both answers come from the one walk**, because anything that found the
+    // box a second time would be free to find a different one.
+    bounds: geom.Rect
+}
+
+pub fn spot_at(laid: widget.Laid, p: geom.Point, spots: [Spot]) -> Option<Picked> {
     val chain = widget.chain_at(laid, p)
     var i = len(chain) - 1
     while i >= 0 {
         for one in spots {
             if one.tag == chain[i].name {
-                return Option<Spot>.Some(one)
+                return Option<Picked>.Some(Picked { spot: one, bounds: chain[i].bounds })
             }
         }
         i = i - 1
     }
-    return Option<Spot>.None
+    return Option<Picked>.None
 }
 
 pub fn eval(node: Node, env: [Binding], shop: Shop, here: [int]) -> Value {

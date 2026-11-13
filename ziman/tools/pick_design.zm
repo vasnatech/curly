@@ -8,13 +8,19 @@
 //
 //   pick_design.zm <file> <component> <x> <y>          what is under that point
 //   pick_design.zm --set <file> <c> <x> <y> <source>   rewrite that node, in place
+//   pick_design.zm --draw <file> <c> <x> <y> <out>     the screen with that node outlined
 //   pick_design.zm --check [root]                      every control resolves to the node that
 //                                                      drew it, and rewriting it hits that node
 use controls
 use font
 use fs
 use geom
+use image
 use os
+use paint
+use raster
+use scene
+use shape
 use tools/read_design
 use tools/read_design.Component
 use tools/render_design
@@ -70,41 +76,40 @@ fn spot_named(spots: [Spot], tag: string) -> Option<Spot> {
     return Option<Spot>.None
 }
 
-fn metrics() -> widget.Metrics {
-    // **A measured font, not a stub.** A stub metric is fine for asserting that two boxes differ,
-    // and useless here: the whole question is where a real glyph run puts a real box.
+// **A measured font, not a stub.** A stub metric is fine for asserting that two boxes differ, and
+// useless here: the whole question is where a real glyph run puts a real box.
+//
+// It answers `Option` rather than exiting, because there is no `FontRef` to hand back on the way
+// out -- a function that exits still has to typecheck its own return.
+fn typeface() -> Option<font.FontRef> {
     val font_path = switch os.get_env("ZIMAN_FONT") {
         Some(p) { p }
         None { "../../ziman/vendor/fonts/Caladea-Regular.ttf" }
     }
-    var found = widget.metrics_of(
-        fn(text: string, size: float) -> float { return (len(text) as float) * 7.0 },
-        fn(size: float) -> float { return size * 1.4 }
-    )
     switch fs.read_bytes(font_path) {
         Ok(data) {
             switch font.load(data) {
-                Ok(face) {
-                    switch widget.metrics_for(face) {
-                        Ok(got) { found = got }
-                        Err(why) {
-                            print(format("metrics: {}", why))
-                            os.exit(1)
-                        }
-                    }
-                }
-                Err(why) {
-                    print(format("load {}: {}", font_path, why))
-                    os.exit(1)
-                }
+                Ok(f) { return Option<font.FontRef>.Some(f) }
+                Err(why) { print(format("load {}: {}", font_path, why)) }
             }
         }
+        Err(why) { print(format("font ({}): {}", font_path, why)) }
+    }
+    return Option<font.FontRef>.None
+}
+
+fn metrics_of(face: font.FontRef) -> widget.Metrics {
+    return switch widget.metrics_for(face) {
+        Ok(got) { got }
         Err(why) {
-            print(format("font ({}): {}", font_path, why))
+            print(format("metrics: {}", why))
             os.exit(1)
+            widget.metrics_of(
+                fn(text: string, size: float) -> float { return 0.0 },
+                fn(size: float) -> float { return size }
+            )
         }
     }
-    return found
 }
 
 fn read(path: string) -> string {
@@ -238,7 +243,8 @@ fn check_component(
             continue
         }
         switch render_design.spot_at(laid, centre(one.bounds), spots) {
-            Some(spot) {
+            Some(picked) {
+                val spot = picked.spot
                 val owner = switch component_named(spot.component, all) {
                     Some(o) { o }
                     None { c }
@@ -393,7 +399,16 @@ fn source_of(owner: Component, node: read_design.Node, text: string) -> string {
 }
 
 fn check(root: string) {
-    val m = metrics()
+    val m = switch typeface() {
+        Some(face) { metrics_of(face) }
+        None {
+            os.exit(1)
+            widget.metrics_of(
+                fn(text: string, size: float) -> float { return 0.0 },
+                fn(size: float) -> float { return size }
+            )
+        }
+    }
     var bad = 0
     var checked = 0
     for file in design_files(root) {
@@ -446,7 +461,16 @@ fn set(path: string, wanted: string, p: geom.Point, replacement: string) {
             all[0]
         }
     }
-    val m = metrics()
+    val m = switch typeface() {
+        Some(face) { metrics_of(face) }
+        None {
+            os.exit(1)
+            widget.metrics_of(
+                fn(text: string, size: float) -> float { return 0.0 },
+                fn(size: float) -> float { return size }
+            )
+        }
+    }
     val shop = render_design.shop_of(
         read_design.constants_of(text),
         all,
@@ -457,7 +481,8 @@ fn set(path: string, wanted: string, p: geom.Point, replacement: string) {
     val drawn = render_design.render(c, [], shop)
     val laid = widget.layout(render_design.widget_of(drawn), canvas, m)
     switch render_design.spot_at(laid, p, snapshot(shop.spots)) {
-        Some(spot) {
+        Some(picked) {
+            val spot = picked.spot
             val owner = switch component_named(spot.component, all) {
                 Some(o) { o }
                 None { c }
@@ -500,8 +525,90 @@ fn set(path: string, wanted: string, p: geom.Point, replacement: string) {
     }
 }
 
+// The screen, with the node under a point outlined on top of it. **Proof by picture**, which is
+// the one check a person can make that no assertion here replaces: a selection drawn in the wrong
+// place is obvious at a glance and says nothing to a test comparing strings.
+fn draw(face: font.FontRef, path: string, wanted: string, p: geom.Point, out_path: string) {
+    val text = read(path)
+    val all = read_design.components_of(text)
+    val c = switch component_named(wanted, all) {
+        Some(got) { got }
+        None {
+            print(format("no component named {}", wanted))
+            os.exit(1)
+            all[0]
+        }
+    }
+    val m = metrics_of(face)
+    val shop = render_design.shop_of(
+        read_design.constants_of(text),
+        all,
+        read_design.records_of(text),
+        controls.default_style(),
+        m
+    )
+    val drawn = render_design.render(c, [], shop)
+    val laid = widget.layout(render_design.widget_of(drawn), canvas, m)
+    val ops = mutable_array_new<scene.Op>()
+    val base = widget.paint(laid, m)
+    for op in base.ops {
+        push(ops, op)
+    }
+    switch render_design.spot_at(laid, p, snapshot(shop.spots)) {
+        Some(picked) {
+            push(ops, scene.stroke(
+                shape.rect_path(picked.bounds),
+                paint.solid(paint.rgb(0.85, 0.15, 0.25)),
+                paint.stroke_of(2.0)
+            ))
+            print(format("{} of {}", read_design.path_text(picked.spot.path), picked.spot.component))
+        }
+        None { print("nothing there; drawing the screen on its own") }
+    }
+    val o = with raster.options() {
+        fonts: [face],
+        samples: 4,
+        background: Option<paint.Color>.Some(paint.rgb(1.0, 1.0, 1.0)),
+        max_pixels: 4000000
+    }
+    switch raster.surface_of(canvas.width, canvas.height, 1.0) {
+        Ok(surface) {
+            switch raster.render_into(surface, scene.with_ops(base, snapshot(ops)), o) {
+                Ok(picture) {
+                    switch fs.write_bytes(out_path, image.encode_png(picture)) {
+                        Ok(_) { print(format("  drew {}", out_path)) }
+                        Err(why) { print(format("  write: {}", why)) }
+                    }
+                }
+                Err(why) { print(format("  render: {}", why)) }
+            }
+        }
+        Err(why) { print(format("  surface: {}", why)) }
+    }
+}
+
 fn main() {
     val args = os.args()
+    if len(args) > 0 && args[0] == "--draw" {
+        if len(args) < 6 {
+            print("usage: pick_design.zm --draw <file> <component> <x> <y> <out.png>")
+            os.exit(1)
+            return
+        }
+        switch typeface() {
+            Some(face) {
+                draw(
+                    face,
+                    args[1],
+                    args[2],
+                    geom.point_of(number_said(args, 3, 0.0), number_said(args, 4, 0.0)),
+                    args[5]
+                )
+            }
+            None { os.exit(1) }
+        }
+        return
+    }
     if len(args) > 0 && args[0] == "--set" {
         if len(args) < 6 {
             print("usage: pick_design.zm --set <file> <component> <x> <y> <source>")
@@ -529,7 +636,16 @@ fn main() {
             all[0]
         }
     }
-    val m = metrics()
+    val m = switch typeface() {
+        Some(face) { metrics_of(face) }
+        None {
+            os.exit(1)
+            widget.metrics_of(
+                fn(text: string, size: float) -> float { return 0.0 },
+                fn(size: float) -> float { return size }
+            )
+        }
+    }
     val shop = render_design.shop_of(
         read_design.constants_of(text),
         all,
@@ -543,7 +659,8 @@ fn main() {
     val p = geom.point_of(x, y)
     print(format("{} node(s) a click can name in {}", str(len(spots)), c.name))
     switch render_design.spot_at(laid, p, spots) {
-        Some(spot) {
+        Some(picked) {
+            val spot = picked.spot
             val owner = switch component_named(spot.component, all) {
                 Some(o) { o }
                 None { c }

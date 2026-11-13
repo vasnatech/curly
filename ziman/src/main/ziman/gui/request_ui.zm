@@ -43,6 +43,18 @@ val pair_add_width = 120.0
 val table_gap = 4.0
 val auth_label_width = 110.0
 val auth_picker_width = 160.0
+val rule_kind_width = 120.0
+val rule_name_width = 160.0
+val rule_said_width = 70.0
+val rule_secret_width = 90.0
+val dialog_label_width = 90.0
+val dialog_field_width = 260.0
+val dialog_error_height = 16.0
+// **The dialog is the size it has with an error showing, always.** A dialog that grows when you
+// mistype jumps under the pointer, so the box is fixed at its tallest: three rows and the error
+// line. Arithmetic, and legal here because a constant is where the dialect allows it.
+val dialog_width = dialog_label_width + gap + dialog_field_width
+val dialog_height = ((row_height + gap) * 3.0) + dialog_error_height
 // **One number, five tabs.** `tab_width` is the number the tab control and the box the strip is
 // laid out in both come from, and writing 500.0 here would be the second place it lives -- which
 // is the thing this codebase keeps removing. So the dialect allows arithmetic **in a constant**,
@@ -268,4 +280,64 @@ pub fn picker_row(label: string, picker: controls.Menu, style: controls.Style) -
 // does -- traded against triplicating the layout.
 pub fn rows_panel(rows: [widget.Widget]) -> widget.Widget {
     return widget.column_of(table_gap, rows)
+}
+
+// ------------------------------------------------------------ the extraction rules table
+
+// One extraction rule: where it reads from, what it is called, the word for its kind, the source
+// itself, whether it is a secret, and the button that removes it.
+pub fn rule_row(
+    kind: controls.Menu,
+    name: controls.Entry,
+    said: string,
+    source: controls.Entry,
+    secret: controls.CheckBox,
+    remove: controls.Button,
+    style: controls.Style,
+    m: widget.Metrics
+) -> widget.Widget {
+    return widget.fixed_of(0.0, row_height, widget.row_of(gap, [
+        widget.fixed_of(rule_kind_width, 0.0, controls.menu_title_widget(kind, style)),
+        widget.fixed_of(rule_name_width, 0.0, controls.entry_widget(name, style, m)),
+        widget.fixed_of(rule_said_width, 0.0, mono_label(said, small_size, style)),
+        widget.expand(controls.entry_widget(source, style, m)),
+        widget.fixed_of(rule_secret_width, 0.0, controls.check_box_widget(secret, style, m)),
+        widget.fixed_of(pair_remove_width, 0.0, controls.button_widget(remove, style))
+    ]))
+}
+
+// ------------------------------------------------------------------- the Save As dialog
+
+pub fn dialog_field_row(
+    label: string,
+    field: controls.Entry,
+    style: controls.Style,
+    m: widget.Metrics
+) -> widget.Widget {
+    return widget.fixed_of(0.0, row_height, widget.row_of(gap, [
+        widget.fixed_of(dialog_label_width, 0.0, mono_label(label, small_size, style)),
+        widget.fixed_of(dialog_field_width, 0.0, controls.entry_widget(field, style, m))
+    ]))
+}
+
+pub fn dialog_error_row(said: string, style: controls.Style) -> widget.Widget {
+    return widget.fixed_of(0.0, dialog_error_height, mono_label(said, small_size, style))
+}
+
+pub fn dialog_buttons(
+    confirm: controls.Button,
+    cancel: controls.Button,
+    style: controls.Style
+) -> widget.Widget {
+    return widget.fixed_of(0.0, row_height, widget.row_of(gap, [
+        widget.fixed_of(dialog_label_width, 0.0, controls.button_widget(confirm, style)),
+        widget.fixed_of(dialog_label_width, 0.0, controls.button_widget(cancel, style))
+    ]))
+}
+
+// **Every width is given and none is `expand`.** A dialog is centred by its own natural size --
+// `dialog_layer` puts flexible space either side of it -- so a child asking to fill its parent is
+// asking the box how big it is while the box is asking the child.
+pub fn naming_dialog(rows: [widget.Widget]) -> widget.Widget {
+    return widget.fixed_of(dialog_width, dialog_height, widget.column_of(gap, rows))
 }

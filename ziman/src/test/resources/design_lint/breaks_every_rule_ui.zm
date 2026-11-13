@@ -1,0 +1,29 @@
+// A fixture, not a source file: it exists so the design lint can be shown to still bite. Four
+// functions, four rules broken, one each. Never compiled, never run -- `lint_design` reads lines.
+use controls
+use widget
+
+// Legal: arithmetic in a module-level constant, over other constants.
+val tab_width = 100.0
+val tabs = 5.0
+val strip = tab_width * tabs
+
+pub fn with_conditional(b: controls.Button, style: controls.Style) -> widget.Widget {
+    return if b.disabled { widget.flex() } else { controls.button_widget(b, style) }
+}
+
+pub fn with_local(b: controls.Button, style: controls.Style) -> widget.Widget {
+    val inner = controls.button_widget(b, style)
+    return inner
+}
+
+pub fn with_arithmetic(b: controls.Button, style: controls.Style) -> widget.Widget {
+    return widget.fixed_of(tab_width * 2.0, 0.0, controls.button_widget(b, style))
+}
+
+pub fn with_loop(items: [string], style: controls.Style) -> widget.Widget {
+    for i in items {
+        print(i)
+    }
+    return widget.flex()
+}

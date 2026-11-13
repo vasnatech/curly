@@ -1,0 +1,202 @@
+// The gate that keeps a `*_ui.zm` file inside the design dialect.
+//
+// **This is load-bearing, not tidiness.** A design file is meant to be read and written by a UI
+// builder, and what makes that possible is not the syntax -- it is Ziman -- but the *subset*: one
+// expression per function, calls and literals and field paths, nothing else. A subset that strict
+// is about as hard to parse as JSON. Let an `if` in, or arithmetic, or a local `val`, and the file
+// is a program again and the tool that owns it stops being able to read its own output. So the
+// line has to be held by something that fails a build, not by whoever remembers.
+//
+// **Textual, and sound because the formatter runs first.** Ziman exposes no expression tree to a
+// program -- `meta` is for declarations and attributes -- so this reads lines. That is only safe
+// because `--fmt --check` has already put every file in exactly one shape, which is the formatter
+// being an oracle again: the layout is known, so the text can be trusted.
+//
+//     ziman tools/lint_design.zm -- src/main/ziman
+use fs
+use os
+
+val forbidden_words = ["if", "while", "for", "switch", "val", "var"]
+val forbidden_operators = [" + ", " - ", " * ", " / ", " % "]
+
+pub struct Finding {
+    file: string
+    line: int
+    said: string
+}
+
+// Everything that is not code on this line: a string literal, then a comment. In that order,
+// because a `//` inside a string is not a comment and a quote inside a comment is not a string.
+pub fn code_of(line: string) -> string {
+    var out = ""
+    var i = 0
+    var in_string = false
+    val n = len(line)
+    while i < n {
+        val ch = substring(line, i, i + 1)
+        if in_string {
+            if ch == "\"" {
+                in_string = false
+            }
+        } else {
+            if ch == "\"" {
+                in_string = true
+            } else {
+                if i + 2 <= n && substring(line, i, i + 2) == "//" {
+                    return out
+                }
+                out = concat(out, ch)
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// Whether `word` appears in `code` as a word rather than inside a longer name -- so `if` is found
+// in `if x {` and not in `verify` or `notify`.
+//
+// **By hand rather than by regex**, because this runs for six words on every line of every design
+// file and `regex.compile` would be called once per check: the cost of a pattern that never
+// changes, paid per line.
+val name_chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"
+
+fn is_name_char(ch: string) -> bool {
+    return contains(name_chars, ch)
+}
+
+pub fn has_word(code: string, word: string) -> bool {
+    val n = len(code)
+    val w = len(word)
+    var from = 0
+    var found = false
+    while from <= n - w && !found {
+        val at = index_of(code, word, from)
+        if at < 0 {
+            return false
+        }
+        val before_ok = if at == 0 { true } else { !is_name_char(substring(code, at - 1, at)) }
+        val after = at + w
+        val after_ok = if after >= n { true } else { !is_name_char(substring(code, after, after + 1)) }
+        if before_ok && after_ok {
+            found = true
+        }
+        from = at + 1
+    }
+    return found
+}
+
+fn starts_function(code: string) -> bool {
+    val trimmed = trim(code)
+    return starts_with(trimmed, "fn ") || starts_with(trimmed, "pub fn ")
+}
+
+// One file's findings. A function's body may hold exactly one `return` and nothing that computes.
+pub fn findings_of(file: string, text: string) -> [Finding] {
+    val out = mutable_array_new<Finding>()
+    var in_body = false
+    var in_header = false
+    var number = 0
+    for raw in lines(text) {
+        number = number + 1
+        val code = code_of(raw)
+        val trimmed = trim(code)
+        if trimmed == "" {
+            continue
+        }
+        if !in_body && !in_header && starts_function(code) {
+            // A signature may wrap, so the body starts at the line that opens the brace.
+            if ends_with(trimmed, "{") {
+                in_body = true
+            } else {
+                in_header = true
+            }
+            continue
+        }
+        if in_header {
+            if ends_with(trimmed, "{") {
+                in_header = false
+                in_body = true
+            }
+            continue
+        }
+        if !in_body {
+            continue
+        }
+        if trimmed == "}" {
+            in_body = false
+            continue
+        }
+        for word in forbidden_words {
+            if has_word(code, word) {
+                push(out, Finding {
+                    file: file,
+                    line: number,
+                    said: concat("'", word, "' in a design function -- a design file computes nothing")
+                })
+            }
+        }
+        for operator in forbidden_operators {
+            if contains(code, operator) {
+                push(out, Finding {
+                    file: file,
+                    line: number,
+                    said: concat(
+                        "arithmetic ('",
+                        trim(operator),
+                        "') in a design function -- it belongs in a constant or in the logic file"
+                    )
+                })
+            }
+        }
+    }
+    return snapshot(out)
+}
+
+fn design_files(root: string) -> [string] {
+    val out = mutable_array_new<string>()
+    walk(root, out)
+    return snapshot(out)
+}
+
+fn walk(dir: string, out: MutableArray<string>) {
+    switch fs.list_dir(dir) {
+        Ok(names) {
+            for name in names {
+                val path = fs.path_join(dir, name)
+                if fs.is_dir(path) {
+                    walk(path, out)
+                } else {
+                    if ends_with(name, "_ui.zm") {
+                        push(out, path)
+                    }
+                }
+            }
+        }
+        Err(_) { unit }
+    }
+}
+
+fn main() {
+    val args = os.args()
+    val root = if len(args) > 0 { args[0] } else { "src/main/ziman" }
+    val files = design_files(root)
+    var total = 0
+    for file in files {
+        switch fs.read_text(file) {
+            Ok(text) {
+                for finding in findings_of(file, text) {
+                    print(format("{}:{}: {}", finding.file, str(finding.line), finding.said))
+                    total = total + 1
+                }
+            }
+            Err(why) { print(format("lint_design: cannot read {}: {}", file, why)) }
+        }
+    }
+    if total == 0 {
+        print(format("lint_design: {} design file(s), no findings", str(len(files))))
+        return
+    }
+    print(format("lint_design: {} finding(s)", str(total)))
+    os.exit(1)
+}

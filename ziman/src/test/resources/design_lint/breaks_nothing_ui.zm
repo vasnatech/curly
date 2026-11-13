@@ -1,0 +1,22 @@
+// The other half of the fixture: everything here is legal and a lint that cried wolf would say
+// otherwise. Keywords in a comment -- if, while, for, val, var -- keywords inside names, and
+// keywords inside a string literal.
+use controls
+use widget
+
+val gap = 8.0
+val width = 90.0
+val count = 3.0
+val strip = width * count
+
+pub fn verify_notify(b: controls.Button, style: controls.Style) -> widget.Widget {
+    // Names that contain keywords: verify, notify, interval, forward, available, evaluation.
+    return widget.row_of(gap, [
+        widget.fixed_of(width, 0.0, controls.button_widget(b, style)),
+        widget.expand(widget.flex())
+    ])
+}
+
+pub fn with_strings(style: controls.Style) -> widget.Widget {
+    return widget.label_of("if you var a val, for while", 12.0, style.ink)
+}

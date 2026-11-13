@@ -38,11 +38,34 @@ unformatted="$(cd "$ROOT/ziman" && ZIMAN_MODULE_PATH=src/main/ziman "$ZIMAN" --f
   src/main/ziman/*.zm src/main/ziman/core/*.zm src/main/ziman/core/import/*.zm \
   src/main/ziman/cli/*.zm src/main/ziman/cli/commands/*.zm \
   src/main/ziman/tui/*.zm src/main/ziman/server/*.zm \
+  src/main/ziman/gui/*.zm tools/*.zm \
   src/test/unit/*.zm src/test/other/*.zm 2>&1)"
 if [ -n "$unformatted" ]; then
   fail "unformatted: $unformatted"
 else
   note "all formatted"
+fi
+
+# **The design dialect, and the lint is load-bearing rather than tidy.** A `*_ui.zm` file is meant
+# to be read and written by a UI builder, and what makes that possible is the subset -- one
+# expression per function, calls and literals, nothing that computes. Let an `if` in and the file
+# is a program again and the tool stops being able to read its own output. Runs after the formatter
+# because it reads lines, which is only sound once every file is in one known shape.
+phase "design dialect"
+if (cd "$ROOT/ziman" && ZIMAN_MODULE_PATH=src/main/ziman \
+      "$ZIMAN" tools/lint_design.zm -- src/main/ziman); then
+  # **And the lint must still bite**, which a passing lint does not show. The fixture breaks one
+  # rule per function and the clean half is full of keywords in comments, names and strings, so a
+  # check that stopped working -- or started crying wolf -- fails here rather than going quiet.
+  caught="$(cd "$ROOT/ziman" && ZIMAN_MODULE_PATH=src/main/ziman \
+    "$ZIMAN" tools/lint_design.zm -- src/test/resources/design_lint 2>&1 | grep -c "^src/test")"
+  if [ "$caught" -eq 4 ]; then
+    note "design lint catches its fixture (4 findings)"
+  else
+    fail "design lint found $caught of 4 fixture violations"
+  fi
+else
+  fail "design dialect"
 fi
 
 phase "ziman unit tests"

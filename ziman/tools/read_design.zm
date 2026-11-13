@@ -19,34 +19,82 @@
 use fs
 use os
 
+// **Where a token was, not just what it was.** An editor rewrites the span a node occupies and
+// leaves every other byte alone -- which the round trip showed is the only way to save a design
+// file without deleting half of it -- and a span is only knowable if the tokens underneath carry
+// one. `from` and `to` are offsets into the text that was tokenised.
 pub struct Token {
     kind: string
     text: string
+    from: int
+    to: int
 }
 
-// A parsed expression. Recursive, like the widget tree it describes.
+// Where something sits in the text it was read from. **Half-open, like every other range here**:
+// `from` is the first character and `to` is one past the last, so `to - from` is the length and
+// `substring(text, from, to)` is exactly what was read.
+pub struct Span {
+    from: int
+    to: int
+}
+
+// A parsed expression. Recursive, like the widget tree it describes, and **every node carries the
+// span it came from** -- which is what lets an editor rewrite one node and leave every other byte
+// of the file alone. The round trip showed why that matters: regenerating a design file deletes
+// its comments, collapses its derived constants and drops a `pub`.
 pub struct Call {
     name: string
     args: [Node]
+    at: Span
 }
 
 pub struct Fields {
     name: string
     keys: [string]
     values: [Node]
+    at: Span
 }
 
 pub struct Items {
     items: [Node]
+    at: Span
+}
+
+// A literal or a name: the text, and where it was.
+pub struct Leaf {
+    text: string
+    at: Span
 }
 
 pub enum Node {
     Call(Call)
     Struct(Fields)
     List(Items)
-    Str(string)
-    Num(string)
-    Path(string)
+    Str(Leaf)
+    Num(Leaf)
+    Path(Leaf)
+}
+
+pub fn span_of(node: Node) -> Span {
+    return switch node {
+        Call(c) { c.at }
+        Struct(f) { f.at }
+        List(items) { items.at }
+        Str(leaf) { leaf.at }
+        Num(leaf) { leaf.at }
+        Path(leaf) { leaf.at }
+    }
+}
+
+pub fn text_of(node: Node) -> string {
+    return switch node {
+        Call(c) { c.name }
+        Struct(f) { f.name }
+        List(_) { "" }
+        Str(leaf) { leaf.text }
+        Num(leaf) { leaf.text }
+        Path(leaf) { leaf.text }
+    }
 }
 
 val digits = "0123456789"
@@ -82,7 +130,7 @@ pub fn tokens_of(source: string) -> [Token] {
                 text = concat(text, substring(source, j, j + 1))
                 j = j + 1
             }
-            push(out, Token { kind: "str", text: text })
+            push(out, Token { kind: "str", text: text, from: i, to: j + 1 })
             i = j + 1
             continue
         }
@@ -91,7 +139,7 @@ pub fn tokens_of(source: string) -> [Token] {
             while j < n && (is_in(digits, substring(source, j, j + 1)) || substring(source, j, j + 1) == ".") {
                 j = j + 1
             }
-            push(out, Token { kind: "num", text: substring(source, i, j) })
+            push(out, Token { kind: "num", text: substring(source, i, j), from: i, to: j })
             i = j
             continue
         }
@@ -100,17 +148,17 @@ pub fn tokens_of(source: string) -> [Token] {
             while j < n && is_in(name_chars, substring(source, j, j + 1)) {
                 j = j + 1
             }
-            push(out, Token { kind: "ident", text: substring(source, i, j) })
+            push(out, Token { kind: "ident", text: substring(source, i, j), from: i, to: j })
             i = j
             continue
         }
         if is_in(punctuation, ch) {
-            push(out, Token { kind: "punct", text: ch })
+            push(out, Token { kind: "punct", text: ch, from: i, to: i + 1 })
             i = i + 1
             continue
         }
         // Anything else is not in the dialect; say so rather than skipping it quietly.
-        push(out, Token { kind: "other", text: ch })
+        push(out, Token { kind: "other", text: ch, from: i, to: i + 1 })
         i = i + 1
     }
     return snapshot(out)
@@ -127,27 +175,39 @@ fn token_at(ts: [Token], i: int) -> Token {
     if i < len(ts) {
         return ts[i]
     }
-    return Token { kind: "end", text: "" }
+    return Token { kind: "end", text: "", from: 0, to: 0 }
 }
 
 // A dotted name: `widget.fixed_of`, `it.filter`, `widget.Direction.Column`.
 fn path_at(ts: [Token], start: int) -> Parsed {
-    var name = token_at(ts, start).text
+    val first = token_at(ts, start)
+    var name = first.text
+    var last = first.to
     var i = start + 1
     while token_at(ts, i).text == "." && token_at(ts, i + 1).kind == "ident" {
         name = concat(name, ".", token_at(ts, i + 1).text)
+        last = token_at(ts, i + 1).to
         i = i + 2
     }
-    return Parsed { node: Node.Path(name), next: i }
+    return Parsed {
+        node: Node.Path(Leaf { text: name, at: Span { from: first.from, to: last } }),
+        next: i
+    }
 }
 
 pub fn expr_at(ts: [Token], start: int) -> Parsed {
     val t = token_at(ts, start)
     if t.kind == "str" {
-        return Parsed { node: Node.Str(t.text), next: start + 1 }
+        return Parsed {
+            node: Node.Str(Leaf { text: t.text, at: Span { from: t.from, to: t.to } }),
+            next: start + 1
+        }
     }
     if t.kind == "num" {
-        return Parsed { node: Node.Num(t.text), next: start + 1 }
+        return Parsed {
+            node: Node.Num(Leaf { text: t.text, at: Span { from: t.from, to: t.to } }),
+            next: start + 1
+        }
     }
     if t.text == "[" {
         val items = mutable_array_new<Node>()
@@ -160,18 +220,18 @@ pub fn expr_at(ts: [Token], start: int) -> Parsed {
                 i = i + 1
             }
         }
-        return Parsed { node: Node.List(Items { items: snapshot(items) }), next: i + 1 }
+        val close = token_at(ts, i)
+        return Parsed {
+            node: Node.List(Items {
+                items: snapshot(items),
+                at: Span { from: t.from, to: close.to }
+            }),
+            next: i + 1
+        }
     }
     if t.kind == "ident" {
         val p = path_at(ts, start)
-        val name = switch p.node {
-            Path(text) { text }
-            Call(_) { "" }
-            Struct(_) { "" }
-            List(_) { "" }
-            Str(_) { "" }
-            Num(_) { "" }
-        }
+        val name = text_of(p.node)
         if token_at(ts, p.next).text == "(" {
             val args = mutable_array_new<Node>()
             var i = p.next + 1
@@ -183,7 +243,15 @@ pub fn expr_at(ts: [Token], start: int) -> Parsed {
                     i = i + 1
                 }
             }
-            return Parsed { node: Node.Call(Call { name: name, args: snapshot(args) }), next: i + 1 }
+            val close = token_at(ts, i)
+            return Parsed {
+                node: Node.Call(Call {
+                    name: name,
+                    args: snapshot(args),
+                    at: Span { from: t.from, to: close.to }
+                }),
+                next: i + 1
+            }
         }
         if token_at(ts, p.next).text == "{" {
             val keys = mutable_array_new<string>()
@@ -199,15 +267,24 @@ pub fn expr_at(ts: [Token], start: int) -> Parsed {
                     i = i + 1
                 }
             }
+            val close = token_at(ts, i)
             return Parsed {
-                node: Node.Struct(Fields { name: name, keys: snapshot(keys), values: snapshot(values) }),
+                node: Node.Struct(Fields {
+                    name: name,
+                    keys: snapshot(keys),
+                    values: snapshot(values),
+                    at: Span { from: t.from, to: close.to }
+                }),
                 next: i + 1
             }
         }
         return p
     }
     // Not in the dialect: hand it back as a path so the caller can see what stopped it.
-    return Parsed { node: Node.Path(concat("?", t.text)), next: start + 1 }
+    return Parsed {
+        node: Node.Path(Leaf { text: concat("?", t.text), at: Span { from: t.from, to: t.to } }),
+        next: start + 1
+    }
 }
 
 // Anything the parser could not place, which is what makes this a gate rather than a demo: a
@@ -238,7 +315,7 @@ pub fn unparsed_in(node: Node) -> int {
         }
         Str(_) { return 0 }
         Num(_) { return 0 }
-        Path(text) { return if starts_with(text, "?") { 1 } else { 0 } }
+        Path(leaf) { return if starts_with(leaf.text, "?") { 1 } else { 0 } }
     }
     return 0
 }
@@ -279,9 +356,9 @@ pub fn show(node: Node, depth: int) {
             }
             print(format("{}]", indent_of(depth)))
         }
-        Str(text) { print(format("{}\"{}\"", indent_of(depth), text)) }
-        Num(text) { print(format("{}{}", indent_of(depth), text)) }
-        Path(text) { print(format("{}{}", indent_of(depth), text)) }
+        Str(leaf) { print(format("{}\"{}\"", indent_of(depth), leaf.text)) }
+        Num(leaf) { print(format("{}{}", indent_of(depth), leaf.text)) }
+        Path(leaf) { print(format("{}{}", indent_of(depth), leaf.text)) }
     }
 }
 
@@ -341,6 +418,9 @@ pub struct Component {
     exported: bool
     params: [Param]
     body: string
+    // Where `body` starts in the file it came from, so a token's offset inside it can be turned
+    // into an offset into the file -- which is what an edit needs to rewrite one span.
+    body_from: int
 }
 
 // A module-level constant, already evaluated. **Arithmetic is allowed in one** -- it is how
@@ -435,10 +515,15 @@ pub fn components_of(text: string) -> [Component] {
     val out = mutable_array_new<Component>()
     var collecting = false
     var name = ""
-    var body = ""
     var signature = ""
     var exported = false
+    var body_from = 0
+    var offset = 0
     for line in lines(text) {
+        val line_from = offset
+        // Every line costs its own length plus the newline that followed it, which is what makes
+        // `body` below an exact slice of the file rather than a copy that merely looks like one.
+        offset = offset + len(line) + 1
         if starts_with(line, "pub fn ") || starts_with(line, "fn ") {
             val shown = starts_with(line, "pub fn ")
             exported = shown
@@ -447,13 +532,14 @@ pub fn components_of(text: string) -> [Component] {
             name = if at > 0 { substring(rest, 0, at) } else { rest }
             signature = trim(line)
             collecting = ends_with(trim(line), "{")
-            body = ""
+            body_from = offset
             continue
         }
         if !collecting && name != "" && !starts_with(trim(line), "//") {
             signature = concat(signature, " ", trim(line))
             if ends_with(trim(line), "{") {
                 collecting = true
+                body_from = offset
             }
             continue
         }
@@ -463,16 +549,68 @@ pub fn components_of(text: string) -> [Component] {
                     name: name,
                     exported: exported,
                     params: params_of(signature),
-                    body: body
+                    body: substring(text, body_from, line_from),
+                    body_from: body_from
                 })
                 collecting = false
                 name = ""
                 continue
             }
-            body = concat(body, "\n", line)
         }
     }
     return snapshot(out)
+}
+
+// ------------------------------------------------------------------- editing
+
+// Where a node sits **in the file**, rather than in the component's body. A body is an exact
+// slice, so this is one addition -- which is the whole reason `body_from` is recorded.
+pub fn span_in_file(c: Component, node: Node) -> Span {
+    val at = span_of(node)
+    return Span { from: c.body_from + at.from, to: c.body_from + at.to }
+}
+
+// The first node whose text matches, depth first. A real editor would address a node by a path
+// from the root -- the builder knows which box was clicked -- so this is the probe's way of
+// naming one, not the interface.
+pub fn find(node: Node, wanted: string) -> Option<Node> {
+    if text_of(node) == wanted {
+        return Option<Node>.Some(node)
+    }
+    switch node {
+        Call(c) {
+            for a in c.args {
+                if Some(found) = find(a, wanted) {
+                    return Option<Node>.Some(found)
+                }
+            }
+        }
+        Struct(f) {
+            for v in f.values {
+                if Some(found) = find(v, wanted) {
+                    return Option<Node>.Some(found)
+                }
+            }
+        }
+        List(items) {
+            for one in items.items {
+                if Some(found) = find(one, wanted) {
+                    return Option<Node>.Some(found)
+                }
+            }
+        }
+        Str(_) { unit }
+        Num(_) { unit }
+        Path(_) { unit }
+    }
+    return Option<Node>.None
+}
+
+// **One span rewritten, every other byte kept.** This is what the round trip said an editor has
+// to do instead of regenerating: the comments, the derived constants and the `pub` that a rewrite
+// loses are not reproduced here, they are simply never touched.
+pub fn with_span_replaced(text: string, at: Span, replacement: string) -> string {
+    return concat(substring(text, 0, at.from), replacement, substring(text, at.to, len(text)))
 }
 
 fn design_files(root: string) -> [string] {

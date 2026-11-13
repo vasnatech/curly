@@ -424,14 +424,15 @@ pub fn eval(
     missing: MutableArray<string>
 ) -> Value {
     switch node {
-        Num(text) {
-            return switch parse_float(text) {
+        Num(leaf) {
+            return switch parse_float(leaf.text) {
                 Ok(f) { Value.F(f) }
                 Err(_) { Value.F(0.0) }
             }
         }
-        Str(text) { return Value.S(text) }
-        Path(text) {
+        Str(leaf) { return Value.S(leaf.text) }
+        Path(leaf) {
+            val text = leaf.text
             if text == "style.ink" {
                 return Value.Col(style.ink)
             }

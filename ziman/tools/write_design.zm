@@ -30,9 +30,9 @@ use tools/read_design.Record
 
 fn literal_of(node: Node) -> string {
     return switch node {
-        Str(text) { concat("\"", text, "\"") }
-        Num(text) { text }
-        Path(text) { text }
+        Str(leaf) { concat("\"", leaf.text, "\"") }
+        Num(leaf) { leaf.text }
+        Path(leaf) { leaf.text }
         Call(c) {
             var out = concat(c.name, "(")
             var first = true

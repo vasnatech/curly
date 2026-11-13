@@ -1,0 +1,132 @@
+// The request bar and the sidebar, as design.
+//
+// **The dialect, which is the point of this file.** One expression per function; calls to
+// `widget.*`, `controls.*` and sibling design functions; literals; field paths off a parameter;
+// module-level constants that are literals. No `if`, no loops, no arithmetic, no function-local
+// `val`. A subset that strict is a sublanguage a tool can read and write -- about as hard to parse
+// as JSON -- which is what lets a UI builder own the file while the type checker still refuses a
+// binding that does not exist.
+//
+// **A design file takes its inputs as parameters and imports no application type.** The first
+// attempt gave every function the whole `State` and read `s.method` out of it, which is what a
+// binding looks like -- and it does not compile: `gui/state` would have to use this module to
+// draw itself while this module used `gui/state` for the type, and ziman refuses the cycle. The
+// fix is the better shape anyway. A component that declares `method: controls.Entry` says exactly
+// what it consumes, a builder can show that as a list of inputs, and the file depends on nothing
+// but the control vocabulary -- so it is portable, and it can never be made circular by anything
+// an application does. What it costs is that the *binding* moves to the call site, which is
+// design too as soon as the caller is a design function; only the root call is code.
+use controls
+use widget
+
+// Tokens. A constant here is a **literal, never a computation**: that is the line that keeps the
+// table flat enough for a tool to resolve without evaluating anything.
+val gap = 8.0
+val heading_height = 18.0
+val heading_size = 12.0
+val field_width = 90.0
+val row_height = 30.0
+val editor_gap = 4.0
+val small_size = 11.0
+val env_label_width = 110.0
+val env_width = 200.0
+// **The breathing room under the editors block, said here rather than added to its height by the
+// caller.** It was `+ 8.0` on the end of an arithmetic expression in the logic file, which is
+// where a component's own spacing cannot live: padding is a thing this box has, so the box says
+// it, and the measured height comes out right without anyone computing it.
+val below_editors = 8.0
+// **One number, five tabs.** `tab_width` is the number the tab control and the box the strip is
+// laid out in both come from, and writing 500.0 here would be the second place it lives -- which
+// is the thing this codebase keeps removing. So the dialect allows arithmetic **in a constant**,
+// over other constants in the same file, where it forbids it in a body: a flat table a tool can
+// evaluate without touching state, a function or a parameter.
+// **Both tabs and the box the strip is laid out in come from this one number**, which is why it
+// is `pub`: the control's own config needs it and so does the strip's width, and the logic file
+// imports it from here rather than keeping a second copy. A token lives in the design file and
+// travels outwards -- the direction that works, since a design file imports no application type.
+pub val tab_width = 100.0
+val editor_tabs = 5.0
+val pane_tabs = 2.0
+val editor_strip_width = tab_width * editor_tabs
+val pane_strip_width = tab_width * pane_tabs
+
+pub fn mono_label(text: string, size: float, style: controls.Style) -> widget.Widget {
+    return widget.label_of(text, size, style.ink)
+}
+
+pub fn sidebar(
+    filter: controls.Entry,
+    tree: controls.Tree,
+    style: controls.Style,
+    m: widget.Metrics
+) -> widget.Widget {
+    return widget.column_of(gap, [
+        widget.fixed_of(0.0, gap, widget.flex()),
+        widget.fixed_of(0.0, heading_height, mono_label("Requests", heading_size, style)),
+        widget.fixed_of(0.0, row_height, controls.entry_widget(filter, style, m)),
+        widget.expand(controls.tree_widget(tree, style))
+    ])
+}
+
+pub fn bar(
+    method: controls.Entry,
+    url: controls.Entry,
+    send: controls.Button,
+    save: controls.Button,
+    save_as: controls.Button,
+    style: controls.Style,
+    m: widget.Metrics
+) -> widget.Widget {
+    return widget.row_of(gap, [
+        widget.fixed_of(field_width, 0.0, controls.entry_widget(method, style, m)),
+        widget.expand(controls.entry_widget(url, style, m)),
+        widget.fixed_of(field_width, 0.0, controls.button_widget(send, style)),
+        widget.fixed_of(field_width, 0.0, controls.button_widget(save, style)),
+        widget.fixed_of(field_width, 0.0, controls.button_widget(save_as, style))
+    ])
+}
+
+// The strip of editor tabs, the editor the strip chose, and the environment row under it.
+//
+// **`body` is a slot and `body_height` is the price of one.** Which editor shows is a four-deep
+// conditional on `s.editors.selected`, and how tall it is depends on how many rows that editor
+// has -- neither is design, and both stay in the logic file. What the slot taught the dialect is
+// that a widget parameter is not enough on its own: this layer cannot ask how tall the content
+// is, so the caller passes the number as well. A slot is a widget **and its size**.
+pub fn editors(
+    tabs: controls.Tabs,
+    body: widget.Widget,
+    body_height: float,
+    env: controls.Menu,
+    style: controls.Style,
+    m: widget.Metrics
+) -> widget.Widget {
+    return widget.Widget.Group(widget.Stack {
+        direction: widget.Direction.Column,
+        spacing: editor_gap,
+        padding: widget.insets_of(0.0, 0.0, 0.0, below_editors),
+        surface: widget.no_surface(),
+        align: widget.stretched(),
+        name: "",
+        children: [
+            widget.fixed_of(0.0, row_height, widget.row_of(gap, [
+                widget.fixed_of(editor_strip_width, 0.0, controls.tabs_widget(tabs, style)),
+                widget.expand(widget.flex())
+            ])),
+            widget.fixed_of(0.0, body_height, body),
+            widget.fixed_of(0.0, row_height, widget.row_of(gap, [
+                widget.fixed_of(env_label_width, 0.0, mono_label("Environment", small_size, style)),
+                widget.fixed_of(env_width, 0.0, controls.menu_title_widget(env, style)),
+                widget.expand(widget.flex())
+            ]))
+        ]
+    })
+}
+
+// The Response/History switcher, which is the same shape with one tab strip and no slot.
+pub fn pane_switcher(panes: controls.Tabs, style: controls.Style) -> widget.Widget {
+    return widget.fixed_of(0.0, row_height, widget.row_of(gap, [
+        widget.fixed_of(pane_strip_width, 0.0, controls.tabs_widget(panes, style)),
+        widget.expand(widget.flex())
+    ]))
+}

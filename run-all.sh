@@ -118,6 +118,18 @@ else
   fail "a click does not name the node that drew it"
 fi
 
+# **The builder's own behaviour, which is in a module precisely so that it has some.** The window
+# itself opens a display and pumps an event queue and can only be looked at; everything it decides
+# lives in `tools/builder_state.zm`, which opens nothing. Its own module path, because these are
+# the design tools and not curly: a product test that could import `tools/` would blur the two.
+phase "builder"
+if (cd "$ROOT/ziman" && ZIMAN_MODULE_PATH=src/main/ziman:. \
+      "$ZIMAN" test tools/builder_state_test.zm); then
+  :
+else
+  fail "the builder does not behave"
+fi
+
 # **ziman's own linter, which nothing here had ever run.** It finds the quadratic shapes a
 # reviewer does not: a string rebuilt from a copy of itself on every pass of a loop, or a
 # `snapshot` of a builder taken inside the loop that is still filling it. It had 22 findings

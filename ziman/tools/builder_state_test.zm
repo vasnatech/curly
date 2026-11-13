@@ -1,0 +1,316 @@
+// The builder's behaviour, with no window, no display and no file.
+//
+// **Every case here is one the builder was driven by hand to find**, and the point of
+// `tools/builder_state.zm` being a separate module is that they are reachable at all: a window
+// that opens a display and polls an event queue can be looked at and not asserted on.
+//
+// The design under test is **a fixture in this file, not the real `request_ui.zm`**. The builder
+// is a tool for any design file, so a test tied to one of them would be measuring that file; and
+// `request_ui.zm` moves whenever curly's window does, which would make this suite fail for
+// reasons that have nothing to do with the builder.
+use controls
+use focus
+use geom
+use test
+use tools/builder_state
+use tools/builder_state.Shown
+use tools/read_design
+use tools/render_design.Spot
+use widget
+
+fn metrics() -> widget.Metrics {
+    return widget.metrics_of(
+        fn(text: string, size: float) -> float { return (len(text) as float) * 7.0 },
+        fn(size: float) -> float { return size * 1.4 }
+    )
+}
+
+fn style() -> controls.Style {
+    return controls.default_style()
+}
+
+val window_box = geom.rect_of(0.0, 0.0, 1400.0, 900.0)
+
+// A design file in the dialect, small enough to reason about: one record, one part, one root.
+fn fixture() -> string {
+    return join(separator: "\n", pieces: [
+        "use controls",
+        "use widget",
+        "",
+        "val gap = 8.0",
+        "val row_height = 30.0",
+        "",
+        "pub struct Screen {",
+        "    name: controls.Entry",
+        "    go: controls.Button",
+        "}",
+        "",
+        "pub fn field(name: controls.Entry, style: controls.Style, m: widget.Metrics) -> widget.Widget {",
+        "    return widget.row_of(gap, [controls.entry_widget(name, style, m), widget.flex()])",
+        "}",
+        "",
+        "pub fn screen(it: Screen, style: controls.Style, m: widget.Metrics) -> widget.Widget {",
+        "    return widget.column_of(gap, [",
+        "        widget.fixed_of(0.0, row_height, field(it.name, style, m)),",
+        "        widget.fixed_of(0.0, row_height, controls.button_widget(it.go, style)),",
+        "        widget.expand(widget.flex())",
+        "    ])",
+        "}",
+        ""
+    ])
+}
+
+fn opened() -> builder_state.State {
+    return builder_state.state_of("fixture_ui.zm", fixture())
+}
+
+fn laid_of(s: builder_state.State) -> widget.Laid {
+    return widget.layout(builder_state.view(s, style(), metrics()), window_box, metrics())
+}
+
+fn shown_of(s: builder_state.State, laid: widget.Laid) -> Shown {
+    val canvas = builder_state.canvas_of(s, style(), metrics())
+    return Shown {
+        laid: widget.layout(
+            canvas.widget_,
+            builder_state.bounds_of(laid, "canvas"),
+            metrics()
+        ),
+        spots: canvas.spots
+    }
+}
+
+fn acted(s: builder_state.State, input: controls.Input) -> builder_state.Step {
+    val laid = laid_of(s)
+    return builder_state.step(s, input, laid, shown_of(s, laid), style(), metrics())
+}
+
+// A press at the middle of a named box of the *design*, which is the only way a test can click
+// something the builder is only drawing.
+fn pressed_on_design(s: builder_state.State, name: string) -> builder_state.Step {
+    val laid = laid_of(s)
+    val shown = shown_of(s, laid)
+    val box = builder_state.bounds_of(shown.laid, name)
+    return builder_state.step(
+        s,
+        controls.Input.Press(geom.point_of(box.x + box.width / 2.0, box.y + box.height / 2.0)),
+        laid,
+        shown,
+        style(),
+        metrics()
+    )
+}
+
+// ---- what it opens on
+
+// **`screen` and not the first function in the file.** It is the dialect's one root; opening on a
+// helper would show a fragment of a window and call it the window.
+#[test]
+fn it_opens_on_the_root_and_not_the_first_part() {
+    test.assert_eq(builder_state.showing(opened()), "screen")
+    test.assert_eq(opened().parts.items[0], "field")
+}
+
+#[test]
+fn the_inputs_are_the_fields_the_file_declares() {
+    val s = opened()
+    test.assert_len(2, s.inputs.items)
+    test.assert_eq(s.inputs.items[0], "Screen.name: controls.Entry")
+    test.assert_eq(s.inputs.items[1], "Screen.go: controls.Button")
+}
+
+// **The design's controls are not in the builder's tab order, and that is the whole reason the
+// canvas is a second tree.** Rendering a design makes real controls -- a real entry, a real
+// button -- and putting them in the builder's own tree would hand them its keystrokes: clicking
+// the design's field would type into it instead of selecting it.
+#[test]
+fn nothing_in_the_design_can_take_the_focus() {
+    val s = opened()
+    val names = mutable_array_new<string>()
+    for one in focus.controls(laid_of(s)) {
+        push(names, one.name)
+    }
+    val reachable = snapshot(names)
+    for wanted in ["parts", "source", "apply", "revert", "inputs"] {
+        test.assert(contains(reachable, wanted))
+    }
+    // The fixture's own controls are named after its fields, and neither is here.
+    test.assert_false(contains(reachable, "name"))
+    test.assert_false(contains(reachable, "go"))
+}
+
+// ---- clicking the canvas
+
+#[test]
+fn a_press_on_the_canvas_selects_the_node_that_drew_it() {
+    val step = pressed_on_design(opened(), "go")
+    test.assert_eq(step.state.source.editor.text, "controls.button_widget(it.go, style)")
+    test.assert(contains(builder_state.selection_line(step.state), "1.1.2 of screen"))
+    test.assert_false(step.write)
+}
+
+// A click inside a part reports a node of *that part's* source, which is the file an editor would
+// open -- not the one line in the root that called it.
+#[test]
+fn a_press_inside_a_part_reports_a_node_of_the_part() {
+    val step = pressed_on_design(opened(), "name")
+    test.assert_eq(step.state.source.editor.text, "controls.entry_widget(name, style, m)")
+    test.assert(contains(builder_state.selection_line(step.state), "of field"))
+}
+
+// **There is no empty part of a canvas while a component is on it.** The root is laid out at the
+// canvas box and every point inside it is inside the root, so a press "on the background" selects
+// the root -- which is right, and is not the miss case. This test asserted the opposite first.
+#[test]
+fn a_press_on_the_background_selects_the_root() {
+    val laid = laid_of(opened())
+    val box = builder_state.bounds_of(laid, "canvas")
+    val low = geom.point_of(box.x + box.width / 2.0, box.y + box.height - 2.0)
+    val step = builder_state.step(
+        opened(),
+        controls.Input.Press(low),
+        laid,
+        shown_of(opened(), laid),
+        style(),
+        metrics()
+    )
+    test.assert(Option.is_Some(step.state.picked))
+    test.assert(contains(builder_state.selection_line(step.state), "root of screen"))
+}
+
+// **A miss clears the selection rather than keeping it.** An outline left over a node nobody is
+// pointing at is a lie about what Apply would rewrite. Reached with nothing on the canvas, which
+// is the only way there is nothing under the pointer.
+#[test]
+fn a_press_with_nothing_on_the_canvas_clears_the_selection() {
+    val chosen = pressed_on_design(opened(), "go").state
+    test.assert(Option.is_Some(chosen.picked))
+    val blank = with chosen { parts: with chosen.parts { selected: 0 - 1 } }
+    val laid = laid_of(blank)
+    val box = builder_state.bounds_of(laid, "canvas")
+    val away = geom.point_of(box.x + box.width / 2.0, box.y + box.height / 2.0)
+    val step = builder_state.step(
+        blank,
+        controls.Input.Press(away),
+        laid,
+        shown_of(blank, laid),
+        style(),
+        metrics()
+    )
+    test.assert(Option.is_None(step.state.picked))
+    test.assert_eq(step.state.source.editor.text, "")
+}
+
+// ---- choosing a component
+
+// **A new component clears the selection.** A path names a node of one component's tree and means
+// something else, or nothing, in another's.
+#[test]
+fn showing_another_component_clears_the_selection() {
+    val chosen = pressed_on_design(opened(), "go").state
+    test.assert(Option.is_Some(chosen.picked))
+    val moved = with chosen { parts: with chosen.parts { selected: 0 } }
+    val step = acted(moved, controls.Input.KeyDown(controls.keystroke_of(controls.Key.Down)))
+    test.assert(Option.is_None(step.state.picked))
+}
+
+// ---- applying an edit
+
+fn applied(s: builder_state.State) -> builder_state.Step {
+    val laid = laid_of(s)
+    val box = builder_state.bounds_of(laid, "apply")
+    val at = geom.point_of(box.x + box.width / 2.0, box.y + box.height / 2.0)
+    val shown = shown_of(s, laid)
+    val down = builder_state.step(s, controls.Input.Press(at), laid, shown, style(), metrics())
+    return builder_state.step(
+        down.state,
+        controls.Input.Release(at),
+        laid,
+        shown,
+        style(),
+        metrics()
+    )
+}
+
+#[test]
+fn apply_rewrites_the_span_and_leaves_every_other_byte_alone() {
+    val s = pressed_on_design(opened(), "go").state
+    val edited = with s { source: controls.text_area_of("source", "Source", "widget.flex()", 6) }
+    val step = applied(edited)
+    test.assert(step.write)
+    test.assert(contains(step.state.text, "widget.flex()"))
+    test.assert_false(contains(step.state.text, "controls.button_widget(it.go, style)"))
+    // Everything else is still there, which is what a span rewrite promises and a regenerated
+    // file does not.
+    test.assert(contains(step.state.text, "val gap = 8.0"))
+    test.assert(contains(step.state.text, "pub struct Screen {"))
+    test.assert(contains(step.state.text, "controls.entry_widget(name, style, m)"))
+    test.assert_eq(len(lines(step.state.text)), len(lines(fixture())))
+}
+
+// **The second Apply has to rewrite the right bytes too**, which is the case a tree that
+// remembered its old spans gets wrong: the first edit moves every span after it.
+#[test]
+fn a_second_apply_lands_on_the_node_and_not_on_stale_bytes() {
+    // **Both replacements are distinctive.** The first version of this test put `widget.flex()`
+    // in and then asserted it was gone, which the fixture's own `expand(widget.flex())` made
+    // false -- a failing test about a working program.
+    val first = applied(with pressed_on_design(opened(), "go").state {
+        source: controls.text_area_of("source", "Source", "mono_label_one(style)", 6)
+    })
+    test.assert(contains(first.state.text, "mono_label_one(style)"))
+    val again = applied(with first.state {
+        source: controls.text_area_of("source", "Source", "mono_label_two(style)", 6)
+    })
+    test.assert(again.write)
+    test.assert(contains(again.state.text, "mono_label_two(style)"))
+    test.assert_false(contains(again.state.text, "mono_label_one(style)"))
+    // **The bytes *after* the node are the ones that matter here**, and the first version of this
+    // test did not look at them. A stale span is the right length for the text that used to be
+    // there, so a second rewrite eats whatever follows -- and everything before the node is
+    // untouched either way, which is why asserting on it passed against the defect.
+    test.assert(contains(again.state.text, "widget.expand(widget.flex())"))
+    test.assert(contains(again.state.text, "controls.entry_widget(name, style, m)"))
+    test.assert(contains(again.state.text, "val gap = 8.0"))
+    // And it still parses as the same file: two components, one record.
+    test.assert_len(2, read_design.components_of(again.state.text))
+    test.assert_len(1, read_design.records_of(again.state.text))
+}
+
+#[test]
+fn apply_with_nothing_selected_writes_nothing() {
+    val step = applied(opened())
+    test.assert_false(step.write)
+    test.assert_eq(step.state.text, fixture())
+}
+
+// Revert puts the file's own bytes back in the box, so a half-typed edit can be abandoned.
+#[test]
+fn revert_restores_what_the_file_says() {
+    val s = pressed_on_design(opened(), "go").state
+    val typed = with s { source: controls.text_area_of("source", "Source", "nonsense", 6) }
+    val laid = laid_of(typed)
+    val box = builder_state.bounds_of(laid, "revert")
+    val at = geom.point_of(box.x + box.width / 2.0, box.y + box.height / 2.0)
+    val shown = shown_of(typed, laid)
+    val down = builder_state.step(typed, controls.Input.Press(at), laid, shown, style(), metrics())
+    val up = builder_state.step(
+        down.state,
+        controls.Input.Release(at),
+        laid,
+        shown,
+        style(),
+        metrics()
+    )
+    test.assert_eq(up.state.source.editor.text, "controls.button_widget(it.go, style)")
+}
+
+// ---- the keyboard
+
+#[test]
+fn tab_moves_the_focus_and_reaches_no_control() {
+    val s = opened()
+    val step = acted(s, controls.Input.KeyDown(controls.keystroke_of(controls.Key.Tab)))
+    test.assert(step.state.focused != s.focused)
+    test.assert_false(step.write)
+}

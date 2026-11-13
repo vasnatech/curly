@@ -268,6 +268,7 @@ spacing written in the wrong place.
 | `read_design.zm` | the text as a tree. Every node carries **the span it came from** |
 | `render_design.zm` | the tree as a window, with a placeholder invented for every input |
 | `pick_design.zm` | a point on that window as a node, and `--set` to rewrite that node in place |
+| `builder.zm` | all of the above in a window: a design file, a click on it, and the bytes that drew what was clicked |
 
 `read_design` keeps spans because **regenerating a design file from its tree is the wrong way to
 save**, which the round trip measured rather than guessed: 7,701 of 16,079 bytes are comments and a
@@ -282,10 +283,41 @@ ziman's `widget.chain_at` hands back the whole descent under a point so the look
 innermost node the *file* is responsible for -- a click on a tree row belongs to the tree, because
 the row was invented by `controls` while drawing and the file never wrote one.
 
-### Five gates, in `run-all.sh`
+### The builder
 
-Formatting, the dialect (with a fixture proving the lint bites), the parse, the round trip, and
-**click to source**: every control in every component is clicked in its own middle, and has to come
+```sh
+ziman-gui tools/builder.zm -- src/main/ziman/gui/request_ui.zm
+```
+
+Three panels: the file's components on the left, the one on show rendered in the middle, and what
+is selected on the right -- its path, its component, its byte range, its source in an editable box,
+and Apply. Clicking the canvas outlines the node that drew what was clicked and puts its bytes in
+the box; Apply rewrites that span in place and leaves every other byte of the file alone. The
+Inputs list is the record the design declares, which is the whole of what a caller has to supply.
+
+**The canvas is a second widget tree, laid out beside the builder's own and never merged into it**,
+and that is the decision the rest follows from. Rendering a design file makes *real* controls -- a
+real entry, a real tree -- and putting them in the builder's tree would put them in its tab order
+and hand them its keystrokes: clicking the design's filter box would type into it instead of
+selecting it. Laid out separately at the canvas box, the design is a picture the builder paints and
+hit-tests, its coordinates are already the window's, and there is no transform in either direction
+to get wrong.
+
+The logic is in `tools/builder_state.zm`, which opens no window and reads no font, so the suite can
+drive it; `builder.zm` is the part that cannot be tested and is kept as small as that costs. One
+line in the whole program can lose someone's work, and it is the `fs.write_bytes` in the shell --
+`step` computes the new text and stays pure.
+
+Two things found by running it. It sat at **104% of a core** doing nothing, because `window.poll`
+does not block and the loop had nothing to stop for. And a click took seconds to show: a full
+repaint of a window this size is ~900 ms at 1x and ~4.4 s at 2x, because a scene costs the sum of
+its ops' areas -- `curly gui` pays the same and only looks faster because its damage region is
+smaller. ziman's `near-term.md` carries the measurements.
+
+### Six gates, in `run-all.sh`
+
+Formatting, the dialect (with a fixture proving the lint bites), the parse, the round trip, the
+builder's own behaviour, and **click to source**: every control in every component is clicked in its own middle, and has to come
 back as a `controls.` call that names it *and* survive being rewritten there. The `controls.` half
 is load-bearing -- without it a mapping that answered "the component's root" to every point passed,
 because a root's source contains every name in the component. Mutation is what said so.

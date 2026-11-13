@@ -1,0 +1,533 @@
+// The builder's pure half: a state, the window it draws, and what an input does to it.
+//
+// **Split from `builder.zm` for the same reason `gui/state.zm` is split from `gui/app.zm`**: this
+// file opens no window, reads no font and polls no event queue, so every behaviour in it is
+// reachable from `ziman test` on a machine with no display. The shell is the part that cannot be
+// tested and it is kept as small as that costs.
+//
+// **The canvas is a second tree, laid out beside the builder's own and never merged into it.**
+// That is the one design decision the rest follows from. Rendering a design file produces real
+// `controls` -- a real entry, a real tree -- and putting them inside the builder's widget tree
+// would put them in its tab order and hand them its keystrokes: clicking the design's filter box
+// would type into it instead of selecting it. Laid out separately, the design is a picture the
+// builder paints and hit-tests, and nothing it contains can take the focus.
+//
+// It is laid out **at the canvas box**, not at the origin and then translated, so its coordinates
+// are already the window's and there is no transform anywhere -- not in the paint, not in the hit
+// test, and so no pair of them to disagree.
+use controls
+use focus
+use fs
+use geom
+use tools/read_design
+use tools/read_design.Component
+use tools/read_design.Constant
+use tools/read_design.Record
+use tools/render_design
+use tools/render_design.Spot
+use widget
+
+val panel_width = 250.0
+val inspector_width = 380.0
+val gap = 8.0
+val row_height = 30.0
+val heading_size = 13.0
+val small_size = 11.0
+val source_rows = 6
+
+pub struct State {
+    path: string
+    // The file as it is on disk, which is what spans index into. Re-read on every load rather
+    // than tracked, because a span is a promise about bytes and a stale copy breaks it silently.
+    text: string
+    // **Parsed once per load, not per frame.** Every panel reads these, and curly's own window
+    // measured what rebuilding per frame costs: an idle window at 66% of a core.
+    components: [Component]
+    constants: [Constant]
+    records: [Record]
+    parts: controls.List
+    source: controls.Entry
+    apply: controls.Button
+    revert: controls.Button
+    inputs: controls.List
+    picked: Option<Spot>
+    status: string
+    focused: string
+}
+
+pub fn showing(s: State) -> string {
+    if s.parts.selected < 0 || s.parts.selected >= len(s.parts.items) {
+        return ""
+    }
+    return s.parts.items[s.parts.selected]
+}
+
+fn component_named(name: string, all: [Component]) -> Option<Component> {
+    for c in all {
+        if c.name == name {
+            return Option<Component>.Some(c)
+        }
+    }
+    return Option<Component>.None
+}
+
+// The root node of a component's body, parsed.
+pub fn tree_of(c: Component) -> read_design.Node {
+    val ts = read_design.tokens_of(c.body)
+    val start = if len(ts) > 0 && ts[0].text == "return" { 1 } else { 0 }
+    return read_design.expr_at(ts, start).node
+}
+
+// Every field of every struct the file declares, as the builder would list them: these are the
+// screen's inputs, the things a caller has to supply, and the only part of a design file that is
+// a data interface rather than a layout.
+fn input_rows(records: [Record]) -> [string] {
+    val out = mutable_array_new<string>()
+    for r in records {
+        for f in r.fields {
+            push(out, format("{}.{}: {}", r.name, f.name, f.said))
+        }
+    }
+    return snapshot(out)
+}
+
+fn part_names(all: [Component]) -> [string] {
+    val out = mutable_array_new<string>()
+    for c in all {
+        push(out, c.name)
+    }
+    return snapshot(out)
+}
+
+// A state over a file's text. Takes the text rather than reading it, so a test needs no file and
+// the shell can hand over what it read.
+pub fn state_of(path: string, text: string) -> State {
+    val all = read_design.components_of(text)
+    val names = part_names(all)
+    // **`screen` first when it is there.** It is the dialect's one root, and opening on an
+    // arbitrary helper would show a fragment of a window and call it the window.
+    var start = 0
+    var i = 0
+    for name in names {
+        if name == "screen" {
+            start = i
+        }
+        i = i + 1
+    }
+    return State {
+        path: path,
+        text: text,
+        components: all,
+        constants: read_design.constants_of(text),
+        records: read_design.records_of(text),
+        parts: with controls.list_of("parts", "Components", names) { selected: start },
+        source: controls.text_area_of("source", "Source", "", source_rows),
+        apply: controls.button_of("apply", "Apply"),
+        revert: controls.button_of("revert", "Revert"),
+        inputs: controls.list_of("inputs", "Inputs", input_rows(read_design.records_of(text))),
+        picked: Option<Spot>.None,
+        status: format("{} component(s)", str(len(all))),
+        focused: "parts"
+    }
+}
+
+pub fn load(path: string) -> Result<State, string> {
+    return switch fs.read_text(path) {
+        Ok(text) { ok(state_of(path, text)) }
+        Err(why) { err(format("{}: {}", path, why)) }
+    }
+}
+
+// ------------------------------------------------- the canvas
+
+pub struct Canvas {
+    widget_: widget.Widget
+    spots: [Spot]
+    // What the builder could not place: a name the file uses that nothing here supplies.
+    missing: [string]
+}
+
+// The component on show, rendered. **Rebuilt when the selection or the file changes and not per
+// frame**: it parses a body, evaluates it and synthesises a placeholder for every input, which is
+// the expensive half of this program.
+pub fn canvas_of(s: State, style: controls.Style, m: widget.Metrics) -> Canvas {
+    val shop = render_design.shop_of(s.constants, s.components, s.records, style, m)
+    val drawn = switch component_named(showing(s), s.components) {
+        Some(c) { render_design.render(c, [], shop) }
+        None { render_design.Value.None }
+    }
+    return Canvas {
+        widget_: render_design.widget_of(drawn),
+        spots: snapshot(shop.spots),
+        missing: snapshot(shop.missing)
+    }
+}
+
+// ------------------------------------------------- the window
+
+fn heading(text: string, style: controls.Style) -> widget.Widget {
+    return widget.fixed_of(0.0, 18.0, widget.label_of(text, heading_size, style.ink))
+}
+
+fn note(text: string, style: controls.Style) -> widget.Widget {
+    return widget.fixed_of(0.0, 16.0, widget.label_of(text, small_size, style.ink))
+}
+
+// What the inspector says about the selection, which is the whole of what a builder knows about
+// a click: which node, in which component, and which bytes.
+pub fn selection_line(s: State) -> string {
+    return switch s.picked {
+        Some(spot) {
+            switch node_picked(s) {
+                Some(node) {
+                    val at = span_of(s, spot, node)
+                    format(
+                        "{} of {}  [{}..{}]",
+                        read_design.path_text(spot.path),
+                        spot.component,
+                        str(at.from),
+                        str(at.to)
+                    )
+                }
+                None { format("{} of {}", read_design.path_text(spot.path), spot.component) }
+            }
+        }
+        None { "nothing selected" }
+    }
+}
+
+// The node the selection names, in the component that owns it.
+pub fn node_picked(s: State) -> Option<read_design.Node> {
+    return switch s.picked {
+        Some(spot) {
+            switch component_named(spot.component, s.components) {
+                Some(owner) { read_design.node_at(tree_of(owner), spot.path) }
+                None { Option<read_design.Node>.None }
+            }
+        }
+        None { Option<read_design.Node>.None }
+    }
+}
+
+fn span_of(s: State, spot: Spot, node: read_design.Node) -> read_design.Span {
+    return switch component_named(spot.component, s.components) {
+        Some(owner) { read_design.span_in_file(owner, node) }
+        None { read_design.Span { from: 0, to: 0 } }
+    }
+}
+
+pub fn view(s: State, style: controls.Style, m: widget.Metrics) -> widget.Widget {
+    return widget.row_of(gap, [
+        widget.fixed_of(panel_width, 0.0, widget.column_of(gap, [
+            heading("Components", style),
+            widget.expand(controls.list_widget(s.parts, style))
+        ])),
+        // **A `flex` and not a box of its own.** The canvas is where the design is painted, and
+        // the design is a separate tree: this reserves the room and names it, and nothing inside
+        // it belongs to this tree.
+        widget.expand(widget.column_of(gap, [
+            heading("Canvas", style),
+            widget.expand(widget.Widget.Group(widget.Stack {
+                direction: widget.Direction.Column,
+                spacing: 0.0,
+                padding: widget.no_insets(),
+                surface: widget.no_surface(),
+                align: widget.stretched(),
+                children: [widget.flex()],
+                name: "canvas"
+            }))
+        ])),
+        widget.fixed_of(inspector_width, 0.0, widget.column_of(gap, [
+            heading("Selected", style),
+            note(selection_line(s), style),
+            widget.fixed_of(0.0, (source_rows as float) * row_height, controls.entry_widget(
+                s.source,
+                style,
+                m
+            )),
+            widget.fixed_of(0.0, row_height, widget.row_of(gap, [
+                controls.button_widget(s.apply, style),
+                controls.button_widget(s.revert, style),
+                widget.expand(widget.flex())
+            ])),
+            heading("Inputs", style),
+            widget.expand(controls.list_widget(s.inputs, style)),
+            note(s.status, style)
+        ]))
+    ])
+}
+
+// ------------------------------------------------- what an input does
+
+// The design on show, laid out. **Laid out by the shell once per frame and handed to both halves**
+// -- what is painted and what a press is routed by -- because two layouts of the same tree could
+// disagree and a click would land on where a box used to be.
+pub struct Shown {
+    laid: widget.Laid
+    spots: [Spot]
+}
+
+// **A write is asked for, not done.** Keeping `fs` out of `step` is what makes every case below
+// reachable from a test with no file and no display, and the shell is a worse place to put
+// behaviour precisely because nothing can reach it there.
+pub struct Step {
+    state: State
+    write: bool
+}
+
+fn kept(s: State) -> Step {
+    return Step { state: s, write: false }
+}
+
+// **By name over the laid tree, not through `focus`.** `focus.node_of` only ever looks at
+// `Control` nodes, and the canvas is a named `Group` -- not a control, deliberately, because the
+// design painted into it must not take the focus. Asking `focus` for it answers `None`, which is
+// an empty box, which is a press that lands on whatever is behind the canvas: the first run of
+// this program clicked the canvas and changed the component list.
+//
+// A name is inherited by every child that has none of its own, so the box wanted is the outermost
+// one carrying it, which a pre-order walk finds first. Controls answer the same way they did.
+pub fn bounds_of(laid: widget.Laid, name: string) -> geom.Rect {
+    return switch node_named(laid, name) {
+        Some(node) { node.bounds }
+        // A box the layout does not hold cannot have been pressed, and an empty rectangle makes
+        // every hit test miss rather than inventing a position.
+        None { geom.rect_of(0.0, 0.0, 0.0, 0.0) }
+    }
+}
+
+fn node_named(laid: widget.Laid, name: string) -> Option<widget.Laid> {
+    if name == "" {
+        return Option<widget.Laid>.None
+    }
+    if laid.name == name {
+        return Option<widget.Laid>.Some(laid)
+    }
+    for child in laid.children {
+        if Some(found) = node_named(child, name) {
+            return Option<widget.Laid>.Some(found)
+        }
+    }
+    return Option<widget.Laid>.None
+}
+
+// The bytes a node reads in the file as it stands.
+pub fn source_of(s: State, spot: Spot) -> string {
+    return switch component_named(spot.component, s.components) {
+        Some(owner) {
+            switch read_design.node_at(tree_of(owner), spot.path) {
+                Some(node) {
+                    val at = read_design.span_in_file(owner, node)
+                    if at.from < 0 || at.to > len(s.text) || at.from >= at.to {
+                        ""
+                    } else {
+                        substring(s.text, at.from, at.to)
+                    }
+                }
+                None { "" }
+            }
+        }
+        None { "" }
+    }
+}
+
+fn with_source(s: State, text: string) -> State {
+    return with s { source: controls.text_area_of("source", "Source", text, source_rows) }
+}
+
+// A state over new text, keeping what the user was looking at. **`state_of` cannot be reused**:
+// it opens on `screen`, which is right for a file nobody has looked at yet and wrong for one the
+// user is in the middle of editing.
+fn reparsed(s: State, text: string) -> State {
+    val all = read_design.components_of(text)
+    val records = read_design.records_of(text)
+    return with s {
+        text: text,
+        components: all,
+        constants: read_design.constants_of(text),
+        records: records,
+        parts: with controls.list_of("parts", "Components", part_names(all)) {
+            selected: s.parts.selected,
+            offset: s.parts.offset
+        },
+        inputs: with controls.list_of("inputs", "Inputs", input_rows(records)) {
+            selected: s.inputs.selected,
+            offset: s.inputs.offset
+        }
+    }
+}
+
+// A press on the canvas selects the node under it, and nothing else about the window changes.
+fn picked_at(s: State, shown: Shown, at: geom.Point) -> State {
+    return switch render_design.spot_at(shown.laid, at, shown.spots) {
+        Some(got) {
+            val chosen = with s { picked: Option<Spot>.Some(got.spot) }
+            with with_source(chosen, source_of(chosen, got.spot)) {
+                status: format("selected in {}", got.spot.component)
+            }
+        }
+        // **A miss clears the selection rather than keeping it.** An outline left over a node
+        // nobody is pointing at is a lie about what Apply would rewrite.
+        None {
+            with with_source(with s { picked: Option<Spot>.None }, "") {
+                status: "nothing there"
+            }
+        }
+    }
+}
+
+fn is_tab(input: controls.Input) -> bool {
+    return switch input {
+        KeyDown(k) { controls.Key.is_Tab(k.key) }
+        KeyUp(_) { false }
+        Text(_) { false }
+        Paste(_) { false }
+        Press(_) { false }
+        Release(_) { false }
+        Move(_) { false }
+        Wheel(_) { false }
+    }
+}
+
+fn shift_held(input: controls.Input) -> bool {
+    return switch input {
+        KeyDown(k) { k.shift }
+        KeyUp(k) { k.shift }
+        Text(_) { false }
+        Paste(_) { false }
+        Press(_) { false }
+        Release(_) { false }
+        Move(_) { false }
+        Wheel(_) { false }
+    }
+}
+
+fn pressed_at(input: controls.Input) -> Option<geom.Point> {
+    return switch input {
+        Press(at) { Option<geom.Point>.Some(at) }
+        KeyDown(_) { Option<geom.Point>.None }
+        KeyUp(_) { Option<geom.Point>.None }
+        Text(_) { Option<geom.Point>.None }
+        Paste(_) { Option<geom.Point>.None }
+        Release(_) { Option<geom.Point>.None }
+        Move(_) { Option<geom.Point>.None }
+        Wheel(_) { Option<geom.Point>.None }
+    }
+}
+
+// Rewrites the picked node's span with what the inspector holds. The text is computed here and
+// written by the shell.
+fn applied(s: State) -> Step {
+    return switch s.picked {
+        Some(spot) {
+            switch component_named(spot.component, s.components) {
+                Some(owner) {
+                    switch read_design.node_at(tree_of(owner), spot.path) {
+                        Some(node) {
+                            val at = read_design.span_in_file(owner, node)
+                            val after = read_design.with_span_replaced(
+                                s.text,
+                                at,
+                                s.source.editor.text
+                            )
+                            // **Re-read from the new text rather than patched.** Every span after
+                            // this one has moved, and a tree that remembered the old ones would
+                            // rewrite the wrong bytes on the very next Apply.
+                            val grown = reparsed(s, after)
+                            Step {
+                                state: with with_source(grown, source_of(grown, spot)) {
+                                    status: format(
+                                        "rewrote {} of {}",
+                                        read_design.path_text(spot.path),
+                                        spot.component
+                                    )
+                                },
+                                write: true
+                            }
+                        }
+                        None { kept(with s { status: "that node is gone" }) }
+                    }
+                }
+                None { kept(with s { status: "that component is gone" }) }
+            }
+        }
+        None { kept(with s { status: "nothing selected" }) }
+    }
+}
+
+pub fn step(
+    s: State,
+    input: controls.Input,
+    laid: widget.Laid,
+    shown: Shown,
+    style: controls.Style,
+    m: widget.Metrics
+) -> Step {
+    // Tab moves the focus and reaches no control, which is why it is taken before anything is
+    // routed: a field that saw Tab would type it.
+    if is_tab(input) {
+        val moved = if shift_held(input) {
+            focus.previous(laid, s.focused)
+        } else {
+            focus.next(laid, s.focused)
+        }
+        return kept(with s { focused: moved })
+    }
+    // **The canvas is taken before `controls.target`, and it has to be.** It is not a control: it
+    // is a named box with another tree painted into it, so nothing in the focus order answers for
+    // it and a press there would otherwise be delivered to whatever had the focus last.
+    if Some(at) = pressed_at(input) {
+        if widget.contains(bounds_of(laid, "canvas"), at) {
+            return kept(picked_at(s, shown, at))
+        }
+    }
+    val focused_now = switch pressed_at(input) {
+        Some(at) { focus.clicked(laid, at, s.focused) }
+        None { s.focused }
+    }
+    val here = with s { focused: focused_now }
+    val name = controls.target(laid, input, focused_now)
+    if name == "parts" {
+        val taken = controls.list_input(here.parts, input, bounds_of(laid, "parts"))
+        val moved = with here { parts: taken.list }
+        if !taken.moved && !taken.activated {
+            return kept(moved)
+        }
+        // **A new component clears the selection.** A path names a node of one component's tree
+        // and means something else, or nothing, in another's -- keeping it would outline a box
+        // that has no relation to what was clicked.
+        return kept(with with_source(with moved { picked: Option<Spot>.None }, "") {
+            status: format("showing {}", showing(moved))
+        })
+    }
+    if name == "inputs" {
+        val taken = controls.list_input(here.inputs, input, bounds_of(laid, "inputs"))
+        return kept(with here { inputs: taken.list })
+    }
+    if name == "source" {
+        val taken = controls.entry_input(here.source, input, bounds_of(laid, "source"), style, m)
+        return kept(with here { source: taken.entry })
+    }
+    if name == "apply" {
+        val taken = controls.button_input(here.apply, input, bounds_of(laid, "apply"))
+        val pressed = with here { apply: taken.button }
+        if taken.activated {
+            return applied(pressed)
+        }
+        return kept(pressed)
+    }
+    if name == "revert" {
+        val taken = controls.button_input(here.revert, input, bounds_of(laid, "revert"))
+        val pressed = with here { revert: taken.button }
+        if !taken.activated {
+            return kept(pressed)
+        }
+        return switch pressed.picked {
+            Some(spot) {
+                kept(with with_source(pressed, source_of(pressed, spot)) { status: "reverted" })
+            }
+            None { kept(with pressed { status: "nothing selected" }) }
+        }
+    }
+    return kept(here)
+}

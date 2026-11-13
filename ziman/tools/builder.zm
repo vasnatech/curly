@@ -1,0 +1,241 @@
+// The builder: a design file in a window, a click on it, and the bytes that drew what was clicked.
+//
+//   ziman-gui tools/builder.zm -- src/main/ziman/gui/request_ui.zm
+//
+// **This file is the part that cannot be tested and it is kept as small as that costs.** It opens
+// a window, loads a font, pumps an event queue and writes a file; everything it decides is in
+// `tools/builder_state.zm`, which does none of those and is driven by the unit suite.
+//
+// The canvas is a second widget tree, laid out at the canvas box and painted into the same scene.
+// It is never merged into the builder's own tree, so the design's placeholder controls -- real
+// entries, real trees -- cannot take the focus or the keyboard: clicking the design's filter box
+// selects it instead of typing into it, which is the whole difference between a builder and a
+// preview that happens to be interactive.
+use clock
+use controls
+use desktop
+use font
+use fs
+use geom
+use os
+use paint
+use raster
+use scene
+use shape
+use tools/builder_state
+use tools/builder_state.Shown
+use tools/builder_state.State
+use tools/render_design
+use widget
+use window
+
+val start_width = 1400
+val start_height = 900
+
+fn load_font() -> Result<font.FontRef, string> {
+    val path = switch os.get_env("ZIMAN_FONT") {
+        Some(p) { p }
+        None { "../../ziman/vendor/fonts/Caladea-Regular.ttf" }
+    }
+    return switch fs.read_bytes(path) {
+        Ok(data) { font.load(data) }
+        Err(why) { err(format("{}: {}", path, why)) }
+    }
+}
+
+fn is_close(e: window.Event) -> bool {
+    return window.Event.is_Close(e)
+}
+
+fn is_exposed(e: window.Event) -> bool {
+    return window.Event.is_Exposed(e)
+}
+
+fn resized_to(e: window.Event) -> Option<window.Size> {
+    return switch e {
+        Resize(size) { Option<window.Size>.Some(size) }
+        KeyDown(_) { Option<window.Size>.None }
+        KeyUp(_) { Option<window.Size>.None }
+        Char(_) { Option<window.Size>.None }
+        PointerDown(_) { Option<window.Size>.None }
+        PointerUp(_) { Option<window.Size>.None }
+        PointerMove(_) { Option<window.Size>.None }
+        Scroll(_) { Option<window.Size>.None }
+        Close { Option<window.Size>.None }
+        FocusIn { Option<window.Size>.None }
+        FocusOut { Option<window.Size>.None }
+        Exposed { Option<window.Size>.None }
+    }
+}
+
+fn chosen_density() -> widget.Resolved {
+    return widget.resolve_density(Option<float>.None, window.display_scale())
+}
+
+// The builder's scene: its own window, the design painted into the canvas box, and the outline
+// around what is selected.
+//
+// **The design is painted after the builder and the outline after the design**, which is the only
+// order that works: the canvas box is drawn empty by the builder, the design fills it, and an
+// outline under the thing it marks is invisible.
+fn painted(
+    st: State,
+    laid: widget.Laid,
+    shown: Shown,
+    style: controls.Style,
+    m: widget.Metrics
+) -> scene.Scene {
+    val base = widget.paint_focused(laid, m, st.focused, paint.rgb(0.15, 0.4, 0.85), 2.0)
+    val ops = mutable_array_new<scene.Op>()
+    for op in base.ops {
+        push(ops, op)
+    }
+    for op in widget.paint(shown.laid, m).ops {
+        push(ops, op)
+    }
+    switch st.picked {
+        Some(spot) {
+            switch render_design.box_of(shown.laid, spot.tag) {
+                Some(box) {
+                    push(ops, scene.stroke(
+                        shape.rect_path(box),
+                        paint.solid(paint.rgb(0.85, 0.15, 0.25)),
+                        paint.stroke_of(2.0)
+                    ))
+                }
+                None { unit }
+            }
+        }
+        None { unit }
+    }
+    return controls.paint_scroll_bars(laid, scene.with_ops(base, snapshot(ops)), style)
+}
+
+pub fn run(path: string) -> Result<unit, string> {
+    val f = try load_font()
+    val m = try widget.metrics_for(f)
+    val style = with controls.default_style() { collapsed_mark: ">", expanded_mark: "v" }
+    val opened = try builder_state.load(path)
+    val density = chosen_density().density
+    val scale = density.px_per_pt
+    val options = with raster.options() {
+        fonts: [f],
+        samples: 1,
+        background: Option<paint.Color>.Some(paint.rgb(0.98, 0.98, 0.99)),
+        max_pixels: ((8000000 as float) * scale * scale) as int,
+        px_per_pt: scale
+    }
+    val outcome = window.with_window<unit>(
+        format("builder -- {}", path),
+        ((start_width as float) * scale) as int,
+        ((start_height as float) * scale) as int,
+        fn(w: window.Window) -> Result<unit, string> {
+            var painter = try desktop.painter_of(start_width as float, start_height as float, scale)
+            var st = opened
+            var width_pt = start_width as float
+            var height_pt = start_height as float
+            var closing = false
+            // **Rebuilt when the file or the component on show changes, and not per frame.**
+            // Rendering a design parses a body, evaluates it and invents a placeholder for every
+            // input, which is the expensive half of this program; the two strings below are what
+            // says whether any of that could have changed its answer.
+            var canvas = builder_state.canvas_of(st, style, m)
+            var drawn_from = st.text
+            var drawn_part = builder_state.showing(st)
+            var laid = widget.layout(
+                builder_state.view(st, style, m),
+                geom.rect_of(0.0, 0.0, width_pt, height_pt),
+                m
+            )
+            var shown = Shown {
+                laid: widget.layout(canvas.widget_, builder_state.bounds_of(laid, "canvas"), m),
+                spots: canvas.spots
+            }
+            var dirty = true
+            while !closing {
+                if dirty {
+                    if st.text != drawn_from || builder_state.showing(st) != drawn_part {
+                        canvas = builder_state.canvas_of(st, style, m)
+                        drawn_from = st.text
+                        drawn_part = builder_state.showing(st)
+                    }
+                    val whole = geom.rect_of(0.0, 0.0, width_pt, height_pt)
+                    laid = widget.layout(builder_state.view(st, style, m), whole, m)
+                    // **Laid out once and used for both halves**, the painting and the routing.
+                    // Two layouts of the same tree could disagree, and a click would select the
+                    // node that used to be under it.
+                    shown = Shown {
+                        laid: widget.layout(
+                            canvas.widget_,
+                            builder_state.bounds_of(laid, "canvas"),
+                            m
+                        ),
+                        spots: canvas.spots
+                    }
+                    val repainted = try desktop.repaint(
+                        painter,
+                        w,
+                        painted(st, laid, shown, style, m),
+                        options
+                    )
+                    painter = repainted.next
+                    dirty = false
+                }
+                for e in try window.poll(w) {
+                    if is_close(e) {
+                        closing = true
+                    }
+                    if is_exposed(e) {
+                        painter = desktop.forget(painter)
+                        dirty = true
+                    }
+                    if Some(size) = resized_to(e) {
+                        width_pt = (size.width as float) / scale
+                        height_pt = (size.height as float) / scale
+                        dirty = true
+                    }
+                    if Some(input) = desktop.input_of(e, density) {
+                        dirty = true
+                        val stepped = builder_state.step(st, input, laid, shown, style, m)
+                        st = stepped.state
+                        // **The write is done here and nowhere else.** `step` decides and stays
+                        // pure; this is the only line in the program that can lose someone's
+                        // work, and it is one line.
+                        if stepped.write {
+                            switch fs.write_bytes(st.path, to_bytes(st.text)) {
+                                Ok(_) {
+                                    st = with st {
+                                        status: format("{} -- {} bytes", st.status, str(byte_len(st.text)))
+                                    }
+                                }
+                                Err(why) {
+                                    st = with st { status: format("write {}: {}", st.path, why) }
+                                }
+                            }
+                        }
+                    }
+                }
+                // **Without this the loop spins.** The first run of this program sat at 104% of a
+                // core doing nothing, because `poll` does not block and there was nothing else to
+                // stop for. `curly gui` learned the same lesson and the number is its number: a
+                // frame's worth, so a window that has something to do is never more than one
+                // behind.
+                clock.sleep_millis(16)
+            }
+            return ok(unit)
+        }
+    )
+    return outcome
+}
+
+fn main() {
+    val args = os.args()
+    val path = if len(args) > 0 { args[0] } else { "src/main/ziman/gui/request_ui.zm" }
+    switch run(path) {
+        Ok(_) { unit }
+        Err(why) {
+            print(format("builder: {}", why))
+            os.exit(1)
+        }
+    }
+}

@@ -680,6 +680,22 @@ pub struct Picked {
     bounds: geom.Rect
 }
 
+// Where a tag was drawn, found again after a fresh layout. **The outermost match and not the
+// first by chance**: a name is inherited by every child that has none of its own, so the tag
+// appears all the way down the node's subtree, and the node's own box is the one at the top of it.
+// Stored bounds would have done instead, and would be stale the moment the window is resized.
+pub fn box_of(laid: widget.Laid, tag: string) -> Option<geom.Rect> {
+    if laid.name == tag {
+        return Option<geom.Rect>.Some(laid.bounds)
+    }
+    for child in laid.children {
+        if Some(found) = box_of(child, tag) {
+            return Option<geom.Rect>.Some(found)
+        }
+    }
+    return Option<geom.Rect>.None
+}
+
 pub fn spot_at(laid: widget.Laid, p: geom.Point, spots: [Spot]) -> Option<Picked> {
     val chain = widget.chain_at(laid, p)
     var i = len(chain) - 1

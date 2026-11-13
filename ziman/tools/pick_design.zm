@@ -6,8 +6,10 @@
 // their spans and `render_design` gave them names; this is the lookup that joins the two, and the
 // check below is the only thing that says the join is real rather than plausible.
 //
-//   pick_design.zm <file> <component> <x> <y>   what is under that point
-//   pick_design.zm --check [root]               every control resolves to the node that drew it
+//   pick_design.zm <file> <component> <x> <y>          what is under that point
+//   pick_design.zm --set <file> <c> <x> <y> <source>   rewrite that node, in place
+//   pick_design.zm --check [root]                      every control resolves to the node that
+//                                                      drew it, and rewriting it hits that node
 use controls
 use font
 use fs
@@ -278,6 +280,26 @@ fn check_component(
                 // second is in the source. A sub-control `controls` invented while drawing, a
                 // tree row or a tab, is named `tree/2` and resolves to the tree, which the
                 // parameter name covers as well.
+                // **Selecting a node and editing it must be the same node.** The span is
+                // where the point led; this puts something unmistakable in it, parses the file
+                // again, and asks what is at that path now. A span off by a byte, or a path that
+                // is only right for the tree it was built from, both show up here and nowhere
+                // else -- the lookup above would still be perfectly self-consistent.
+                switch node {
+                    Some(got) {
+                        if !rewrites_cleanly(text, owner, got, spot.path) {
+                            print(format(
+                                "{}: {} -- rewriting {} of {} does not land on it",
+                                file,
+                                c.name,
+                                read_design.path_text(spot.path),
+                                spot.component
+                            ))
+                            bad = bad + 1
+                        }
+                    }
+                    None { unit }
+                }
                 if !mentions(said, one.name, owner) {
                     print(format(
                         "{}: {} -- the middle of '{}' lands on {} of {}, which reads {}",
@@ -322,6 +344,39 @@ fn mentions(said: string, control: string, owner: Component) -> bool {
     for p in owner.params {
         if contains(said, p.name) {
             return true
+        }
+    }
+    return false
+}
+
+// Replaces one node with something unmistakable, reads the file back, and asks whether that is
+// what is at the path now. **The file is re-read from scratch**, components and all, because an
+// edit moves every span after it and a check that reused the old component would be asking the
+// old text.
+fn rewrites_cleanly(
+    text: string,
+    owner: Component,
+    node: read_design.Node,
+    path: read_design.Path
+) -> bool {
+    val marker = "widget.flex()"
+    val after = read_design.with_span_replaced(text, read_design.span_in_file(owner, node), marker)
+    for c in read_design.components_of(after) {
+        if c.name == owner.name {
+            val ts = read_design.tokens_of(c.body)
+            val start = if len(ts) > 0 && ts[0].text == "return" { 1 } else { 0 }
+            val parsed = read_design.expr_at(ts, start)
+            // **Everything has to be consumed, and the path reading right is not that.** A span
+            // that ends one byte early leaves the closing bracket behind; the parser reads
+            // `widget.flex()`, stops, and answers every question correctly about a file that no
+            // longer compiles. Mutation walked straight through the version without this.
+            if parsed.next != len(ts) || read_design.unparsed_in(parsed.node) > 0 {
+                return false
+            }
+            return switch read_design.node_at(parsed.node, path) {
+                Some(now) { read_design.text_of(now) == "widget.flex" }
+                None { false }
+            }
         }
     }
     return false
@@ -375,8 +430,87 @@ fn number_said(args: [string], which: int, fallback: float) -> float {
     }
 }
 
+// Rewrites the node under a point and leaves every other byte of the file alone. **This is the
+// save the round trip said was needed**: regenerating a design file from its tree is semantically
+// lossless and still wrong, because half of it is comments, its derived constants collapse to
+// their values and its `pub val` comes back `val`. One span, in place, is what a refactoring tool
+// does and what an editor has to do.
+fn set(path: string, wanted: string, p: geom.Point, replacement: string) {
+    val text = read(path)
+    val all = read_design.components_of(text)
+    val c = switch component_named(wanted, all) {
+        Some(got) { got }
+        None {
+            print(format("no component named {}", wanted))
+            os.exit(1)
+            all[0]
+        }
+    }
+    val m = metrics()
+    val shop = render_design.shop_of(
+        read_design.constants_of(text),
+        all,
+        read_design.records_of(text),
+        controls.default_style(),
+        m
+    )
+    val drawn = render_design.render(c, [], shop)
+    val laid = widget.layout(render_design.widget_of(drawn), canvas, m)
+    switch render_design.spot_at(laid, p, snapshot(shop.spots)) {
+        Some(spot) {
+            val owner = switch component_named(spot.component, all) {
+                Some(o) { o }
+                None { c }
+            }
+            switch read_design.node_at(tree_of(owner), spot.path) {
+                Some(node) {
+                    val at = read_design.span_in_file(owner, node)
+                    val was = substring(text, at.from, at.to)
+                    switch fs.write_bytes(
+                        path,
+                        to_bytes(read_design.with_span_replaced(text, at, replacement))
+                    ) {
+                        Ok(_) {
+                            print(format(
+                                "{} of {} [{}..{}]",
+                                read_design.path_text(spot.path),
+                                spot.component,
+                                str(at.from),
+                                str(at.to)
+                            ))
+                            print(format("  was: {}", was))
+                            print(format("  now: {}", replacement))
+                        }
+                        Err(why) {
+                            print(format("write {}: {}", path, why))
+                            os.exit(1)
+                        }
+                    }
+                }
+                None {
+                    print("that point names no node")
+                    os.exit(1)
+                }
+            }
+        }
+        None {
+            print("nothing there")
+            os.exit(1)
+        }
+    }
+}
+
 fn main() {
     val args = os.args()
+    if len(args) > 0 && args[0] == "--set" {
+        if len(args) < 6 {
+            print("usage: pick_design.zm --set <file> <component> <x> <y> <source>")
+            os.exit(1)
+            return
+        }
+        set(args[1], args[2], geom.point_of(number_said(args, 3, 0.0), number_said(args, 4, 0.0)), args[5])
+        return
+    }
     if len(args) > 0 && args[0] == "--check" {
         check(if len(args) > 1 { args[1] } else { "src/main/ziman" })
         return

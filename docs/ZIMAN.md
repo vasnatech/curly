@@ -238,6 +238,63 @@ A fifth was reported here and **was not a gap**: growable rows need no control. 
 the array, `push` adds a row and a `Button` removes one. The four fixed header rows were a shortcut,
 not a limitation.
 
+## The design files, and the builder that reads them
+
+`curly gui` is not one module per screen but two: `gui/state.zm` is the logic and `gui/request_ui.zm`
+is the layout. The layout file is **Ziman, restricted** -- not XML, not JSON, not a brace DSL -- and
+the restriction is the whole point: full Ziman needs a Ziman parser, while the subset is about as
+hard to read as JSON. A tool can parse it, draw it, map a click on the drawing back into it and
+rewrite one node of it without touching the rest.
+
+The dialect, in full: one expression per function; calls to `widget.*`, `controls.*` and sibling
+functions in the same file; literals; field paths off a parameter; module-level constants, which may
+do arithmetic over other constants. No `if`, no loops, no `switch`, no arithmetic in a body, no
+function-local `val`. One root called `screen`; every other `pub fn` is a part it calls. A design
+file **declares its own input struct** rather than importing the application's -- the logic module
+has to `use` the design module to draw itself, and ziman refuses the cycle, so the dependency runs
+outwards and the cycle cannot form.
+
+What the dialect refuses, it refuses on purpose, and twice the refusal found a mistake rather than
+a cost. Repetition is a row template plus a list the caller fills, so the loop stays in the logic
+file; *which* children appear is the same mechanism, so the dialect needs no conditional. A slot
+briefly grew a size parameter and then lost it again: both hand-computed heights turned out to be
+spacing written in the wrong place.
+
+### The four tools, in `ziman/tools/`
+
+| | |
+|---|---|
+| `lint_design.zm` | the dialect, enforced. Textual, and sound only because `--fmt` runs first |
+| `read_design.zm` | the text as a tree. Every node carries **the span it came from** |
+| `render_design.zm` | the tree as a window, with a placeholder invented for every input |
+| `pick_design.zm` | a point on that window as a node, and `--set` to rewrite that node in place |
+
+`read_design` keeps spans because **regenerating a design file from its tree is the wrong way to
+save**, which the round trip measured rather than guessed: 7,701 of 16,079 bytes are comments and a
+regenerating editor deletes them; `editor_strip_width = tab_width * editor_tabs` comes back as
+`500.0`, so changing `tab_width` stops changing the strip; and `pub val` comes back `val`, so the
+file does not compile. An editor rewrites the span one node occupies and leaves every other byte
+alone. Replacing `heading_height` with `44.0` is a one-line diff with all 96 comments intact.
+
+`pick_design` maps a click back **by name, not by a parallel tree**: `widget.layout` passes a
+parent's name down to every child that has none, so naming a node names everything inside it, and
+ziman's `widget.chain_at` hands back the whole descent under a point so the lookup can stop at the
+innermost node the *file* is responsible for -- a click on a tree row belongs to the tree, because
+the row was invented by `controls` while drawing and the file never wrote one.
+
+### Five gates, in `run-all.sh`
+
+Formatting, the dialect (with a fixture proving the lint bites), the parse, the round trip, and
+**click to source**: every control in every component is clicked in its own middle, and has to come
+back as a `controls.` call that names it *and* survive being rewritten there. The `controls.` half
+is load-bearing -- without it a mapping that answered "the component's root" to every point passed,
+because a root's source contains every name in the component. Mutation is what said so.
+
+The layout itself is held by a committed baseline, `src/test/resources/window_geometry.txt`: every
+named control's bounds in eight states of the window. **The rest of the suite cannot see a control
+move**, because every test finds one with `bounds_of(name)` and presses inside it; a change that
+shifted the pane switcher twelve points left all 263 of them green.
+
 ## `curly serve`
 
 ```sh

@@ -52,7 +52,55 @@ pub struct Binding {
     value: Value
 }
 
-fn widget_of(v: Value) -> widget.Widget {
+// Where a box on the canvas came from in the source. **This is what makes a renderer an editor**:
+// drawing a design file proved the text can become a window, and this is the way back -- a point
+// becomes a widget, a widget carries a name, and a name is one of these.
+pub struct Spot {
+    tag: string
+    component: string
+    path: read_design.Path
+}
+
+// Everything an evaluation needs that does not change from one node to the next.
+//
+// **Eight positional parameters is how two of them get swapped.** `known`, `all` and `records`
+// are three arrays of things the file declared and the compiler cannot tell a misordered pair of
+// them apart; `style` and `m` are both ambient. Naming them costs one `with` at the only place
+// any of them changes -- `component`, when a call descends into a sibling.
+pub struct Shop {
+    known: [Constant]
+    all: [Component]
+    records: [Record]
+    style: controls.Style
+    m: widget.Metrics
+    // What the builder could not place, for the tool to report.
+    missing: MutableArray<string>
+    // What it could, for a click to find. Both are handles, so a `with` that changes `component`
+    // keeps writing into the same two.
+    spots: MutableArray<Spot>
+    component: string
+}
+
+pub fn shop_of(
+    known: [Constant],
+    all: [Component],
+    records: [Record],
+    style: controls.Style,
+    m: widget.Metrics
+) -> Shop {
+    return Shop {
+        known: known,
+        all: all,
+        records: records,
+        style: style,
+        m: m,
+        missing: mutable_array_new<string>(),
+        spots: mutable_array_new<Spot>(),
+        component: ""
+    }
+}
+
+pub fn widget_of(v: Value) -> widget.Widget {
     return switch v {
         W(w) { w }
         E(_) { widget.flex() }
@@ -521,16 +569,125 @@ fn ink_of(v: Value, style: controls.Style) -> paint.Color {
 
 // ------------------------------------------------------------------ evaluating
 
-pub fn eval(
-    node: Node,
-    env: [Binding],
-    known: [Constant],
-    all: [Component],
-    records: [Record],
-    style: controls.Style,
-    m: widget.Metrics,
-    missing: MutableArray<string>
-) -> Value {
+// ---- naming a node, so that a click can find it again
+
+// The name a widget already answers to, or "" for the three kinds that have nowhere to put one.
+// `Expand` and `Flex` are weights rather than boxes and `Control` is named by the design itself.
+fn own_name(w: widget.Widget) -> string {
+    return switch w {
+        Group(it) { it.name }
+        Sized(it) { it.name }
+        Scroll(it) { it.name }
+        Layered(it) { it.name }
+        Text(it) { it.name }
+        Control(it) { it.name }
+        Nothing { "" }
+        Flex(_) { "" }
+        Expand(_) { "" }
+    }
+}
+
+// Names a widget that has no name. A widget that has one is handed back untouched, which is the
+// rule the rest of this depends on.
+fn with_name(w: widget.Widget, tag: string) -> widget.Widget {
+    if own_name(w) != "" {
+        return w
+    }
+    return switch w {
+        Group(it) { widget.Widget.Group(with it { name: tag }) }
+        Sized(it) { widget.Widget.Sized(with it { name: tag }) }
+        Scroll(it) { widget.Widget.Scroll(with it { name: tag }) }
+        Layered(it) { widget.Widget.Layered(with it { name: tag }) }
+        Text(it) { widget.Widget.Text(with it { name: tag }) }
+        Control(_) { w }
+        Nothing { w }
+        Flex(_) { w }
+        Expand(_) { w }
+    }
+}
+
+fn known_tag(spots: MutableArray<Spot>, tag: string) -> bool {
+    for one in spots {
+        if one.tag == tag {
+            return true
+        }
+    }
+    return false
+}
+
+// This node's path, with one more step on the end.
+fn step(here: [int], index: int) -> [int] {
+    val out = mutable_array_new<int>()
+    for one in here {
+        push(out, one)
+    }
+    push(out, index)
+    return snapshot(out)
+}
+
+// **Records where this node's box came from, and names it if it has no name.**
+//
+// `widget.layout` passes a parent's name down to every child that has none of its own, and
+// `widget.at` returns the deepest box under a point -- so naming a node names everything inside
+// it that is not named itself, and `at(...).name` is already "the innermost thing here that was
+// worth naming". No second tree, no walk of my own, and no assumption that laying out preserves
+// the shape of the widget tree.
+//
+// **A name already there is left alone, and that is the whole of how components compose.** A
+// sibling component names its own root while evaluating its own body, so the caller's attempt is
+// a no-op and a click inside it reports a node of *that* component -- the file an editor would
+// open, rather than the one line that called it. A control is named by the design (`send`), so it
+// is recorded under that name instead of a tag.
+fn record(v: Value, shop: Shop, here: [int]) -> Value {
+    if W(w) = v {
+        val already = own_name(w)
+        val tag = if already != "" { already } else { format("@{}", str(len(shop.spots))) }
+        val named = with_name(w, tag)
+        // Nothing to hang a name on. Its children carry their own, so a click inside still lands.
+        if own_name(named) == "" {
+            return v
+        }
+        // **First writer wins**, and the two ways a tag can already be there are not the same
+        // mistake. A component's root is recorded by the component, which is right. Two nodes
+        // building a control with one name is a design that has given two things one focus
+        // identity -- a defect in the file, which `lint_design` is the place to say so.
+        if !known_tag(shop.spots, tag) {
+            push(shop.spots, Spot {
+                tag: tag,
+                component: shop.component,
+                path: read_design.Path { steps: here }
+            })
+        }
+        return Value.W(named)
+    }
+    return v
+}
+
+// A point on the canvas, as a node of a design file.
+//
+// **The deepest box under a point is often not a node of the file.** A click on a row of a tree
+// lands on a control named `requests/2`, which `controls` invented while drawing: the design file
+// never wrote a row, it wrote a tree. So this takes the whole chain of boxes under the point and
+// returns the innermost one the file is responsible for -- which is what selecting a thing on a
+// canvas should mean, and is why `widget.chain_at` had to exist.
+//
+// The lookup is linear because the table is small and built once per render; a builder redrawing
+// on every mouse move would index it.
+pub fn spot_at(laid: widget.Laid, p: geom.Point, spots: [Spot]) -> Option<Spot> {
+    val chain = widget.chain_at(laid, p)
+    var i = len(chain) - 1
+    while i >= 0 {
+        for one in spots {
+            if one.tag == chain[i].name {
+                return Option<Spot>.Some(one)
+            }
+        }
+        i = i - 1
+    }
+    return Option<Spot>.None
+}
+
+pub fn eval(node: Node, env: [Binding], shop: Shop, here: [int]) -> Value {
     switch node {
         Num(leaf) {
             return switch parse_float(leaf.text) {
@@ -542,28 +699,33 @@ pub fn eval(
         Path(leaf) {
             val text = leaf.text
             if text == "style.ink" {
-                return Value.Col(style.ink)
+                return Value.Col(shop.style.ink)
             }
             if text == "style.face" {
-                return Value.Col(style.face)
+                return Value.Col(shop.style.face)
             }
             val bound = look_up(text, env)
             if Value.is_None(bound) {
-                val c = constant(text, known)
+                val c = constant(text, shop.known)
                 if Value.is_None(c) {
-                    push(missing, text)
+                    push(shop.missing, text)
                 }
                 return c
             }
-            return bound
+            // **A slot is a node too.** `it.body` draws a placeholder box, and clicking it should
+            // select the reference that put it there -- which is the only handle an editor has on
+            // a hole the screen's owner fills.
+            return record(bound, shop, here)
         }
         List(items) {
             val out = mutable_array_new<widget.Widget>()
+            var index = 0
             for one in items.items {
-                val v = eval(one, env, known, all, records, style, m, missing)
+                val v = eval(one, env, shop, step(here, index))
                 for w in widgets_of(v) {
                     push(out, w)
                 }
+                index = index + 1
             }
             return Value.L(Widgets { items: snapshot(out) })
         }
@@ -574,7 +736,7 @@ pub fn eval(
             // an escape hatch a design file could do without -- it is the only way to express two
             // of the features `lib/ui` has.
             if f.name != "widget.Stack" {
-                push(missing, concat(f.name, " { }"))
+                push(shop.missing, concat(f.name, " { }"))
                 return Value.None
             }
             var direction = widget.Direction.Column
@@ -597,7 +759,7 @@ pub fn eval(
                     i = i + 1
                     continue
                 }
-                val v = eval(f.values[i], env, known, all, records, style, m, missing)
+                val v = eval(f.values[i], env, shop, step(here, i))
                 if key == "spacing" {
                     spacing = float_of(v)
                 }
@@ -615,7 +777,7 @@ pub fn eval(
                 }
                 i = i + 1
             }
-            return Value.W(widget.Widget.Group(widget.Stack {
+            return record(Value.W(widget.Widget.Group(widget.Stack {
                 direction: direction,
                 spacing: spacing,
                 padding: padding,
@@ -623,24 +785,26 @@ pub fn eval(
                 align: align,
                 children: children,
                 name: ""
-            }))
+            })), shop, here)
         }
         Call(c) {
             val args = mutable_array_new<Value>()
+            var index = 0
             for a in c.args {
-                push(args, eval(a, env, known, all, records, style, m, missing))
+                push(args, eval(a, env, shop, step(here, index)))
+                index = index + 1
             }
             // Its own components first: a design file's calls are mostly to its siblings, and
             // that recursion is what makes a tree of components rather than a tree of boxes.
-            switch component_named(c.name, all) {
-                Some(part) { return render(part, snapshot(args), known, all, records, style, m, missing) }
+            switch component_named(c.name, shop.all) {
+                Some(part) { return record(render(part, snapshot(args), shop), shop, here) }
                 None { unit }
             }
-            val built = call(c.name, snapshot(args), style, m)
+            val built = call(c.name, snapshot(args), shop.style, shop.m)
             if Value.is_None(built) {
-                push(missing, concat(c.name, "()"))
+                push(shop.missing, concat(c.name, "()"))
             }
-            return built
+            return record(built, shop, here)
         }
     }
     return Value.None
@@ -657,16 +821,9 @@ fn record_named(said: string, records: [Record]) -> Option<Record> {
     return Option<Record>.None
 }
 
-pub fn render(
-    c: Component,
-    args: [Value],
-    known: [Constant],
-    all: [Component],
-    records: [Record],
-    style: controls.Style,
-    m: widget.Metrics,
-    missing: MutableArray<string>
-) -> Value {
+pub fn render(c: Component, args: [Value], outer: Shop) -> Value {
+    // The spots a component's body produces are its own, not its caller's.
+    val shop = with outer { component: c.name }
     val env = mutable_array_new<Binding>()
     var i = 0
     for p in c.params {
@@ -676,18 +833,18 @@ pub fn render(
         // A struct parameter is bound to a marker, not a value: what the body reads is
         // `it.filter`, never `it`, and passing it on to another component must not look like a
         // name nobody declared. The callee re-expands whichever fields it reads.
-        val is_record = switch record_named(p.said, records) {
+        val is_record = switch record_named(p.said, shop.records) {
             Some(_) { true }
             None { false }
         }
         val given = if is_record {
-            Value.Sty(style)
+            Value.Sty(shop.style)
         } else {
             if p.said == "controls.Style" {
-                Value.Sty(style)
+                Value.Sty(shop.style)
             } else {
                 if p.said == "widget.Metrics" {
-                    Value.Met(m)
+                    Value.Met(shop.m)
                 } else {
                     if i < len(args) { args[i] } else { placeholder(p.said, p.name) }
                 }
@@ -697,7 +854,7 @@ pub fn render(
         // **A struct parameter is a data interface, not a value.** The root takes one `Screen`
         // and reads `it.filter` out of it, so the builder binds a placeholder per declared field
         // -- which is exactly the list an editor would show as the screen's inputs.
-        switch record_named(p.said, records) {
+        switch record_named(p.said, shop.records) {
             Some(r) {
                 for f in r.fields {
                     push(env, Binding {
@@ -712,7 +869,7 @@ pub fn render(
     }
     val ts = read_design.tokens_of(c.body)
     val start = if len(ts) > 0 && ts[0].text == "return" { 1 } else { 0 }
-    return eval(read_design.expr_at(ts, start).node, snapshot(env), known, all, records, style, m, missing)
+    return eval(read_design.expr_at(ts, start).node, snapshot(env), shop, [])
 }
 
 fn main() {
@@ -771,14 +928,15 @@ fn main() {
             for p in c.params {
                 print(format("  input {}: {}", p.name, p.said))
             }
-            val missing = mutable_array_new<string>()
-            val drawn = render(c, [], known, all, records, style, m, missing)
-            if len(missing) > 0 {
-                print(format("  {} thing(s) the builder could not place:", str(len(missing))))
-                for one in missing {
+            val shop = shop_of(known, all, records, style, m)
+            val drawn = render(c, [], shop)
+            if len(shop.missing) > 0 {
+                print(format("  {} thing(s) the builder could not place:", str(len(shop.missing))))
+                for one in shop.missing {
                     print(format("    {}", one))
                 }
             }
+            print(format("  {} node(s) a click can name", str(len(shop.spots))))
             val width = 900.0
             val height = 320.0
             val laid = widget.layout(widget_of(drawn), geom.rect_of(0.0, 0.0, width, height), m)

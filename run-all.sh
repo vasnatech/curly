@@ -104,6 +104,20 @@ else
   fail "a design file does not survive a round trip"
 fi
 
+# **And a point on the canvas must name the node that drew it**, which is the lookup a visual
+# editor opens with: a user clicks a box, and the editor has to say which bytes of which file to
+# select. Every control in every component is clicked in its own middle and has to come back as a
+# `controls.` call that names it. The `controls.` half is load-bearing: without it a mapping that
+# answered "the component's root" to every point passed, because a root's source contains every
+# name in the component.
+phase "click to source"
+if (cd "$ROOT/ziman" && ZIMAN_MODULE_PATH=src/main/ziman:. \
+      "$ZIMAN" tools/pick_design.zm -- --check src/main/ziman); then
+  :
+else
+  fail "a click does not name the node that drew it"
+fi
+
 # **ziman's own linter, which nothing here had ever run.** It finds the quadratic shapes a
 # reviewer does not: a string rebuilt from a copy of itself on every pass of a loop, or a
 # `snapshot` of a builder taken inside the loop that is still filling it. It had 22 findings

@@ -41,6 +41,8 @@ val pair_name_width = 220.0
 val pair_remove_width = 28.0
 val pair_add_width = 120.0
 val table_gap = 4.0
+val auth_label_width = 110.0
+val auth_picker_width = 160.0
 // **One number, five tabs.** `tab_width` is the number the tab control and the box the strip is
 // laid out in both come from, and writing 500.0 here would be the second place it lives -- which
 // is the thing this codebase keeps removing. So the dialect allows arithmetic **in a constant**,
@@ -227,4 +229,43 @@ pub fn pair_table(rows: [widget.Widget], add: controls.Button, style: controls.S
             widget.expand(widget.flex())
         ]))
     ])
+}
+
+// ------------------------------------- labelled rows, which is the conditional-children case
+
+// A labelled row whose field fills the rest of the line.
+pub fn field_row(
+    label: string,
+    field: controls.Entry,
+    style: controls.Style,
+    m: widget.Metrics
+) -> widget.Widget {
+    return widget.fixed_of(0.0, row_height, widget.row_of(gap, [
+        widget.fixed_of(auth_label_width, 0.0, mono_label(label, small_size, style)),
+        widget.expand(controls.entry_widget(field, style, m))
+    ]))
+}
+
+// A labelled row holding a picker, which takes its own width rather than the line's.
+pub fn picker_row(label: string, picker: controls.Menu, style: controls.Style) -> widget.Widget {
+    return widget.fixed_of(0.0, row_height, widget.row_of(gap, [
+        widget.fixed_of(auth_label_width, 0.0, mono_label(label, small_size, style)),
+        widget.fixed_of(auth_picker_width, 0.0, controls.menu_title_widget(picker, style)),
+        widget.expand(widget.flex())
+    ]))
+}
+
+// A stack of labelled rows.
+//
+// **Conditional children turn out to be the repeated slot again.** Which rows the authorization
+// editor shows depends on the kind picked -- a Bearer token has no username -- and a design file
+// has no `if`. It does not need one: *which* children appear is a list the logic file computes,
+// exactly as *how many* was for a table. Both collapse into "the caller supplies the list".
+//
+// What that costs is worth saying: the order and the choice are now in code, so an editor can see
+// a panel of rows and a palette of row kinds, but not the arrangement. The alternative is one
+// design function per combination -- which is what a design tool calls variants, and what Figma
+// does -- traded against triplicating the layout.
+pub fn rows_panel(rows: [widget.Widget]) -> widget.Widget {
+    return widget.column_of(table_gap, rows)
 }

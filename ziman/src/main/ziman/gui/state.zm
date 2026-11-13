@@ -730,27 +730,25 @@ fn table_widget(t: PairTable, style: controls.Style, m: widget.Metrics) -> widge
 // token has no username, and a greyed-out box labelled Username invites a user to wonder what it
 // would do. Not drawing it also keeps it out of the tab order and out of the accessibility tree,
 // which "disabled" does not.
+// **Which rows, and nothing about how they look.** A Bearer token has no username, so the rows
+// the editor shows depend on the kind picked -- and that choice is the only thing left here. The
+// row layouts live in `request_ui`, and the conditional supplies a list exactly as the table's
+// loop does.
 fn auth_widget(a: AuthEditors, style: controls.Style, m: widget.Metrics) -> widget.Widget {
-    val label_width = 110.0
     val rows = mutable_array_new<widget.Widget>()
-    push(rows, widget.fixed_of(0.0, row_height, widget.row_of(gap, [
-        widget.fixed_of(label_width, 0.0, mono_label("Authorization", 11.0, style)),
-        widget.fixed_of(160.0, 0.0, controls.menu_title_widget(a.kind, style)),
-        widget.expand(widget.flex())
-    ])))
+    push(rows, request_ui.picker_row("Authorization", a.kind, style))
     if a.kind.items.selected == auth_basic {
-        push(rows, widget.fixed_of(0.0, row_height, widget.row_of(gap, [
-            widget.fixed_of(label_width, 0.0, mono_label("Username", 11.0, style)),
-            widget.expand(controls.entry_widget(a.user, style, m))
-        ])))
+        push(rows, request_ui.field_row("Username", a.user, style, m))
     }
     if a.kind.items.selected != auth_none {
-        push(rows, widget.fixed_of(0.0, row_height, widget.row_of(gap, [
-            widget.fixed_of(label_width, 0.0, mono_label(secret_label(a), 11.0, style)),
-            widget.expand(controls.entry_widget(with a.secret { label: secret_label(a) }, style, m))
-        ])))
+        push(rows, request_ui.field_row(
+            secret_label(a),
+            with a.secret { label: secret_label(a) },
+            style,
+            m
+        ))
     }
-    return widget.column_of(4.0, snapshot(rows))
+    return request_ui.rows_panel(snapshot(rows))
 }
 
 fn auth_height(a: AuthEditors) -> float {

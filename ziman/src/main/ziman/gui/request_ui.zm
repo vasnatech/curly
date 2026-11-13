@@ -121,26 +121,18 @@ pub fn editors(
     style: controls.Style,
     m: widget.Metrics
 ) -> widget.Widget {
-    return widget.Widget.Group(widget.Stack {
-        direction: widget.Direction.Column,
-        spacing: editor_gap,
-        padding: widget.insets_of(0.0, 0.0, 0.0, below_editors),
-        surface: widget.no_surface(),
-        align: widget.stretched(),
-        name: "",
-        children: [
-            widget.fixed_of(0.0, row_height, widget.row_of(gap, [
-                widget.fixed_of(editor_strip_width, 0.0, controls.tabs_widget(tabs, style)),
-                widget.expand(widget.flex())
-            ])),
-            body,
-            widget.fixed_of(0.0, row_height, widget.row_of(gap, [
-                widget.fixed_of(env_label_width, 0.0, mono_label("Environment", small_size, style)),
-                widget.fixed_of(env_width, 0.0, controls.menu_title_widget(env, style)),
-                widget.expand(widget.flex())
-            ]))
-        ]
-    })
+    return widget.padded_of(widget.insets_of(0.0, 0.0, 0.0, below_editors), widget.column_of(editor_gap, [
+        widget.fixed_of(0.0, row_height, widget.row_of(gap, [
+            widget.fixed_of(editor_strip_width, 0.0, controls.tabs_widget(tabs, style)),
+            widget.expand(widget.flex())
+        ])),
+        body,
+        widget.fixed_of(0.0, row_height, widget.row_of(gap, [
+            widget.fixed_of(env_label_width, 0.0, mono_label("Environment", small_size, style)),
+            widget.fixed_of(env_width, 0.0, controls.menu_title_widget(env, style)),
+            widget.expand(widget.flex())
+        ]))
+    ]))
 }
 
 // The Response/History switcher, which is the same shape with one tab strip and no slot.
@@ -235,7 +227,7 @@ pub fn pair_row(
 // be a list of them. An editor draws a few placeholders and calls it repeated content, which is
 // what every editor already does with a list.
 pub fn pair_table(rows: [widget.Widget], add: controls.Button, style: controls.Style) -> widget.Widget {
-    return padded_below(widget.column_of(table_gap, [
+    return widget.padded_of(widget.insets_of(0.0, 0.0, 0.0, below_rows), widget.column_of(table_gap, [
         widget.column_of(table_gap, rows),
         widget.fixed_of(0.0, row_height, widget.row_of(gap, [
             widget.fixed_of(pair_add_width, 0.0, controls.button_widget(add, style)),
@@ -280,25 +272,7 @@ pub fn picker_row(label: string, picker: controls.Menu, style: controls.Style) -
 // design function per combination -- which is what a design tool calls variants, and what Figma
 // does -- traded against triplicating the layout.
 pub fn rows_panel(rows: [widget.Widget]) -> widget.Widget {
-    return padded_below(widget.column_of(table_gap, rows))
-}
-
-// A box with four points under it, which is what every editor's content carries so that its
-// measured height is what the logic file used to compute by hand.
-//
-// **Private, because `pub` means something here.** In a design file what is exported is what a
-// builder may place, so a wrapper that takes a widget and gives it padding is not for the palette
-// -- it is how two components are written.
-fn padded_below(child: widget.Widget) -> widget.Widget {
-    return widget.Widget.Group(widget.Stack {
-        direction: widget.Direction.Column,
-        spacing: 0.0,
-        padding: widget.insets_of(0.0, 0.0, 0.0, below_rows),
-        surface: widget.no_surface(),
-        align: widget.stretched(),
-        name: "",
-        children: [child]
-    })
+    return widget.padded_of(widget.insets_of(0.0, 0.0, 0.0, below_rows), widget.column_of(table_gap, rows))
 }
 
 // ------------------------------------------------------------ the extraction rules table

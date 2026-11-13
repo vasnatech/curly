@@ -1,0 +1,645 @@
+// Draws a design file's component, the way a builder would: parse it, synthesise a placeholder for
+// every input, evaluate the tree against the real `widget` and `controls`, and rasterise.
+//
+// **This is the step where a reader becomes a builder.** `read_design` proved the text can be
+// turned into a tree; the question left was whether that tree can be turned back into a window
+// without the application that owns it. Everything a component needs comes from its signature:
+// `method: controls.Entry` is an entry a builder can make up, `body: widget.Widget` is a slot it
+// draws as a placeholder, and `style`/`m` are ambient.
+use controls
+use font
+use fs
+use geom
+use image
+use os
+use paint
+use raster
+use tools/read_design
+use tools/read_design.Component
+use tools/read_design.Constant
+use tools/read_design.Node
+use tools/read_design.Record
+use widget
+
+// What an expression evaluates to. One variant per thing the dialect can hand a builder -- which
+// is a short list, because the dialect is short.
+pub struct Widgets {
+    items: [widget.Widget]
+}
+
+pub enum Value {
+    W(widget.Widget)
+    F(float)
+    S(string)
+    E(controls.Entry)
+    B(controls.Button)
+    T(controls.Tabs)
+    M(controls.Menu)
+    R(controls.Tree)
+    C(controls.CheckBox)
+    L(Widgets)
+    Col(paint.Color)
+    Sty(controls.Style)
+    Met(widget.Metrics)
+    Ins(widget.Insets)
+    None
+}
+
+pub struct Binding {
+    name: string
+    value: Value
+}
+
+fn widget_of(v: Value) -> widget.Widget {
+    return switch v {
+        W(w) { w }
+        E(_) { widget.flex() }
+        B(_) { widget.flex() }
+        T(_) { widget.flex() }
+        M(_) { widget.flex() }
+        R(_) { widget.flex() }
+        C(_) { widget.flex() }
+        F(_) { widget.flex() }
+        S(_) { widget.flex() }
+        L(_) { widget.flex() }
+        Col(_) { widget.flex() }
+        Sty(_) { widget.flex() }
+        Met(_) { widget.flex() }
+        Ins(_) { widget.flex() }
+        None { widget.flex() }
+    }
+}
+
+fn float_of(v: Value) -> float {
+    return switch v {
+        F(f) { f }
+        W(_) { 0.0 }
+        E(_) { 0.0 }
+        B(_) { 0.0 }
+        T(_) { 0.0 }
+        M(_) { 0.0 }
+        R(_) { 0.0 }
+        C(_) { 0.0 }
+        S(_) { 0.0 }
+        L(_) { 0.0 }
+        Col(_) { 0.0 }
+        Sty(_) { 0.0 }
+        Met(_) { 0.0 }
+        Ins(_) { 0.0 }
+        None { 0.0 }
+    }
+}
+
+fn string_of(v: Value) -> string {
+    return switch v {
+        S(text) { text }
+        F(_) { "" }
+        W(_) { "" }
+        E(_) { "" }
+        B(_) { "" }
+        T(_) { "" }
+        M(_) { "" }
+        R(_) { "" }
+        C(_) { "" }
+        L(_) { "" }
+        Col(_) { "" }
+        Sty(_) { "" }
+        Met(_) { "" }
+        Ins(_) { "" }
+        None { "" }
+    }
+}
+
+fn widgets_of(v: Value) -> [widget.Widget] {
+    return switch v {
+        L(items) { items.items }
+        W(w) { [w] }
+        F(_) { [] }
+        S(_) { [] }
+        E(_) { [] }
+        B(_) { [] }
+        T(_) { [] }
+        M(_) { [] }
+        R(_) { [] }
+        C(_) { [] }
+        Col(_) { [] }
+        Sty(_) { [] }
+        Met(_) { [] }
+        Ins(_) { [] }
+        None { [] }
+    }
+}
+
+// **A placeholder for every input a component declares.** This is the half an editor cannot do
+// without: to draw `bar` on its own it must invent a `controls.Entry` for `method`, and the
+// signature is where it learns that it needs one.
+pub fn placeholder(said: string, name: string) -> Value {
+    if said == "controls.Entry" {
+        return Value.E(controls.entry_of(name, name, name))
+    }
+    if said == "controls.Button" {
+        return Value.B(controls.button_of(name, name))
+    }
+    if said == "controls.Tabs" {
+        return Value.T(controls.tabs_of(name, name, ["One", "Two", "Three"]))
+    }
+    if said == "controls.Menu" {
+        return Value.M(controls.choice_of(name, name, ["One", "Two"], 0))
+    }
+    if said == "controls.Tree" {
+        return Value.R(controls.tree_of(name, name, [
+            controls.tree_row("folder", 0),
+            controls.tree_row("request", 1),
+            controls.tree_row("another", 1)
+        ]))
+    }
+    if said == "controls.CheckBox" {
+        return Value.C(controls.check_box_of(name, name, widget.Toggle.Off))
+    }
+    if said == "string" {
+        return Value.S(name)
+    }
+    if said == "float" {
+        return Value.F(0.0)
+    }
+    // A slot, and a list of them. Drawn as a labelled box, which is what a slot should look like
+    // on a canvas: somewhere content goes, not content.
+    if said == "widget.Widget" {
+        return Value.W(slot_box(name))
+    }
+    if said == "[widget.Widget]" {
+        return Value.L(Widgets { items: [slot_box(name), slot_box(name), slot_box(name)] })
+    }
+    return Value.None
+}
+
+fn slot_box(name: string) -> widget.Widget {
+    return widget.fixed_of(0.0, 30.0, widget.Widget.Group(widget.Stack {
+        direction: widget.Direction.Row,
+        spacing: 0.0,
+        padding: widget.insets_all(6.0),
+        surface: widget.Surface {
+            fill: Option<paint.Color>.Some(paint.rgb(0.93, 0.93, 0.96)),
+            border: Option<widget.Border>.Some(widget.border_of(paint.rgb(0.6, 0.6, 0.7), 1.0)),
+            corner_radius: 3.0
+        },
+        align: widget.centred(),
+        name: "",
+        children: [widget.label_of(concat("slot: ", name), 11.0, paint.rgb(0.35, 0.35, 0.45))]
+    }))
+}
+
+fn look_up(name: string, env: [Binding]) -> Value {
+    for b in env {
+        if b.name == name {
+            return b.value
+        }
+    }
+    return Value.None
+}
+
+fn constant(name: string, known: [Constant]) -> Value {
+    for c in known {
+        if c.name == name {
+            return Value.F(c.value)
+        }
+    }
+    return Value.None
+}
+
+fn component_named(name: string, all: [Component]) -> Option<Component> {
+    for c in all {
+        if c.name == name {
+            return Option<Component>.Some(c)
+        }
+    }
+    return Option<Component>.None
+}
+
+// ------------------------------------------------------------------ the registry
+
+// The call names the dialect actually uses, and what each builds. **Short on purpose**: a design
+// file may call `widget.*`, `controls.*` and its own components, so this is the whole surface a
+// builder has to know, and anything missing is named rather than silently dropped.
+fn call(name: string, args: [Value], style: controls.Style, m: widget.Metrics) -> Value {
+    if name == "widget.row_of" {
+        return Value.W(widget.row_of(float_of(args[0]), widgets_of(args[1])))
+    }
+    if name == "widget.column_of" {
+        return Value.W(widget.column_of(float_of(args[0]), widgets_of(args[1])))
+    }
+    if name == "widget.fixed_of" {
+        return Value.W(widget.fixed_of(float_of(args[0]), float_of(args[1]), widget_of(args[2])))
+    }
+    if name == "widget.expand" {
+        return Value.W(widget.expand(widget_of(args[0])))
+    }
+    if name == "widget.padded_of" {
+        return Value.W(widget.padded_of(insets_of(args[0]), widget_of(args[1])))
+    }
+    if name == "widget.insets_of" {
+        return Value.Ins(widget.insets_of(
+            float_of(args[0]),
+            float_of(args[1]),
+            float_of(args[2]),
+            float_of(args[3])
+        ))
+    }
+    if name == "widget.insets_all" {
+        return Value.Ins(widget.insets_all(float_of(args[0])))
+    }
+    if name == "widget.flex" {
+        return Value.W(widget.flex())
+    }
+    if name == "widget.label_of" {
+        return Value.W(widget.label_of(string_of(args[0]), float_of(args[1]), ink_of(args[2], style)))
+    }
+    if name == "controls.entry_widget" {
+        return switch args[0] {
+            E(e) { Value.W(controls.entry_widget(e, style, m)) }
+            W(_) { Value.None }
+            F(_) { Value.None }
+            S(_) { Value.None }
+            B(_) { Value.None }
+            T(_) { Value.None }
+            M(_) { Value.None }
+            R(_) { Value.None }
+            C(_) { Value.None }
+            L(_) { Value.None }
+            Col(_) { Value.None }
+            Sty(_) { Value.None }
+            Met(_) { Value.None }
+            Ins(_) { Value.None }
+            None { Value.None }
+        }
+    }
+    if name == "controls.button_widget" {
+        return switch args[0] {
+            B(b) { Value.W(controls.button_widget(b, style)) }
+            W(_) { Value.None }
+            F(_) { Value.None }
+            S(_) { Value.None }
+            E(_) { Value.None }
+            T(_) { Value.None }
+            M(_) { Value.None }
+            R(_) { Value.None }
+            C(_) { Value.None }
+            L(_) { Value.None }
+            Col(_) { Value.None }
+            Sty(_) { Value.None }
+            Met(_) { Value.None }
+            Ins(_) { Value.None }
+            None { Value.None }
+        }
+    }
+    if name == "controls.tabs_widget" {
+        return switch args[0] {
+            T(t) { Value.W(controls.tabs_widget(t, style)) }
+            W(_) { Value.None }
+            F(_) { Value.None }
+            S(_) { Value.None }
+            E(_) { Value.None }
+            B(_) { Value.None }
+            M(_) { Value.None }
+            R(_) { Value.None }
+            C(_) { Value.None }
+            L(_) { Value.None }
+            Col(_) { Value.None }
+            Sty(_) { Value.None }
+            Met(_) { Value.None }
+            Ins(_) { Value.None }
+            None { Value.None }
+        }
+    }
+    if name == "controls.menu_title_widget" {
+        return switch args[0] {
+            M(menu) { Value.W(controls.menu_title_widget(menu, style)) }
+            W(_) { Value.None }
+            F(_) { Value.None }
+            S(_) { Value.None }
+            E(_) { Value.None }
+            B(_) { Value.None }
+            T(_) { Value.None }
+            R(_) { Value.None }
+            C(_) { Value.None }
+            L(_) { Value.None }
+            Col(_) { Value.None }
+            Sty(_) { Value.None }
+            Met(_) { Value.None }
+            Ins(_) { Value.None }
+            None { Value.None }
+        }
+    }
+    if name == "controls.tree_widget" {
+        return switch args[0] {
+            R(t) { Value.W(controls.tree_widget(t, style)) }
+            W(_) { Value.None }
+            F(_) { Value.None }
+            S(_) { Value.None }
+            E(_) { Value.None }
+            B(_) { Value.None }
+            T(_) { Value.None }
+            M(_) { Value.None }
+            C(_) { Value.None }
+            L(_) { Value.None }
+            Col(_) { Value.None }
+            Sty(_) { Value.None }
+            Met(_) { Value.None }
+            Ins(_) { Value.None }
+            None { Value.None }
+        }
+    }
+    if name == "controls.check_box_widget" {
+        return switch args[0] {
+            C(c) { Value.W(controls.check_box_widget(c, style, m)) }
+            W(_) { Value.None }
+            F(_) { Value.None }
+            S(_) { Value.None }
+            E(_) { Value.None }
+            B(_) { Value.None }
+            T(_) { Value.None }
+            M(_) { Value.None }
+            R(_) { Value.None }
+            L(_) { Value.None }
+            Col(_) { Value.None }
+            Sty(_) { Value.None }
+            Met(_) { Value.None }
+            Ins(_) { Value.None }
+            None { Value.None }
+        }
+    }
+    return Value.None
+}
+
+fn insets_of(v: Value) -> widget.Insets {
+    return switch v {
+        Ins(i) { i }
+        W(_) { widget.no_insets() }
+        F(_) { widget.no_insets() }
+        S(_) { widget.no_insets() }
+        E(_) { widget.no_insets() }
+        B(_) { widget.no_insets() }
+        T(_) { widget.no_insets() }
+        M(_) { widget.no_insets() }
+        R(_) { widget.no_insets() }
+        C(_) { widget.no_insets() }
+        L(_) { widget.no_insets() }
+        Col(_) { widget.no_insets() }
+        Sty(_) { widget.no_insets() }
+        Met(_) { widget.no_insets() }
+        None { widget.no_insets() }
+    }
+}
+
+fn ink_of(v: Value, style: controls.Style) -> paint.Color {
+    return switch v {
+        Col(c) { c }
+        W(_) { style.ink }
+        F(_) { style.ink }
+        S(_) { style.ink }
+        E(_) { style.ink }
+        B(_) { style.ink }
+        T(_) { style.ink }
+        M(_) { style.ink }
+        R(_) { style.ink }
+        C(_) { style.ink }
+        L(_) { style.ink }
+        Sty(_) { style.ink }
+        Met(_) { style.ink }
+        Ins(_) { style.ink }
+        None { style.ink }
+    }
+}
+
+// ------------------------------------------------------------------ evaluating
+
+pub fn eval(
+    node: Node,
+    env: [Binding],
+    known: [Constant],
+    all: [Component],
+    records: [Record],
+    style: controls.Style,
+    m: widget.Metrics,
+    missing: MutableArray<string>
+) -> Value {
+    switch node {
+        Num(text) {
+            return switch parse_float(text) {
+                Ok(f) { Value.F(f) }
+                Err(_) { Value.F(0.0) }
+            }
+        }
+        Str(text) { return Value.S(text) }
+        Path(text) {
+            if text == "style.ink" {
+                return Value.Col(style.ink)
+            }
+            val bound = look_up(text, env)
+            if Value.is_None(bound) {
+                val c = constant(text, known)
+                if Value.is_None(c) {
+                    push(missing, text)
+                }
+                return c
+            }
+            return bound
+        }
+        List(items) {
+            val out = mutable_array_new<widget.Widget>()
+            for one in items.items {
+                val v = eval(one, env, known, all, records, style, m, missing)
+                for w in widgets_of(v) {
+                    push(out, w)
+                }
+            }
+            return Value.L(Widgets { items: snapshot(out) })
+        }
+        Struct(_) {
+            // A struct literal is a `widget.Stack`, which only an internal helper builds; a
+            // builder never needs to place one.
+            push(missing, "struct literal")
+            return Value.None
+        }
+        Call(c) {
+            val args = mutable_array_new<Value>()
+            for a in c.args {
+                push(args, eval(a, env, known, all, records, style, m, missing))
+            }
+            // Its own components first: a design file's calls are mostly to its siblings, and
+            // that recursion is what makes a tree of components rather than a tree of boxes.
+            switch component_named(c.name, all) {
+                Some(part) { return render(part, snapshot(args), known, all, records, style, m, missing) }
+                None { unit }
+            }
+            val built = call(c.name, snapshot(args), style, m)
+            if Value.is_None(built) {
+                push(missing, concat(c.name, "()"))
+            }
+            return built
+        }
+    }
+    return Value.None
+}
+
+// One component, with its arguments bound to its parameters. Arguments it was not given get a
+// placeholder, which is how a builder draws a component on its own.
+fn record_named(said: string, records: [Record]) -> Option<Record> {
+    for r in records {
+        if r.name == said {
+            return Option<Record>.Some(r)
+        }
+    }
+    return Option<Record>.None
+}
+
+pub fn render(
+    c: Component,
+    args: [Value],
+    known: [Constant],
+    all: [Component],
+    records: [Record],
+    style: controls.Style,
+    m: widget.Metrics,
+    missing: MutableArray<string>
+) -> Value {
+    val env = mutable_array_new<Binding>()
+    var i = 0
+    for p in c.params {
+        // **`style` and `m` are ambient, not inputs.** Every component takes them and none of them
+        // chooses them: they are the theme and the font, handed down from whoever is drawing. A
+        // builder supplies its own, which is how one canvas previews a component under two themes.
+        // A struct parameter is bound to a marker, not a value: what the body reads is
+        // `it.filter`, never `it`, and passing it on to another component must not look like a
+        // name nobody declared. The callee re-expands whichever fields it reads.
+        val is_record = switch record_named(p.said, records) {
+            Some(_) { true }
+            None { false }
+        }
+        val given = if is_record {
+            Value.Sty(style)
+        } else {
+            if p.said == "controls.Style" {
+                Value.Sty(style)
+            } else {
+                if p.said == "widget.Metrics" {
+                    Value.Met(m)
+                } else {
+                    if i < len(args) { args[i] } else { placeholder(p.said, p.name) }
+                }
+            }
+        }
+        push(env, Binding { name: p.name, value: given })
+        // **A struct parameter is a data interface, not a value.** The root takes one `Screen`
+        // and reads `it.filter` out of it, so the builder binds a placeholder per declared field
+        // -- which is exactly the list an editor would show as the screen's inputs.
+        switch record_named(p.said, records) {
+            Some(r) {
+                for f in r.fields {
+                    push(env, Binding {
+                        name: concat(p.name, ".", f.name),
+                        value: placeholder(f.said, f.name)
+                    })
+                }
+            }
+            None { unit }
+        }
+        i = i + 1
+    }
+    val ts = read_design.tokens_of(c.body)
+    val start = if len(ts) > 0 && ts[0].text == "return" { 1 } else { 0 }
+    return eval(read_design.expr_at(ts, start).node, snapshot(env), known, all, records, style, m, missing)
+}
+
+fn main() {
+    val args = os.args()
+    val path = if len(args) > 0 { args[0] } else { "src/main/ziman/gui/request_ui.zm" }
+    val wanted = if len(args) > 1 { args[1] } else { "bar" }
+    val out_path = if len(args) > 2 { args[2] } else { "/tmp/component.png" }
+    val text = switch fs.read_text(path) {
+        Ok(t) { t }
+        Err(why) {
+            print(format("cannot read {}: {}", path, why))
+            return
+        }
+    }
+    val font_path = switch os.get_env("ZIMAN_FONT") {
+        Some(p) { p }
+        None { "../../ziman/vendor/fonts/Caladea-Regular.ttf" }
+    }
+    val data = switch fs.read_bytes(font_path) {
+        Ok(d) { d }
+        Err(why) {
+            print(format("font ({}): {}", font_path, why))
+            return
+        }
+    }
+    val face = switch font.load(data) {
+        Ok(f) { f }
+        Err(why) {
+            print(format("load: {}", why))
+            return
+        }
+    }
+    val m = switch widget.metrics_for(face) {
+        Ok(got) { got }
+        Err(why) {
+            print(format("metrics: {}", why))
+            return
+        }
+    }
+    val style = controls.default_style()
+    val all = read_design.components_of(text)
+    val known = read_design.constants_of(text)
+    val records = read_design.records_of(text)
+    print(format(
+        "{} component(s), {} constant(s), {} declared struct(s)",
+        str(len(all)),
+        str(len(known)),
+        str(len(records))
+    ))
+    for r in records {
+        print(format("  {} has {} input(s)", r.name, str(len(r.fields))))
+    }
+    switch component_named(wanted, all) {
+        Some(c) {
+            print(format("--- {} ---", c.name))
+            for p in c.params {
+                print(format("  input {}: {}", p.name, p.said))
+            }
+            val missing = mutable_array_new<string>()
+            val drawn = render(c, [], known, all, records, style, m, missing)
+            if len(missing) > 0 {
+                print(format("  {} thing(s) the builder could not place:", str(len(missing))))
+                for one in snapshot(missing) {
+                    print(format("    {}", one))
+                }
+            }
+            val width = 900.0
+            val height = 320.0
+            val laid = widget.layout(widget_of(drawn), geom.rect_of(0.0, 0.0, width, height), m)
+            val scene_of_it = widget.paint(laid, m)
+            val o = with raster.options() {
+                fonts: [face],
+                samples: 4,
+                background: Option<paint.Color>.Some(paint.rgb(1.0, 1.0, 1.0)),
+                max_pixels: 4000000
+            }
+            switch raster.surface_of(width, height, 1.0) {
+                Ok(surface) {
+                    switch raster.render_into(surface, scene_of_it, o) {
+                        Ok(picture) {
+                            switch fs.write_bytes(out_path, image.encode_png(picture)) {
+                                Ok(_) { print(format("  drew {}", out_path)) }
+                                Err(why) { print(format("  write: {}", why)) }
+                            }
+                        }
+                        Err(why) { print(format("  render: {}", why)) }
+                    }
+                }
+                Err(why) { print(format("  surface: {}", why)) }
+            }
+        }
+        None { print(format("no component named {}", wanted)) }
+    }
+}

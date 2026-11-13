@@ -805,7 +805,7 @@ fn rows_push_rule(
         // **Relabelled rather than rebuilt**, so the reader hears "Header" or "Template" where it
         // would otherwise hear "Path", and the text a user typed survives changing their mind.
         widget.expand(controls.entry_widget(with row.source { label: said }, style, m)),
-        widget.fixed_of(90.0, 0.0, controls.check_box_widget(row.secret, style)),
+        widget.fixed_of(90.0, 0.0, controls.check_box_widget(row.secret, style, m)),
         widget.fixed_of(28.0, 0.0, controls.button_widget(row.remove, style))
     ])))
 }

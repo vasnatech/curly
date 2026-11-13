@@ -15,6 +15,7 @@ use core/saved.Folder
 use core/saved.SavedRequest
 use core/storage
 use focus
+use fs
 use geom
 use gui/state
 use gui/state.Loaded
@@ -424,3 +425,133 @@ fn typing_in_the_filter_narrows_the_sidebar() {
 // tells the two apart -- a test for it passes whether the guard is there or not, which mutation
 // said out loud: removing it failed nothing. It is a performance choice and belongs in a
 // measurement, not in a gate that only looks like one.
+
+// ------------------------------------------------- the window's geometry (2026-11-13)
+
+// Every named control's bounds, in every state the window can be in, against a committed baseline.
+//
+// **This exists because the rest of this file cannot see a control move.** Every other test here
+// finds a control by `bounds_of(name)` and presses inside it, so it passes wherever that control
+// is -- blind to movement by construction. A change that shifted the pane switcher twelve points
+// up left all 263 of them green, and was caught only by dumping coordinates and diffing them by
+// hand. This is that diff, kept.
+//
+// A failure here is a layout change: either it was meant, and the baseline moves in the same
+// commit, or it was not, and this is the only thing in the suite that would have said so.
+//
+// When it was meant, the test leaves `window_geometry.actual.txt` beside the baseline and names
+// it, so the update is `mv` and the review is a diff. Reporting one differing line at a time and
+// asking for a 250-line file to be retyped is how a baseline stops being maintained and starts
+// being deleted.
+fn dump_into(l: widget.Laid, out: MutableArray<string>) {
+    if Control(c) = l.widget {
+        push(out, format(
+            "GEOM {} x={} y={} w={} h={}",
+            c.name,
+            str(l.bounds.x as int),
+            str(l.bounds.y as int),
+            str(l.bounds.width as int),
+            str(l.bounds.height as int)
+        ))
+    }
+    for child in l.children {
+        dump_into(child, out)
+    }
+}
+
+fn geometry_lines() -> [string] {
+    val out = mutable_array_new<string>()
+    // Every editor tab, because each draws a different editor and the default shows one of five.
+    for which in 0..5 {
+        push(out, format("-- editor {} --", str(which)))
+        dump_into(laid_of(with opened() { editors: with opened().editors { selected: which } }), out)
+    }
+    // Basic authorization, the only state that draws all three of the auth panel's rows.
+    push(out, "-- auth basic --")
+    val on_auth = with opened() { editors: with opened().editors { selected: 2 } }
+    val basic = with on_auth {
+        auth: with on_auth.auth {
+            kind: with on_auth.auth.kind { items: with on_auth.auth.kind.items { selected: 1 } }
+        }
+    }
+    dump_into(laid_of(basic), out)
+    // The Save As dialog, both halves: its error line is conditional, and the panel is fixed at
+    // the size it has with one showing so that it does not jump when you mistype.
+    val naming = state.Naming {
+        collection: controls.entry_of("save-collection", "Collection", "demo"),
+        path: controls.entry_of("save-path", "Name", "a/request"),
+        confirm: controls.button_of("save-confirm", "Save"),
+        cancel: controls.button_of("save-cancel", "Cancel"),
+        error: ""
+    }
+    push(out, "-- dialog --")
+    dump_into(laid_of(with opened() { naming: Option<state.Naming>.Some(naming) }), out)
+    push(out, "-- dialog with an error --")
+    val failing = with naming { error: "that name is taken" }
+    dump_into(laid_of(with opened() { naming: Option<state.Naming>.Some(failing) }), out)
+    return snapshot(out)
+}
+
+#[test]
+fn the_window_lays_out_where_the_baseline_says() {
+    val found = switch fs.resolve("window_geometry.txt") {
+        Some(path) { path }
+        None {
+            test.fail("window_geometry.txt is not on ZIMAN_RESOURCE_PATH")
+            ""
+        }
+    }
+    val baseline = switch fs.read_text(found) {
+        Ok(t) { t }
+        Err(why) {
+            test.fail(format("window_geometry.txt: {}", why))
+            ""
+        }
+    }
+    val wanted = lines(trim(baseline))
+    val got = geometry_lines()
+    var i = 0
+    for line in got {
+        if i >= len(wanted) {
+            report(found, got, format(
+                "line {}: {} -- the baseline ends at line {}",
+                str(i + 1),
+                line,
+                str(len(wanted))
+            ))
+            return
+        }
+        if line != wanted[i] {
+            report(found, got, format(
+                "line {}: {} -- baseline says {}",
+                str(i + 1),
+                line,
+                wanted[i]
+            ))
+            return
+        }
+        i = i + 1
+    }
+    if len(wanted) > len(got) {
+        report(found, got, format(
+            "the dump ends at line {}, and the baseline says {}",
+            str(len(got)),
+            wanted[len(got)]
+        ))
+    }
+}
+
+// Writes what was actually laid out next to the baseline, then fails with the first difference.
+// The write is best-effort: a read-only checkout still gets the difference, just not the file.
+fn report(baseline_path: string, got: [string], why: string) {
+    val out = mutable_string_new()
+    for line in got {
+        append(out, line, "\n")
+    }
+    val beside = fs.path_join(fs.parent_dir(baseline_path), "window_geometry.actual.txt")
+    val note = switch fs.write_bytes(beside, to_bytes(snapshot(out))) {
+        Ok(_) { format(" (what was laid out is in {})", beside) }
+        Err(_) { "" }
+    }
+    test.fail(concat(why, note))
+}

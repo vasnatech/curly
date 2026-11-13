@@ -5,3 +5,7 @@
 node_modules/
 
 .DS_Store
+
+# What the geometry test saw, written beside the baseline when it disagrees with it. Anchored
+# rather than bare: a bare name here once untracked a committed file somewhere else in the tree.
+/ziman/src/test/resources/window_geometry.actual.txt

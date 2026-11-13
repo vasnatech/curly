@@ -27,3 +27,9 @@ pub fn with_loop(items: [string], style: controls.Style) -> widget.Widget {
     }
     return widget.flex()
 }
+
+// A fifth rule: `pub` on something that is not a widget. A builder keying off `pub` would offer a
+// number in the palette beside the buttons.
+pub fn label_width() -> float {
+    return 110.0
+}

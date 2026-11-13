@@ -285,7 +285,11 @@ pub fn rows_panel(rows: [widget.Widget]) -> widget.Widget {
 
 // A box with four points under it, which is what every editor's content carries so that its
 // measured height is what the logic file used to compute by hand.
-pub fn padded_below(child: widget.Widget) -> widget.Widget {
+//
+// **Private, because `pub` means something here.** In a design file what is exported is what a
+// builder may place, so a wrapper that takes a widget and gives it padding is not for the palette
+// -- it is how two components are written.
+fn padded_below(child: widget.Widget) -> widget.Widget {
     return widget.Widget.Group(widget.Stack {
         direction: widget.Direction.Column,
         spacing: 0.0,

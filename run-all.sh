@@ -59,10 +59,10 @@ if (cd "$ROOT/ziman" && ZIMAN_MODULE_PATH=src/main/ziman \
   # check that stopped working -- or started crying wolf -- fails here rather than going quiet.
   caught="$(cd "$ROOT/ziman" && ZIMAN_MODULE_PATH=src/main/ziman \
     "$ZIMAN" tools/lint_design.zm -- src/test/resources/design_lint 2>&1 | grep -c "^src/test")"
-  if [ "$caught" -eq 4 ]; then
-    note "design lint catches its fixture (4 findings)"
+  if [ "$caught" -eq 5 ]; then
+    note "design lint catches its fixture (5 findings)"
   else
-    fail "design lint found $caught of 4 fixture violations"
+    fail "design lint found $caught of 5 fixture violations"
   fi
 else
   fail "design dialect"

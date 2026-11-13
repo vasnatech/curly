@@ -17,7 +17,17 @@ use fs
 use os
 
 val forbidden_words = ["if", "while", "for", "switch", "val", "var"]
+val widget_return = "-> widget.Widget"
+
 val forbidden_operators = [" + ", " - ", " * ", " / ", " % "]
+
+// **What `pub` means in a design file**, which is the whole reason this rule exists: what is
+// exported is what a builder may offer, so it has to be a thing a builder can place. `pub` on a
+// text helper or a number puts it in the palette beside the buttons. A helper that is not a
+// widget is written private, and the file's exports become its component list.
+val not_a_component =
+    "a `pub fn` in a design file must return widget.Widget -- what is exported here is what a " \
+    "builder may place, so make a helper private instead"
 
 pub struct Finding {
     file: string
@@ -97,6 +107,9 @@ pub fn findings_of(file: string, text: string) -> [Finding] {
     var in_body = false
     var in_header = false
     var number = 0
+    var header = ""
+    var exported = false
+    var header_line = 0
     for raw in lines(text) {
         number = number + 1
         val code = code_of(raw)
@@ -105,18 +118,32 @@ pub fn findings_of(file: string, text: string) -> [Finding] {
             continue
         }
         if !in_body && !in_header && starts_function(code) {
+            header = trimmed
+            exported = starts_with(trimmed, "pub fn ")
+            header_line = number
             // A signature may wrap, so the body starts at the line that opens the brace.
             if ends_with(trimmed, "{") {
                 in_body = true
+                if !exported || contains(header, widget_return) {
+                    unit
+                } else {
+                    push(out, Finding { file: file, line: header_line, said: not_a_component })
+                }
             } else {
                 in_header = true
             }
             continue
         }
         if in_header {
+            header = concat(header, " ", trimmed)
             if ends_with(trimmed, "{") {
                 in_header = false
                 in_body = true
+                if !exported || contains(header, widget_return) {
+                    unit
+                } else {
+                    push(out, Finding { file: file, line: header_line, said: not_a_component })
+                }
             }
             continue
         }

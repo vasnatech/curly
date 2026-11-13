@@ -287,9 +287,147 @@ pub fn show(node: Node, depth: int) {
 
 // --------------------------------------------------------- functions in a file
 
+// A struct a design file declares -- its data interface. **This is the one thing an editor most
+// needs**: a single list saying exactly what a screen consumes, from which it can synthesise a
+// placeholder per field and draw the component on its own.
+pub struct Field {
+    name: string
+    said: string
+}
+
+pub struct Record {
+    name: string
+    fields: [Field]
+}
+
+pub fn records_of(text: string) -> [Record] {
+    val out = mutable_array_new<Record>()
+    var name = ""
+    val fields = mutable_array_new<Field>()
+    for line in lines(text) {
+        val code = trim(code_of(line))
+        if starts_with(code, "pub struct ") && ends_with(code, "{") {
+            name = trim(substring(code, 11, len(code) - 1))
+            continue
+        }
+        if name == "" {
+            continue
+        }
+        if code == "}" {
+            push(out, Record { name: name, fields: snapshot(fields) })
+            clear(fields)
+            name = ""
+            continue
+        }
+        if Some(halves) = split_once(code, ": ") {
+            push(fields, Field { name: trim(halves[0]), said: trim(halves[1]) })
+        }
+    }
+    return snapshot(out)
+}
+
+pub struct Param {
+    name: string
+    said: string
+}
+
+// **Every function, not only the exported ones.** `pub` says what a builder may *offer* in a
+// palette; it does not say what a builder must *resolve*. A component that calls a private helper
+// still has to render, so the reader collects both and marks which is which. Getting that wrong
+// showed up immediately: `pair_table` calls a private `padded_below`, and a reader that skipped
+// private functions could not draw it.
 pub struct Component {
     name: string
+    exported: bool
+    params: [Param]
     body: string
+}
+
+// A module-level constant, already evaluated. **Arithmetic is allowed in one** -- it is how
+// `editor_strip_width = tab_width * editor_tabs` keeps one number in one place -- so the table is
+// read in order and a later constant may use an earlier one. Nothing else may: no calls, no
+// parameters, no state, which is what keeps this a table rather than an interpreter.
+pub struct Constant {
+    name: string
+    value: float
+}
+
+// The code on a line, with any trailing comment dropped. A `//` inside a string is not a
+// comment, but a constant's value is a number or a name, so a plain search is enough here.
+fn code_of(line: string) -> string {
+    val at = index_of(line, "//", 0)
+    return if at < 0 { line } else { substring(line, 0, at) }
+}
+
+fn number_of(word: string, known: [Constant]) -> float {
+    for c in known {
+        if c.name == word {
+            return c.value
+        }
+    }
+    return switch parse_float(word) {
+        Ok(f) { f }
+        Err(_) { 0.0 }
+    }
+}
+
+pub fn constants_of(text: string) -> [Constant] {
+    val out = mutable_array_new<Constant>()
+    for line in lines(text) {
+        val code = trim(code_of(line))
+        val body = if starts_with(code, "pub val ") {
+            substring(code, 8, len(code))
+        } else {
+            if starts_with(code, "val ") { substring(code, 4, len(code)) } else { "" }
+        }
+        if body == "" {
+            continue
+        }
+        if Some(parts) = split_once(body, " = ") {
+            val name = trim(parts[0])
+            val words = split(trim(parts[1]), " ")
+            var value = number_of(words[0], snapshot(out))
+            var i = 1
+            while i + 1 < len(words) {
+                val operator = words[i]
+                val next = number_of(words[i + 1], snapshot(out))
+                if operator == "*" {
+                    value = value * next
+                }
+                if operator == "+" {
+                    value = value + next
+                }
+                if operator == "-" {
+                    value = value - next
+                }
+                i = i + 2
+            }
+            push(out, Constant { name: name, value: value })
+        }
+    }
+    return snapshot(out)
+}
+
+// The parameters of a signature, which is a component's inputs -- what a builder shows as a panel
+// and what it must synthesise a placeholder for to draw the thing on its own.
+fn params_of(signature: string) -> [Param] {
+    val out = mutable_array_new<Param>()
+    val open = index_of(signature, "(", 0)
+    val close = index_of(signature, ")", 0)
+    if open < 0 || close < open {
+        return snapshot(out)
+    }
+    val inside = substring(signature, open + 1, close)
+    for piece in split(inside, ",") {
+        val one = trim(piece)
+        if one == "" {
+            continue
+        }
+        if Some(halves) = split_once(one, ": ") {
+            push(out, Param { name: trim(halves[0]), said: trim(halves[1]) })
+        }
+    }
+    return snapshot(out)
 }
 
 // Every `pub fn`, with the text of its body. Line-oriented, which the formatter makes sound.
@@ -298,22 +436,35 @@ pub fn components_of(text: string) -> [Component] {
     var collecting = false
     var name = ""
     var body = ""
+    var signature = ""
+    var exported = false
     for line in lines(text) {
-        if starts_with(line, "pub fn ") {
-            val rest = substring(line, 7, len(line))
+        if starts_with(line, "pub fn ") || starts_with(line, "fn ") {
+            val shown = starts_with(line, "pub fn ")
+            exported = shown
+            val rest = if shown { substring(line, 7, len(line)) } else { substring(line, 3, len(line)) }
             val at = index_of(rest, "(", 0)
             name = if at > 0 { substring(rest, 0, at) } else { rest }
+            signature = trim(line)
             collecting = ends_with(trim(line), "{")
             body = ""
             continue
         }
-        if !collecting && name != "" && ends_with(trim(line), "{") && !starts_with(trim(line), "//") {
-            collecting = true
+        if !collecting && name != "" && !starts_with(trim(line), "//") {
+            signature = concat(signature, " ", trim(line))
+            if ends_with(trim(line), "{") {
+                collecting = true
+            }
             continue
         }
         if collecting {
             if line == "}" {
-                push(out, Component { name: name, body: body })
+                push(out, Component {
+                    name: name,
+                    exported: exported,
+                    params: params_of(signature),
+                    body: body
+                })
                 collecting = false
                 name = ""
                 continue
@@ -410,9 +561,9 @@ fn main() {
         }
     }
     val found = components_of(text)
-    print(format("{} component(s): ", str(len(found))))
+    print(format("{} function(s): ", str(len(found))))
     for c in found {
-        print(format("  {}", c.name))
+        print(format("  {}{}", c.name, if c.exported { "" } else { "  (private)" }))
     }
     for c in found {
         if c.name == wanted {

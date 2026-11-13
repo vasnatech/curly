@@ -1,0 +1,427 @@
+// Reads a design file the way a UI builder would, and proves it can be read.
+//
+// **The dialect rests on one claim: the subset is about as hard to parse as JSON.** That is an
+// argument until something parses it, so this does -- tokenise a `*_ui.zm`, parse each `pub fn`'s
+// body into a tree of calls, literals, paths, lists and struct literals, and either print the
+// tree or check that every component in every design file comes out whole.
+//
+// **`--check` is the gate, and it is a stronger statement than the lint beside it.**
+// `lint_design.zm` says no forbidden keyword appears; this says a program can actually read the
+// file. The second implies the first and does not depend on a list of words -- a construct nobody
+// thought to forbid still fails here, because the parser stops and the leftover tokens are
+// counted. Four of the lint's own fixture functions fail it for exactly that reason.
+//
+//     ziman tools/read_design.zm -- --check src/main/ziman
+//     ziman tools/read_design.zm -- src/main/ziman/gui/request_ui.zm screen
+//
+// What it does **not** do is render. Turning this tree into a window needs a registry from a call
+// name to a control, which is the builder's next piece and not this one's.
+use fs
+use os
+
+pub struct Token {
+    kind: string
+    text: string
+}
+
+// A parsed expression. Recursive, like the widget tree it describes.
+pub struct Call {
+    name: string
+    args: [Node]
+}
+
+pub struct Fields {
+    name: string
+    keys: [string]
+    values: [Node]
+}
+
+pub struct Items {
+    items: [Node]
+}
+
+pub enum Node {
+    Call(Call)
+    Struct(Fields)
+    List(Items)
+    Str(string)
+    Num(string)
+    Path(string)
+}
+
+val digits = "0123456789"
+val name_chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"
+val punctuation = "().,[]{}:"
+
+fn is_in(set: string, ch: string) -> bool {
+    return contains(set, ch)
+}
+
+// ------------------------------------------------------------------- tokens
+
+pub fn tokens_of(source: string) -> [Token] {
+    val out = mutable_array_new<Token>()
+    val n = len(source)
+    var i = 0
+    while i < n {
+        val ch = substring(source, i, i + 1)
+        if ch == " " || ch == "\n" || ch == "\t" || ch == "\r" {
+            i = i + 1
+            continue
+        }
+        if i + 2 <= n && substring(source, i, i + 2) == "//" {
+            while i < n && substring(source, i, i + 1) != "\n" {
+                i = i + 1
+            }
+            continue
+        }
+        if ch == "\"" {
+            var j = i + 1
+            var text = ""
+            while j < n && substring(source, j, j + 1) != "\"" {
+                text = concat(text, substring(source, j, j + 1))
+                j = j + 1
+            }
+            push(out, Token { kind: "str", text: text })
+            i = j + 1
+            continue
+        }
+        if is_in(digits, ch) {
+            var j = i
+            while j < n && (is_in(digits, substring(source, j, j + 1)) || substring(source, j, j + 1) == ".") {
+                j = j + 1
+            }
+            push(out, Token { kind: "num", text: substring(source, i, j) })
+            i = j
+            continue
+        }
+        if is_in(name_chars, ch) {
+            var j = i
+            while j < n && is_in(name_chars, substring(source, j, j + 1)) {
+                j = j + 1
+            }
+            push(out, Token { kind: "ident", text: substring(source, i, j) })
+            i = j
+            continue
+        }
+        if is_in(punctuation, ch) {
+            push(out, Token { kind: "punct", text: ch })
+            i = i + 1
+            continue
+        }
+        // Anything else is not in the dialect; say so rather than skipping it quietly.
+        push(out, Token { kind: "other", text: ch })
+        i = i + 1
+    }
+    return snapshot(out)
+}
+
+// ------------------------------------------------------------------- parsing
+
+pub struct Parsed {
+    node: Node
+    next: int
+}
+
+fn token_at(ts: [Token], i: int) -> Token {
+    if i < len(ts) {
+        return ts[i]
+    }
+    return Token { kind: "end", text: "" }
+}
+
+// A dotted name: `widget.fixed_of`, `it.filter`, `widget.Direction.Column`.
+fn path_at(ts: [Token], start: int) -> Parsed {
+    var name = token_at(ts, start).text
+    var i = start + 1
+    while token_at(ts, i).text == "." && token_at(ts, i + 1).kind == "ident" {
+        name = concat(name, ".", token_at(ts, i + 1).text)
+        i = i + 2
+    }
+    return Parsed { node: Node.Path(name), next: i }
+}
+
+pub fn expr_at(ts: [Token], start: int) -> Parsed {
+    val t = token_at(ts, start)
+    if t.kind == "str" {
+        return Parsed { node: Node.Str(t.text), next: start + 1 }
+    }
+    if t.kind == "num" {
+        return Parsed { node: Node.Num(t.text), next: start + 1 }
+    }
+    if t.text == "[" {
+        val items = mutable_array_new<Node>()
+        var i = start + 1
+        while token_at(ts, i).text != "]" && token_at(ts, i).kind != "end" {
+            val one = expr_at(ts, i)
+            push(items, one.node)
+            i = one.next
+            if token_at(ts, i).text == "," {
+                i = i + 1
+            }
+        }
+        return Parsed { node: Node.List(Items { items: snapshot(items) }), next: i + 1 }
+    }
+    if t.kind == "ident" {
+        val p = path_at(ts, start)
+        val name = switch p.node {
+            Path(text) { text }
+            Call(_) { "" }
+            Struct(_) { "" }
+            List(_) { "" }
+            Str(_) { "" }
+            Num(_) { "" }
+        }
+        if token_at(ts, p.next).text == "(" {
+            val args = mutable_array_new<Node>()
+            var i = p.next + 1
+            while token_at(ts, i).text != ")" && token_at(ts, i).kind != "end" {
+                val one = expr_at(ts, i)
+                push(args, one.node)
+                i = one.next
+                if token_at(ts, i).text == "," {
+                    i = i + 1
+                }
+            }
+            return Parsed { node: Node.Call(Call { name: name, args: snapshot(args) }), next: i + 1 }
+        }
+        if token_at(ts, p.next).text == "{" {
+            val keys = mutable_array_new<string>()
+            val values = mutable_array_new<Node>()
+            var i = p.next + 1
+            while token_at(ts, i).text != "}" && token_at(ts, i).kind != "end" {
+                push(keys, token_at(ts, i).text)
+                // name, colon, value
+                val one = expr_at(ts, i + 2)
+                push(values, one.node)
+                i = one.next
+                if token_at(ts, i).text == "," {
+                    i = i + 1
+                }
+            }
+            return Parsed {
+                node: Node.Struct(Fields { name: name, keys: snapshot(keys), values: snapshot(values) }),
+                next: i + 1
+            }
+        }
+        return p
+    }
+    // Not in the dialect: hand it back as a path so the caller can see what stopped it.
+    return Parsed { node: Node.Path(concat("?", t.text)), next: start + 1 }
+}
+
+// Anything the parser could not place, which is what makes this a gate rather than a demo: a
+// design file is only useful to a builder if a builder can read it, and "no forbidden keyword"
+// is a weaker statement than "it parses".
+pub fn unparsed_in(node: Node) -> int {
+    switch node {
+        Call(c) {
+            var n = 0
+            for a in c.args {
+                n = n + unparsed_in(a)
+            }
+            return n
+        }
+        Struct(f) {
+            var n = 0
+            for v in f.values {
+                n = n + unparsed_in(v)
+            }
+            return n
+        }
+        List(items) {
+            var n = 0
+            for one in items.items {
+                n = n + unparsed_in(one)
+            }
+            return n
+        }
+        Str(_) { return 0 }
+        Num(_) { return 0 }
+        Path(text) { return if starts_with(text, "?") { 1 } else { 0 } }
+    }
+    return 0
+}
+
+// ------------------------------------------------------------------- printing
+
+fn indent_of(depth: int) -> string {
+    var out = ""
+    for _ in 0..depth {
+        out = concat(out, "  ")
+    }
+    return out
+}
+
+pub fn show(node: Node, depth: int) {
+    switch node {
+        Call(c) {
+            print(format("{}{}(", indent_of(depth), c.name))
+            for a in c.args {
+                show(a, depth + 1)
+            }
+            print(format("{})", indent_of(depth)))
+        }
+        Struct(f) {
+            print(format("{}{} {{", indent_of(depth), f.name))
+            var i = 0
+            for key in f.keys {
+                print(format("{}{}:", indent_of(depth + 1), key))
+                show(f.values[i], depth + 2)
+                i = i + 1
+            }
+            print(format("{}}}", indent_of(depth)))
+        }
+        List(items) {
+            print(format("{}[", indent_of(depth)))
+            for one in items.items {
+                show(one, depth + 1)
+            }
+            print(format("{}]", indent_of(depth)))
+        }
+        Str(text) { print(format("{}\"{}\"", indent_of(depth), text)) }
+        Num(text) { print(format("{}{}", indent_of(depth), text)) }
+        Path(text) { print(format("{}{}", indent_of(depth), text)) }
+    }
+}
+
+// --------------------------------------------------------- functions in a file
+
+pub struct Component {
+    name: string
+    body: string
+}
+
+// Every `pub fn`, with the text of its body. Line-oriented, which the formatter makes sound.
+pub fn components_of(text: string) -> [Component] {
+    val out = mutable_array_new<Component>()
+    var collecting = false
+    var name = ""
+    var body = ""
+    for line in lines(text) {
+        if starts_with(line, "pub fn ") {
+            val rest = substring(line, 7, len(line))
+            val at = index_of(rest, "(", 0)
+            name = if at > 0 { substring(rest, 0, at) } else { rest }
+            collecting = ends_with(trim(line), "{")
+            body = ""
+            continue
+        }
+        if !collecting && name != "" && ends_with(trim(line), "{") && !starts_with(trim(line), "//") {
+            collecting = true
+            continue
+        }
+        if collecting {
+            if line == "}" {
+                push(out, Component { name: name, body: body })
+                collecting = false
+                name = ""
+                continue
+            }
+            body = concat(body, "\n", line)
+        }
+    }
+    return snapshot(out)
+}
+
+fn design_files(root: string) -> [string] {
+    val out = mutable_array_new<string>()
+    walk(root, out)
+    return snapshot(out)
+}
+
+fn walk(dir: string, out: MutableArray<string>) {
+    switch fs.list_dir(dir) {
+        Ok(names) {
+            for name in names {
+                val path = fs.path_join(dir, name)
+                if fs.is_dir(path) {
+                    walk(path, out)
+                } else {
+                    if ends_with(name, "_ui.zm") {
+                        push(out, path)
+                    }
+                }
+            }
+        }
+        Err(_) { unit }
+    }
+}
+
+// Every component of every design file under `root` must parse, with nothing left over.
+fn check(root: string) {
+    val files = design_files(root)
+    var components = 0
+    var bad = 0
+    for file in files {
+        val text = switch fs.read_text(file) {
+            Ok(t) { t }
+            Err(why) {
+                print(format("read_design: cannot read {}: {}", file, why))
+                os.exit(1)
+                ""
+            }
+        }
+        for c in components_of(text) {
+            components = components + 1
+            val ts = tokens_of(c.body)
+            val start = if token_at(ts, 0).text == "return" { 1 } else { 0 }
+            val parsed = expr_at(ts, start)
+            val left = unparsed_in(parsed.node)
+            // A trailing token is as much a failure as an unknown one: it means the parser stopped
+            // early and the tree it returned is not the whole component.
+            val trailing = len(ts) - parsed.next
+            if left > 0 || trailing > 0 {
+                bad = bad + 1
+                print(format(
+                    "{}: {} did not parse -- {} token(s) outside the dialect, {} left over",
+                    file,
+                    c.name,
+                    str(left),
+                    str(trailing)
+                ))
+            }
+        }
+    }
+    if bad > 0 {
+        print(format("read_design: {} of {} component(s) unreadable by a builder", str(bad), str(components)))
+        os.exit(1)
+    }
+    print(format(
+        "read_design: {} component(s) in {} design file(s), every one parses",
+        str(components),
+        str(len(files))
+    ))
+}
+
+fn main() {
+    val args = os.args()
+    if len(args) > 0 && args[0] == "--check" {
+        check(if len(args) > 1 { args[1] } else { "src/main/ziman" })
+        return
+    }
+    val path = if len(args) > 0 { args[0] } else { "src/main/ziman/gui/request_ui.zm" }
+    val wanted = if len(args) > 1 { args[1] } else { "screen" }
+    val text = switch fs.read_text(path) {
+        Ok(t) { t }
+        Err(why) {
+            print(format("cannot read {}: {}", path, why))
+            return
+        }
+    }
+    val found = components_of(text)
+    print(format("{} component(s): ", str(len(found))))
+    for c in found {
+        print(format("  {}", c.name))
+    }
+    for c in found {
+        if c.name == wanted {
+            print(format("\n--- {} ---", c.name))
+            val ts = tokens_of(c.body)
+            print(format("{} tokens", str(len(ts))))
+            // The body is `return <expr>`, so the expression starts after the keyword.
+            val start = if token_at(ts, 0).text == "return" { 1 } else { 0 }
+            show(expr_at(ts, start).node, 0)
+        }
+    }
+}

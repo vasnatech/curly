@@ -68,6 +68,22 @@ else
   fail "design dialect"
 fi
 
+# **And a builder must be able to read them**, which is a stronger claim than "no forbidden
+# keyword": tools/read_design.zm parses every component of every design file into a tree and
+# counts what it could not place or had left over. A construct nobody thought to forbid still
+# fails here. The fixture is checked too, because a parser that accepted everything would pass.
+if (cd "$ROOT/ziman" && ZIMAN_MODULE_PATH=src/main/ziman \
+      "$ZIMAN" tools/read_design.zm -- --check src/main/ziman); then
+  if (cd "$ROOT/ziman" && ZIMAN_MODULE_PATH=src/main/ziman \
+        "$ZIMAN" tools/read_design.zm -- --check src/test/resources/design_lint >/dev/null 2>&1); then
+    fail "read_design parsed a fixture it should have refused"
+  else
+    note "design files parse; the fixture does not"
+  fi
+else
+  fail "a design file cannot be read by a builder"
+fi
+
 phase "ziman unit tests"
 if (cd "$ROOT/ziman" && ZIMAN_MODULE_PATH=src/main/ziman ZIMAN_RESOURCE_PATH=src/test/resources \
       "$ZIMAN" test src/test/unit/*.zm) | tail -1; then

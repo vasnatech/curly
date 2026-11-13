@@ -35,6 +35,8 @@ val env_width = 200.0
 // where a component's own spacing cannot live: padding is a thing this box has, so the box says
 // it, and the measured height comes out right without anyone computing it.
 val below_editors = 8.0
+val sidebar_width = 280.0
+val status_height = 18.0
 // **One number, five tabs.** `tab_width` is the number the tab control and the box the strip is
 // laid out in both come from, and writing 500.0 here would be the second place it lives -- which
 // is the thing this codebase keeps removing. So the dialect allows arithmetic **in a constant**,
@@ -129,4 +131,59 @@ pub fn pane_switcher(panes: controls.Tabs, style: controls.Style) -> widget.Widg
         widget.fixed_of(pane_strip_width, 0.0, controls.tabs_widget(panes, style)),
         widget.expand(widget.flex())
     ]))
+}
+
+// Everything the screen draws itself from: the controls it shows, the two slots the logic file
+// fills, and the one number a slot cannot supply for itself.
+//
+// **The design file declares its own data interface**, which is what lets it stay free of
+// application types -- `gui/state` builds one of these and passes it in, so the dependency runs
+// outwards and the cycle that killed the first attempt cannot form. It is also the one thing an
+// editor most needs: a single struct saying exactly what a screen consumes, from which it can
+// synthesise placeholder values to draw a preview.
+pub struct Screen {
+    filter: controls.Entry
+    tree: controls.Tree
+    method: controls.Entry
+    url: controls.Entry
+    send: controls.Button
+    save: controls.Button
+    save_as: controls.Button
+    editors: controls.Tabs
+    // The editor the strip chose, and how tall it is. A four-deep conditional on the selected tab
+    // picks it and the row count decides its height; neither is design.
+    editor: widget.Widget
+    editor_height: float
+    env: controls.Menu
+    panes: controls.Tabs
+    // The response or the history, whichever the pane switcher chose.
+    lower: widget.Widget
+    status: string
+}
+
+// **The root.** One per design file by convention, named `screen` rather than after the file, so
+// renaming the file is not a two-place change -- and it is what an editor opens and draws. Every
+// other `pub fn` here is a part it calls, which is how the nesting becomes visible to a tool: the
+// composition lives in the design file instead of in `view`, where an editor could not see it.
+pub fn screen(it: Screen, style: controls.Style, m: widget.Metrics) -> widget.Widget {
+    return widget.row_of(gap, [
+        widget.fixed_of(gap, 0.0, widget.flex()),
+        widget.fixed_of(sidebar_width, 0.0, sidebar(it.filter, it.tree, style, m)),
+        widget.expand(main_column(it, style, m)),
+        widget.fixed_of(gap, 0.0, widget.flex())
+    ])
+}
+
+// The window's right-hand side, under its own name because a root reads better as four lines than
+// as eleven.
+pub fn main_column(it: Screen, style: controls.Style, m: widget.Metrics) -> widget.Widget {
+    return widget.column_of(gap, [
+        widget.fixed_of(0.0, gap, widget.flex()),
+        widget.fixed_of(0.0, row_height, bar(it.method, it.url, it.send, it.save, it.save_as, style, m)),
+        editors(it.editors, it.editor, it.editor_height, it.env, style, m),
+        pane_switcher(it.panes, style),
+        widget.expand(it.lower),
+        widget.fixed_of(0.0, status_height, mono_label(it.status, small_size, style)),
+        widget.fixed_of(0.0, gap, widget.flex())
+    ])
 }

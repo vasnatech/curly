@@ -459,7 +459,6 @@ pub struct State {
     focused: string
 }
 
-pub val row_height = 30.0
 val headers_editor = 0
 val query_editor = 1
 val auth_editor = 2
@@ -735,17 +734,6 @@ fn auth_widget(a: AuthEditors, style: controls.Style, m: widget.Metrics) -> widg
     return request_ui.rows_panel(snapshot(rows))
 }
 
-fn auth_height(a: AuthEditors) -> float {
-    var rows = 1
-    if a.kind.items.selected == auth_basic {
-        rows = rows + 1
-    }
-    if a.kind.items.selected != auth_none {
-        rows = rows + 1
-    }
-    return (row_height + 4.0) * (rows as float)
-}
-
 // The extraction rules: one row of five controls per rule, and a button that adds one.
 fn rules_widget(t: RuleTable, style: controls.Style, m: widget.Metrics) -> widget.Widget {
     val rows = mutable_array_new<widget.Widget>()
@@ -782,15 +770,6 @@ fn rows_push_rule(
     ))
 }
 
-fn rules_height(t: RuleTable) -> float {
-    return (row_height + 4.0) * ((len(t.rows) + 1) as float)
-}
-
-// What `table_widget` will measure, which the column above it has to know before it is built.
-fn table_height(t: PairTable) -> float {
-    return (row_height + 4.0) * ((len(t.rows) + 1) as float)
-}
-
 pub fn view(s: State, style: controls.Style, m: widget.Metrics) -> widget.Widget {
     val body_height = (body_rows as float) * 17.0 + 8.0
     // **One editor at a time.** Headers, query parameters and a body stacked between the URL and
@@ -813,20 +792,6 @@ pub fn view(s: State, style: controls.Style, m: widget.Metrics) -> widget.Widget
             }
         }
     }
-    val editor_height = if s.editors.selected == query_editor {
-        table_height(s.query)
-    } else {
-        if s.editors.selected == auth_editor {
-            auth_height(s.auth)
-        } else {
-            if s.editors.selected == extract_editor {
-                rules_height(s.rules)
-            } else {
-                if s.editors.selected == body_editor { body_height } else { table_height(s.headers) }
-            }
-        }
-    }
-
     // **No scroll of its own around it**: a text area scrolls itself to follow its caret, and a
     // scroll measures as nothing, so wrapping one in another collapsed the pane to a sliver. The
     // control owns its view now, which is the right place for it -- only the code that moved the
@@ -848,7 +813,6 @@ pub fn view(s: State, style: controls.Style, m: widget.Metrics) -> widget.Widget
         save_as: s.save_as,
         editors: s.editors,
         editor: chosen_editor,
-        editor_height: editor_height,
         env: s.env,
         panes: s.panes,
         lower: lower,

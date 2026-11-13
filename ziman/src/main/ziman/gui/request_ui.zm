@@ -41,6 +41,7 @@ val pair_name_width = 220.0
 val pair_remove_width = 28.0
 val pair_add_width = 120.0
 val table_gap = 4.0
+val below_rows = 4.0
 val auth_label_width = 110.0
 val auth_picker_width = 160.0
 val rule_kind_width = 120.0
@@ -116,7 +117,6 @@ pub fn bar(
 pub fn editors(
     tabs: controls.Tabs,
     body: widget.Widget,
-    body_height: float,
     env: controls.Menu,
     style: controls.Style,
     m: widget.Metrics
@@ -133,7 +133,7 @@ pub fn editors(
                 widget.fixed_of(editor_strip_width, 0.0, controls.tabs_widget(tabs, style)),
                 widget.expand(widget.flex())
             ])),
-            widget.fixed_of(0.0, body_height, body),
+            body,
             widget.fixed_of(0.0, row_height, widget.row_of(gap, [
                 widget.fixed_of(env_label_width, 0.0, mono_label("Environment", small_size, style)),
                 widget.fixed_of(env_width, 0.0, controls.menu_title_widget(env, style)),
@@ -168,10 +168,11 @@ pub struct Screen {
     save: controls.Button
     save_as: controls.Button
     editors: controls.Tabs
-    // The editor the strip chose, and how tall it is. A four-deep conditional on the selected tab
-    // picks it and the row count decides its height; neither is design.
+    // The editor the strip chose. A four-deep conditional on the selected tab picks it, which is
+    // not design -- but **how tall it is no longer has to be told**: every editor's content
+    // carries four points of padding below it, so the column measures the height the logic file
+    // used to compute. That removed `editor_height` and the three functions behind it.
     editor: widget.Widget
-    editor_height: float
     env: controls.Menu
     panes: controls.Tabs
     // The response or the history, whichever the pane switcher chose.
@@ -198,7 +199,7 @@ pub fn main_column(it: Screen, style: controls.Style, m: widget.Metrics) -> widg
     return widget.column_of(gap, [
         widget.fixed_of(0.0, gap, widget.flex()),
         widget.fixed_of(0.0, row_height, bar(it.method, it.url, it.send, it.save, it.save_as, style, m)),
-        editors(it.editors, it.editor, it.editor_height, it.env, style, m),
+        editors(it.editors, it.editor, it.env, style, m),
         pane_switcher(it.panes, style),
         widget.expand(it.lower),
         widget.fixed_of(0.0, status_height, mono_label(it.status, small_size, style)),
@@ -234,13 +235,13 @@ pub fn pair_row(
 // be a list of them. An editor draws a few placeholders and calls it repeated content, which is
 // what every editor already does with a list.
 pub fn pair_table(rows: [widget.Widget], add: controls.Button, style: controls.Style) -> widget.Widget {
-    return widget.column_of(table_gap, [
+    return padded_below(widget.column_of(table_gap, [
         widget.column_of(table_gap, rows),
         widget.fixed_of(0.0, row_height, widget.row_of(gap, [
             widget.fixed_of(pair_add_width, 0.0, controls.button_widget(add, style)),
             widget.expand(widget.flex())
         ]))
-    ])
+    ]))
 }
 
 // ------------------------------------- labelled rows, which is the conditional-children case
@@ -279,7 +280,21 @@ pub fn picker_row(label: string, picker: controls.Menu, style: controls.Style) -
 // design function per combination -- which is what a design tool calls variants, and what Figma
 // does -- traded against triplicating the layout.
 pub fn rows_panel(rows: [widget.Widget]) -> widget.Widget {
-    return widget.column_of(table_gap, rows)
+    return padded_below(widget.column_of(table_gap, rows))
+}
+
+// A box with four points under it, which is what every editor's content carries so that its
+// measured height is what the logic file used to compute by hand.
+pub fn padded_below(child: widget.Widget) -> widget.Widget {
+    return widget.Widget.Group(widget.Stack {
+        direction: widget.Direction.Column,
+        spacing: 0.0,
+        padding: widget.insets_of(0.0, 0.0, 0.0, below_rows),
+        surface: widget.no_surface(),
+        align: widget.stretched(),
+        name: "",
+        children: [child]
+    })
 }
 
 // ------------------------------------------------------------ the extraction rules table

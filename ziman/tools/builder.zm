@@ -153,7 +153,10 @@ pub fn run(path: string) -> Result<unit, string> {
             // says whether any of that could have changed its answer.
             var canvas = builder_state.canvas_of(st, style, m)
             var drawn_from = st.text
-            var drawn_part = builder_state.showing(st)
+            // **The component *and* the placeholder counts**, because changing a count changes
+            // the picture and nothing else does: a signature of the text and the component alone
+            // leaves the canvas stale until something unrelated moves it.
+            var drawn_part = builder_state.canvas_signature(st)
             var laid = widget.layout(
                 builder_state.view(st, style, m),
                 geom.rect_of(0.0, 0.0, width_pt, height_pt),
@@ -166,10 +169,10 @@ pub fn run(path: string) -> Result<unit, string> {
             var dirty = true
             while !closing {
                 if dirty {
-                    if st.text != drawn_from || builder_state.showing(st) != drawn_part {
+                    if st.text != drawn_from || builder_state.canvas_signature(st) != drawn_part {
                         canvas = builder_state.canvas_of(st, style, m)
                         drawn_from = st.text
-                        drawn_part = builder_state.showing(st)
+                        drawn_part = builder_state.canvas_signature(st)
                     }
                     val whole = geom.rect_of(0.0, 0.0, width_pt, height_pt)
                     laid = widget.layout(builder_state.view(st, style, m), whole, m)

@@ -79,6 +79,8 @@ pub struct Shop {
     // keeps writing into the same two.
     spots: MutableArray<Spot>
     component: string
+    // How many items each invented control has, by input name. Empty means the default.
+    counts: [Count]
 }
 
 pub fn shop_of(
@@ -96,7 +98,8 @@ pub fn shop_of(
         m: m,
         missing: mutable_array_new<string>(),
         spots: mutable_array_new<Spot>(),
-        component: ""
+        component: "",
+        counts: []
     }
 }
 
@@ -191,7 +194,41 @@ fn widgets_of(v: Value) -> [widget.Widget] {
 // **A placeholder for every input a component declares.** This is the half an editor cannot do
 // without: to draw `bar` on its own it must invent a `controls.Entry` for `method`, and the
 // signature is where it learns that it needs one.
-pub fn placeholder(said: string, name: string) -> Value {
+// How many items an invented control has. **A design can be sized for a number the builder
+// cannot know**: `pane_switcher` gives its strip `tab_width * pane_tabs` with `pane_tabs = 2`,
+// and a placeholder that makes up three tabs draws the third past the end of the strip -- where,
+// because a `Fixed` does not clip, it is painted and no click can reach it. The count has to come
+// from outside, which means from whoever is previewing.
+pub struct Count {
+    name: string
+    items: int
+}
+
+// The default, and the reason it is three: one item hides every spacing question, two hides
+// which end a gap is on, three shows both.
+val default_items = 3
+
+pub fn items_for(name: string, counts: [Count]) -> int {
+    for one in counts {
+        if one.name == name {
+            return if one.items < 0 { 0 } else { one.items }
+        }
+    }
+    return default_items
+}
+
+fn made_up_labels(name: string, how_many: int) -> [string] {
+    val out = mutable_array_new<string>()
+    var i = 0
+    while i < how_many {
+        push(out, format("{} {}", name, str(i + 1)))
+        i = i + 1
+    }
+    return snapshot(out)
+}
+
+pub fn placeholder(said: string, name: string, counts: [Count]) -> Value {
+    val how_many = items_for(name, counts)
     if said == "controls.Entry" {
         return Value.E(controls.entry_of(name, name, name))
     }
@@ -199,17 +236,20 @@ pub fn placeholder(said: string, name: string) -> Value {
         return Value.B(controls.button_of(name, name))
     }
     if said == "controls.Tabs" {
-        return Value.T(controls.tabs_of(name, name, ["One", "Two", "Three"]))
+        return Value.T(controls.tabs_of(name, name, made_up_labels(name, how_many)))
     }
     if said == "controls.Menu" {
-        return Value.M(controls.choice_of(name, name, ["One", "Two"], 0))
+        return Value.M(controls.choice_of(name, name, made_up_labels(name, how_many), 0))
     }
     if said == "controls.Tree" {
-        return Value.R(controls.tree_of(name, name, [
-            controls.tree_row("folder", 0),
-            controls.tree_row("request", 1),
-            controls.tree_row("another", 1)
-        ]))
+        val rows = mutable_array_new<controls.TreeRow>()
+        var i = 0
+        while i < how_many {
+            // The first row is a branch and the rest sit under it, so a tree looks like one.
+            push(rows, controls.tree_row(format("{} {}", name, str(i + 1)), if i == 0 { 0 } else { 1 }))
+            i = i + 1
+        }
+        return Value.R(controls.tree_of(name, name, snapshot(rows)))
     }
     if said == "controls.CheckBox" {
         return Value.C(controls.check_box_of(name, name, widget.Toggle.Off))
@@ -226,7 +266,13 @@ pub fn placeholder(said: string, name: string) -> Value {
         return Value.W(slot_box(name))
     }
     if said == "[widget.Widget]" {
-        return Value.L(Widgets { items: [slot_box(name), slot_box(name), slot_box(name)] })
+        val boxes = mutable_array_new<widget.Widget>()
+        var i = 0
+        while i < how_many {
+            push(boxes, slot_box(name))
+            i = i + 1
+        }
+        return Value.L(Widgets { items: snapshot(boxes) })
     }
     return Value.None
 }
@@ -869,7 +915,7 @@ pub fn render(c: Component, args: [Value], outer: Shop) -> Value {
                 if p.said == "widget.Metrics" {
                     Value.Met(shop.m)
                 } else {
-                    if i < len(args) { args[i] } else { placeholder(p.said, p.name) }
+                    if i < len(args) { args[i] } else { placeholder(p.said, p.name, shop.counts) }
                 }
             }
         }
@@ -882,7 +928,7 @@ pub fn render(c: Component, args: [Value], outer: Shop) -> Value {
                 for f in r.fields {
                     push(env, Binding {
                         name: concat(p.name, ".", f.name),
-                        value: placeholder(f.said, f.name)
+                        value: placeholder(f.said, f.name, shop.counts)
                     })
                 }
             }

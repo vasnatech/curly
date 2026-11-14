@@ -57,12 +57,18 @@ pub struct State {
     up: controls.Button
     down: controls.Button
     undo: controls.Button
+    fewer: controls.Button
+    more: controls.Button
     picked: Option<Spot>
     // The file as it was before the last edit, so one mistake is recoverable. **One step, not a
     // stack**: four buttons here write to somebody's source the instant they are pressed, and
     // the case this exists for is the press you did not mean -- Delete, mostly. A stack invites
     // redo and a history panel, which is a text editor, which this is not.
     before: Option<string>
+    // How many items the invented controls have, by input name. **A design can be sized for a
+    // number nothing here can infer** -- `pane_switcher` sizes its strip for `pane_tabs = 2` --
+    // so the preview has to be told, and the Inputs panel is where.
+    counts: [render_design.Count]
     status: string
     focused: string
 }
@@ -126,17 +132,70 @@ pub fn tree_of(c: Component) -> read_design.Node {
     return read_design.expr_at(ts, start).node
 }
 
-// Every field of every struct the file declares, as the builder would list them: these are the
-// screen's inputs, the things a caller has to supply, and the only part of a design file that is
-// a data interface rather than a layout.
-fn input_rows(records: [Record]) -> [string] {
+// What the component on the canvas is given, in the names its placeholders are built under.
+//
+// **It follows what is being shown, and the first version did not.** It listed every field of
+// every declared struct, which is right for the root -- `screen(it: Screen, ...)` takes one
+// record and its placeholders are named for that record's fields -- and wrong for every part:
+// `pane_switcher(panes: controls.Tabs, style)` is handed a placeholder named `panes`, which was
+// in no list and so could not be chosen or counted.
+//
+// `style` and `m` are left out because they are ambient: every component takes them and none of
+// them chooses them.
+fn input_rows(c: Component, records: [Record]) -> [string] {
     val out = mutable_array_new<string>()
-    for r in records {
-        for f in r.fields {
-            push(out, format("{}.{}: {}", r.name, f.name, f.said))
+    for p in c.params {
+        if p.said == "controls.Style" || p.said == "widget.Metrics" {
+            continue
+        }
+        switch record_of(p.said, records) {
+            // A record parameter is a data interface rather than a value: what the body reads is
+            // `it.filter`, so the inputs are the fields and not the record.
+            Some(r) {
+                for f in r.fields {
+                    push(out, format("{}: {}", f.name, f.said))
+                }
+            }
+            None { push(out, format("{}: {}", p.name, p.said)) }
         }
     }
     return snapshot(out)
+}
+
+// The name at a position in that list, which is the name a placeholder is built under.
+fn input_named(c: Component, records: [Record], at: int) -> string {
+    var i = 0
+    for p in c.params {
+        if p.said == "controls.Style" || p.said == "widget.Metrics" {
+            continue
+        }
+        switch record_of(p.said, records) {
+            Some(r) {
+                for f in r.fields {
+                    if i == at {
+                        return f.name
+                    }
+                    i = i + 1
+                }
+            }
+            None {
+                if i == at {
+                    return p.name
+                }
+                i = i + 1
+            }
+        }
+    }
+    return ""
+}
+
+fn record_of(said: string, records: [Record]) -> Option<Record> {
+    for r in records {
+        if r.name == said {
+            return Option<Record>.Some(r)
+        }
+    }
+    return Option<Record>.None
 }
 
 fn part_names(all: [Component]) -> [string] {
@@ -172,18 +231,35 @@ pub fn state_of(path: string, text: string) -> State {
         source: controls.text_area_of("source", "Source", "", source_rows),
         apply: controls.button_of("apply", "Apply"),
         revert: controls.button_of("revert", "Revert"),
-        inputs: controls.list_of("inputs", "Inputs", input_rows(read_design.records_of(text))),
+        inputs: controls.list_of("inputs", "Inputs", inputs_for(names, start, all, read_design.records_of(text))),
         palette: controls.list_of("palette", "Add", palette_labels()),
         insert: controls.button_of("insert", "Insert after"),
         remove: controls.button_of("remove", "Delete"),
         up: controls.button_of("up", "Up"),
         down: controls.button_of("down", "Down"),
         undo: controls.button_of("undo", "Undo"),
+        fewer: controls.button_of("fewer", "-"),
+        more: controls.button_of("more", "+"),
         picked: Option<Spot>.None,
         before: Option<string>.None,
+        counts: [],
         status: format("{} component(s)", str(len(all))),
         focused: "parts"
     }
+}
+
+// The inputs of whichever component a state opens on, which `state_of` needs before it has a
+// state to ask.
+fn inputs_for(names: [string], at: int, all: [Component], records: [Record]) -> [string] {
+    if at < 0 || at >= len(names) {
+        return []
+    }
+    for c in all {
+        if c.name == names[at] {
+            return input_rows(c, records)
+        }
+    }
+    return []
 }
 
 pub fn load(path: string) -> Result<State, string> {
@@ -206,7 +282,9 @@ pub struct Canvas {
 // frame**: it parses a body, evaluates it and synthesises a placeholder for every input, which is
 // the expensive half of this program.
 pub fn canvas_of(s: State, style: controls.Style, m: widget.Metrics) -> Canvas {
-    val shop = render_design.shop_of(s.constants, s.components, s.records, style, m)
+    val shop = with render_design.shop_of(s.constants, s.components, s.records, style, m) {
+        counts: s.counts
+    }
     val drawn = switch component_named(showing(s), s.components) {
         Some(c) { render_design.render(c, [], shop) }
         None { render_design.Value.None }
@@ -271,6 +349,68 @@ fn span_of(s: State, spot: Spot, node: read_design.Node) -> read_design.Span {
     }
 }
 
+// The input the Inputs list is on, as the name a placeholder is built under -- which is the
+// field's own name, not `Screen.field`.
+pub fn chosen_input(s: State) -> string {
+    return switch component_named(showing(s), s.components) {
+        Some(c) { input_named(c, s.records, s.inputs.selected) }
+        None { "" }
+    }
+}
+
+fn items_line(s: State) -> string {
+    val name = chosen_input(s)
+    if name == "" {
+        return "no input chosen"
+    }
+    return format("{}: {} item(s)", name, str(render_design.items_for(name, s.counts)))
+}
+
+// Changes how many items the chosen input's placeholder has. **Not an edit**: nothing is written,
+// because this is about the preview and not about the file. A design that is only right at two
+// tabs is still right; it was the drawing that was wrong.
+fn counted(s: State, by: int) -> Step {
+    val name = chosen_input(s)
+    if name == "" {
+        return kept(with s { status: "choose an input first" })
+    }
+    val now = render_design.items_for(name, s.counts) + by
+    if now < 0 {
+        return kept(with s { status: "already none" })
+    }
+    val out = mutable_array_new<render_design.Count>()
+    var found = false
+    for one in s.counts {
+        if one.name == name {
+            push(out, with one { items: now })
+            found = true
+        } else {
+            push(out, one)
+        }
+    }
+    if !found {
+        push(out, render_design.Count { name: name, items: now })
+    }
+    return kept(with s {
+        counts: snapshot(out),
+        status: format("{}: {} item(s)", name, str(now))
+    })
+}
+
+// What the canvas was drawn from, so the shell knows when to draw it again. **The counts belong
+// in it**: changing one changes the picture and nothing else does, so a signature of the text and
+// the component alone leaves the canvas stale until something else moves.
+pub fn canvas_signature(s: State) -> string {
+    val out = mutable_string_new()
+    // A separator that cannot occur in an identifier, so two different states cannot spell the
+    // same signature. Not NUL: ziman strings do not carry one.
+    append(out, showing(s), "|")
+    for one in s.counts {
+        append(out, one.name, "=", str(one.items), ";")
+    }
+    return snapshot(out)
+}
+
 pub fn view(s: State, style: controls.Style, m: widget.Metrics) -> widget.Widget {
     return widget.row_of(gap, [
         widget.fixed_of(panel_width, 0.0, widget.column_of(gap, [
@@ -319,6 +459,11 @@ pub fn view(s: State, style: controls.Style, m: widget.Metrics) -> widget.Widget
                 widget.expand(widget.flex())
             ])),
             heading("Inputs", style),
+            widget.fixed_of(0.0, row_height, widget.row_of(gap, [
+                controls.button_widget(s.fewer, style),
+                controls.button_widget(s.more, style),
+                widget.expand(note(items_line(s), style))
+            ])),
             widget.expand(controls.list_widget(s.inputs, style)),
             note(s.status, style)
         ]))
@@ -644,7 +789,11 @@ fn reparsed(s: State, text: string) -> State {
             selected: s.parts.selected,
             offset: s.parts.offset
         },
-        inputs: with controls.list_of("inputs", "Inputs", input_rows(records)) {
+        inputs: with controls.list_of(
+            "inputs",
+            "Inputs",
+            inputs_for(part_names(all), s.parts.selected, all, records)
+        ) {
             selected: s.inputs.selected,
             offset: s.inputs.offset
         }
@@ -1009,7 +1158,15 @@ pub fn step(
         // **A new component clears the selection.** A path names a node of one component's tree
         // and means something else, or nothing, in another's -- keeping it would outline a box
         // that has no relation to what was clicked.
-        return kept(with with_source(with moved { picked: Option<Spot>.None }, "") {
+        val shown_now = with moved {
+            picked: Option<Spot>.None,
+            inputs: controls.list_of(
+                "inputs",
+                "Inputs",
+                inputs_for(part_names(moved.components), moved.parts.selected, moved.components, moved.records)
+            )
+        }
+        return kept(with with_source(shown_now, "") {
             status: format("showing {}", showing(moved))
         })
     }
@@ -1051,6 +1208,19 @@ pub fn step(
         val pressed = with here { undo: taken.button }
         if taken.activated {
             return undone(pressed)
+        }
+        return kept(pressed)
+    }
+    if name == "fewer" || name == "more" {
+        val which = if name == "fewer" { here.fewer } else { here.more }
+        val taken = controls.button_input(which, input, bounds_of(laid, name))
+        val pressed = if name == "fewer" {
+            with here { fewer: taken.button }
+        } else {
+            with here { more: taken.button }
+        }
+        if taken.activated {
+            return counted(pressed, if name == "fewer" { 0 - 1 } else { 1 })
         }
         return kept(pressed)
     }

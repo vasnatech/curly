@@ -49,6 +49,10 @@ fn fixture() -> string {
         "    return widget.row_of(gap, [controls.entry_widget(name, style, m), widget.flex()])",
         "}",
         "",
+        "pub fn strip(tabs: controls.Tabs, style: controls.Style) -> widget.Widget {",
+        "    return controls.tabs_widget(tabs, style)",
+        "}",
+        "",
         "pub fn screen(it: Screen, style: controls.Style, m: widget.Metrics) -> widget.Widget {",
         "    return widget.column_of(gap, [",
         "        widget.fixed_of(0.0, row_height, field(it.name, style, m)),",
@@ -62,6 +66,21 @@ fn fixture() -> string {
 
 fn opened() -> builder_state.State {
     return builder_state.state_of("fixture_ui.zm", fixture())
+}
+
+// Shows a component the way pressing its row in the list does, so the inputs follow.
+fn showing_part(s: builder_state.State, name: string) -> builder_state.State {
+    var at = 0
+    for one in s.parts.items {
+        if one == name {
+            // Landed on by moving, so `step` rebuilds the inputs the way a user's press does.
+            val moved = with s { parts: with s.parts { selected: at - 1 } }
+            return acted(moved, controls.Input.KeyDown(controls.keystroke_of(controls.Key.Down))).state
+        }
+        at = at + 1
+    }
+    test.fail(concat("no component named ", name))
+    return s
 }
 
 fn laid_of(s: builder_state.State) -> widget.Laid {
@@ -111,12 +130,32 @@ fn it_opens_on_the_root_and_not_the_first_part() {
     test.assert_eq(opened().parts.items[0], "field")
 }
 
+// **The inputs follow what is on the canvas**, which is the whole point of listing them: the
+// root takes one record and its placeholders are named for that record's fields, while a part
+// takes its own parameters and is handed placeholders named for those. Listing the records
+// regardless -- which this did first -- means a part's inputs appear nowhere, so they cannot be
+// chosen and their placeholders cannot be adjusted.
 #[test]
-fn the_inputs_are_the_fields_the_file_declares() {
+fn the_inputs_follow_the_component_on_the_canvas() {
     val s = opened()
+    test.assert_eq(builder_state.showing(s), "screen")
     test.assert_len(2, s.inputs.items)
-    test.assert_eq(s.inputs.items[0], "Screen.name: controls.Entry")
-    test.assert_eq(s.inputs.items[1], "Screen.go: controls.Button")
+    test.assert_eq(s.inputs.items[0], "name: controls.Entry")
+    test.assert_eq(s.inputs.items[1], "go: controls.Button")
+
+    val on_strip = showing_part(s, "strip")
+    test.assert_len(1, on_strip.inputs.items)
+    test.assert_eq(on_strip.inputs.items[0], "tabs: controls.Tabs")
+}
+
+// `style` and `m` are ambient -- every component takes them and none of them chooses them -- so
+// they are not inputs and do not appear.
+#[test]
+fn the_ambient_parameters_are_not_inputs() {
+    for row in opened().inputs.items {
+        test.assert_false(contains(row, "controls.Style"))
+        test.assert_false(contains(row, "widget.Metrics"))
+    }
 }
 
 // **The design's controls are not in the builder's tab order, and that is the whole reason the
@@ -273,7 +312,7 @@ fn a_second_apply_lands_on_the_node_and_not_on_stale_bytes() {
     test.assert(contains(again.state.text, "controls.entry_widget(name, style, m)"))
     test.assert(contains(again.state.text, "val gap = 8.0"))
     // And it still parses as the same file: two components, one record.
-    test.assert_len(2, read_design.components_of(again.state.text))
+    test.assert_len(3, read_design.components_of(again.state.text))
     test.assert_len(1, read_design.records_of(again.state.text))
 }
 
@@ -461,9 +500,10 @@ fn adding_a_node_leaves_a_file_that_still_parses() {
     val step = pressing(with_palette(chosen, 0), "insert")
     test.assert(step.write)
     test.assert(contains(step.state.text, "widget.flex()"))
-    test.assert_len(2, read_design.components_of(step.state.text))
-    // ...and the root is still the root, not a casualty of the splice.
-    test.assert_eq(read_design.components_of(step.state.text)[1].name, "screen")
+    test.assert_len(3, read_design.components_of(step.state.text))
+    // ...and the root is still the root, not a casualty of the splice. Found by name rather
+    // than by position, which is what broke when the fixture grew a third component.
+    test.assert(contains(names_of(step.state.text), "widget.flex"))
 }
 
 // It goes *after* the selection, which is what the button says.
@@ -533,7 +573,7 @@ fn a_container_can_be_added_and_then_filled() {
     val step = pressing(with_palette(chosen, 2), "insert")
     test.assert(step.write)
     test.assert(contains(step.state.text, "widget.row_of(8.0, [widget.flex()])"))
-    test.assert_len(2, read_design.components_of(step.state.text))
+    test.assert_len(3, read_design.components_of(step.state.text))
 }
 
 // ---- deleting a node
@@ -550,7 +590,7 @@ fn deleting_a_middle_item_leaves_a_file_that_parses() {
     test.assert_len(2, items)
     test.assert_eq(read_design.text_of(items[0]), "widget.fixed_of")
     test.assert_eq(read_design.text_of(items[1]), "widget.expand")
-    test.assert_len(2, read_design.components_of(step.state.text))
+    test.assert_len(3, read_design.components_of(step.state.text))
 }
 
 // The last item takes the comma *before* it instead, which is the other half of the rule.
@@ -575,7 +615,7 @@ fn deleting_the_last_item_takes_the_comma_before_it() {
             test.assert(contains(substring(s.text, cut.from, cut.to), ","))
             val after = read_design.with_span_replaced(s.text, cut, "")
             test.assert_len(2, root_children(after))
-            test.assert_len(2, read_design.components_of(after))
+            test.assert_len(3, read_design.components_of(after))
         }
         None { test.fail("no slot") }
     }
@@ -603,7 +643,7 @@ fn the_only_item_can_go_and_leaves_an_empty_list() {
             ""
         }
     }
-    test.assert_len(2, read_design.components_of(once))
+    test.assert_len(3, read_design.components_of(once))
     // Now one item is left, and cutting it leaves the list empty and the file readable.
     val left = builder_state.state_of("fixture_ui.zm", once)
     val empty = switch builder_state.deletion_of(left, with one { index: 0 }) {
@@ -614,7 +654,7 @@ fn the_only_item_can_go_and_leaves_an_empty_list() {
         }
     }
     test.assert(contains(empty, "widget.row_of(gap, [])"))
-    test.assert_len(2, read_design.components_of(empty))
+    test.assert_len(3, read_design.components_of(empty))
 }
 
 #[test]
@@ -654,7 +694,7 @@ fn down_moves_the_item_past_the_next_one() {
     test.assert_eq(names_of(step.state.text), "widget.fixed_of widget.expand widget.fixed_of")
     // ...and the thing that moved is the one that was selected, not some other row.
     test.assert(contains(step.state.text, "controls.button_widget(it.go, style)"))
-    test.assert_len(2, read_design.components_of(step.state.text))
+    test.assert_len(3, read_design.components_of(step.state.text))
 }
 
 // Up is the same machinery the other way, and lands the item before the one above it.
@@ -681,7 +721,7 @@ fn a_second_move_lands_where_the_first_one_left_it() {
     val twice = pressing(again, "up")
     test.assert(twice.write)
     test.assert_eq(names_of(twice.state.text), "widget.fixed_of widget.fixed_of widget.expand")
-    test.assert_len(2, read_design.components_of(twice.state.text))
+    test.assert_len(3, read_design.components_of(twice.state.text))
 }
 
 // The ends refuse rather than wrapping or writing nothing quietly.
@@ -764,4 +804,97 @@ fn undo_leaves_the_canvas_where_it_was() {
     val back = pressing(gone, "undo").state
     test.assert_eq(back.text, fixture())
     test.assert_eq(builder_state.showing(back), "field")
+}
+
+// ---- how many items an invented control has
+
+// How many distinct controls in the canvas have names under a prefix, which is how `controls`
+// names the rows of a list, the tabs of a strip and the branches of a tree.
+//
+// **Distinct names, not matching nodes.** A name is inherited by every child that has none of
+// its own, so a tab and the label inside it both answer `tabs/0` -- counting nodes gave exactly
+// twice the number of tabs, which looks like a plausible count and is not one.
+fn parts_named(l: widget.Laid, prefix: string) -> int {
+    val seen = mutable_array_new<string>()
+    gather_names(l, prefix, seen)
+    return len(seen)
+}
+
+fn gather_names(l: widget.Laid, prefix: string, seen: MutableArray<string>) {
+    if starts_with(l.name, prefix) && !contains(seen, l.name) {
+        push(seen, l.name)
+    }
+    for child in l.children {
+        gather_names(child, prefix, seen)
+    }
+}
+
+fn tabs_drawn(s: builder_state.State) -> int {
+    val laid = laid_of(s)
+    // Each tab is its own control; the strip itself is named `tabs`, its tabs `tabs/0` and so on.
+    return parts_named(shown_of(s, laid).laid, "tabs/")
+}
+
+// **A design can be sized for a number the builder cannot know.** `pane_switcher` in curly's own
+// screen gives its strip `tab_width * pane_tabs` with `pane_tabs = 2`, and a placeholder that
+// invents three tabs draws the third past the end of it -- painted, because a `Fixed` does not
+// clip, and unreachable, because hit testing will not descend into a box the point is outside.
+// The count has to come from whoever is previewing, and this is them telling it.
+#[test]
+fn the_item_count_changes_what_a_placeholder_draws() {
+    val on_strip = showing_part(opened(), "strip")
+    val chosen = with on_strip { inputs: with on_strip.inputs { selected: 0 } }
+    test.assert_eq(builder_state.chosen_input(chosen), "tabs")
+    // Three by default: one item hides every spacing question, two hides which end a gap is on.
+    test.assert(tabs_drawn(chosen) > 0)
+    val three = tabs_drawn(chosen)
+    val fewer = pressing(chosen, "fewer").state
+    test.assert_eq(tabs_drawn(fewer), three - 1)
+    val more = pressing(pressing(fewer, "more").state, "more").state
+    test.assert_eq(tabs_drawn(more), three + 1)
+}
+
+// **Nothing is written.** This is about the preview, not about the file: a design that is only
+// right at two tabs was always right, and it was the drawing that was wrong.
+#[test]
+fn changing_the_count_writes_nothing() {
+    val on_strip = showing_part(opened(), "strip")
+    val chosen = with on_strip { inputs: with on_strip.inputs { selected: 0 } }
+    val step = pressing(chosen, "fewer")
+    test.assert_false(step.write)
+    test.assert_eq(step.state.text, fixture())
+}
+
+// It will not go below none, and says so rather than wrapping to a negative count.
+#[test]
+fn the_count_stops_at_none() {
+    val on_strip = showing_part(opened(), "strip")
+    var s = with on_strip { inputs: with on_strip.inputs { selected: 0 } }
+    var guard = 0
+    while guard < 6 {
+        s = pressing(s, "fewer").state
+        guard = guard + 1
+    }
+    test.assert_eq(tabs_drawn(s), 0)
+    test.assert_eq(s.status, "already none")
+}
+
+// With no input chosen there is nothing to count, and the button says so instead of guessing one.
+#[test]
+fn changing_the_count_with_no_input_chosen_says_so() {
+    val on_strip = showing_part(opened(), "strip")
+    val none = with on_strip { inputs: with on_strip.inputs { selected: 0 - 1 } }
+    test.assert_eq(pressing(none, "fewer").state.status, "choose an input first")
+}
+
+// **The canvas is redrawn when a count changes**, which the shell decides from a signature -- and
+// a signature of the text and the component alone would leave the picture stale until something
+// unrelated moved it.
+#[test]
+fn the_canvas_signature_notices_a_count() {
+    val on_strip = showing_part(opened(), "strip")
+    val chosen = with on_strip { inputs: with on_strip.inputs { selected: 0 } }
+    val before = builder_state.canvas_signature(chosen)
+    val after = builder_state.canvas_signature(pressing(chosen, "fewer").state)
+    test.assert(before != after)
 }

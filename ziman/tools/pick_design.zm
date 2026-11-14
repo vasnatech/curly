@@ -226,6 +226,12 @@ fn check_component(
         // button's on its label, and both are reachable. If the control is nowhere in the chain
         // under its own centre, no mapping from a point could have found it either.
         //
+        // **It used to be invisible to the pointer and perfectly visible to the eye.** ziman's
+        // `Fixed` clips what overflows it now, so a control laid outside its box is simply not
+        // drawn rather than painted somewhere no click can reach -- which is why the note says
+        // that instead. What it reports is still worth knowing; it is no longer a lie about what
+        // the user sees.
+        //
         // In a preview this is usually the placeholder's fault rather than the design's: a
         // `controls.Tabs` nobody filled in is drawn with three items, and `pane_switcher` sizes
         // its strip `tab_width * pane_tabs` with `pane_tabs = 2.0`. The third tab is laid past
@@ -235,7 +241,7 @@ fn check_component(
         // causes are the same picture.
         if !reachable(laid, centre(one.bounds), one.name) {
             print(format(
-                "{}: {} -- note: '{}' is drawn where a press cannot reach it",
+                "{}: {} -- note: '{}' is laid outside its box, so it is clipped away",
                 file,
                 c.name,
                 one.name

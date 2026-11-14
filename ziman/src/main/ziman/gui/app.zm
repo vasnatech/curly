@@ -568,22 +568,22 @@ pub fn run(store: Storage) -> Result<unit, string> {
                     // the same widgets the scene draws, so it is stale in exactly the cases the
                     // scene is -- which `repaint` has already worked out. Republishing an
                     // unchanged tree would be the same waste the damage path exists to avoid.
-                    if readable {
-                        switch painted.region {
-                            Some(_) {
-                                switch atspi.publish(a11y.tree_of(laid, "curly", st.focused), "curly") {
-                                    Ok(_) { unit }
-                                    // **Stop trying rather than fail.** A window with no
-                                    // accessibility bus is a window, not an error: this build may
-                                    // have no backend, or the session may have no registry. Said
-                                    // once, in the status line, and then left alone.
-                                    Err(why) {
-                                        readable = false
-                                        st = with st { status: concat("accessibility off: ", why) }
-                                    }
-                                }
+                    //
+                    // `repaint` answers a *list* of painted regions since ziman 2026-11-14 --
+                    // two distant changes are cheaper as two rectangles than as the box between
+                    // them -- so the question "did anything change" is now whether that list is
+                    // empty.
+                    if readable && len(painted.regions) > 0 {
+                        switch atspi.publish(a11y.tree_of(laid, "curly", st.focused), "curly") {
+                            Ok(_) { unit }
+                            // **Stop trying rather than fail.** A window with no accessibility
+                            // bus is a window, not an error: this build may have no backend, or
+                            // the session may have no registry. Said once, in the status line,
+                            // and then left alone.
+                            Err(why) {
+                                readable = false
+                                st = with st { status: concat("accessibility off: ", why) }
                             }
-                            None { unit }
                         }
                     }
                     dirty = false

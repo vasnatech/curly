@@ -69,6 +69,9 @@ use gui/state.Naming
 use gui/state.Sidebar
 use gui/state.State
 use gui/state.bounds_of
+use gui/state.committed
+use gui/state.composing
+use gui/state.composition_dropped
 use gui/state.edited_request
 use gui/state.edited_request_from
 use gui/state.env_name
@@ -84,6 +87,7 @@ use gui/state.selected_item
 use gui/state.sidebar_of
 use gui/state.step
 use gui/state.view
+use ibus
 use os
 use paint
 use raster
@@ -290,6 +294,78 @@ fn is_exposed(e: window.Event) -> bool {
     }
 }
 
+// Whether the window gained or lost the keyboard, which an input method **needs telling**: an
+// unfocused application that still answered key events would compose into a window the user has
+// left.
+fn focus_change(e: window.Event) -> Option<bool> {
+    return switch e {
+        FocusIn { Option<bool>.Some(true) }
+        FocusOut { Option<bool>.Some(false) }
+        Resize(_) { Option<bool>.None }
+        Exposed { Option<bool>.None }
+        Close { Option<bool>.None }
+        KeyDown(_) { Option<bool>.None }
+        KeyUp(_) { Option<bool>.None }
+        Char(_) { Option<bool>.None }
+        PointerDown(_) { Option<bool>.None }
+        PointerUp(_) { Option<bool>.None }
+        PointerMove(_) { Option<bool>.None }
+        Scroll(_) { Option<bool>.None }
+    }
+}
+
+// The key a press or release carries, for offering to the input method before anything else sees
+// it. **Both directions**, because a method that is told only about presses never learns a
+// modifier was let go.
+fn key_down_of(e: window.Event) -> Option<window.KeyPress> {
+    return switch e {
+        KeyDown(k) { Option<window.KeyPress>.Some(k) }
+        KeyUp(_) { Option<window.KeyPress>.None }
+        FocusIn { Option<window.KeyPress>.None }
+        FocusOut { Option<window.KeyPress>.None }
+        Resize(_) { Option<window.KeyPress>.None }
+        Exposed { Option<window.KeyPress>.None }
+        Close { Option<window.KeyPress>.None }
+        Char(_) { Option<window.KeyPress>.None }
+        PointerDown(_) { Option<window.KeyPress>.None }
+        PointerUp(_) { Option<window.KeyPress>.None }
+        PointerMove(_) { Option<window.KeyPress>.None }
+        Scroll(_) { Option<window.KeyPress>.None }
+    }
+}
+
+fn key_up_of(e: window.Event) -> Option<window.KeyPress> {
+    return switch e {
+        KeyUp(k) { Option<window.KeyPress>.Some(k) }
+        KeyDown(_) { Option<window.KeyPress>.None }
+        FocusIn { Option<window.KeyPress>.None }
+        FocusOut { Option<window.KeyPress>.None }
+        Resize(_) { Option<window.KeyPress>.None }
+        Exposed { Option<window.KeyPress>.None }
+        Close { Option<window.KeyPress>.None }
+        Char(_) { Option<window.KeyPress>.None }
+        PointerDown(_) { Option<window.KeyPress>.None }
+        PointerUp(_) { Option<window.KeyPress>.None }
+        PointerMove(_) { Option<window.KeyPress>.None }
+        Scroll(_) { Option<window.KeyPress>.None }
+    }
+}
+
+// What the method did to the document, applied to whichever field has the focus.
+fn composed_into(s: State, changes: [ibus.Change]) -> State {
+    var now = s
+    for one in changes {
+        switch one {
+            Composing(c) { now = composing(now, c.text, c.caret, c.marked_start, c.marked_end) }
+            Committed(text) { now = committed(now, text) }
+            // The context went: the daemon stopped, or the engine was switched out from under
+            // us. The half-typed word goes with it rather than being inserted.
+            Closed { now = composition_dropped(now) }
+        }
+    }
+    return now
+}
+
 fn resized_to(e: window.Event) -> Option<window.Size> {
     return switch e {
         Resize(size) { Option<window.Size>.Some(size) }
@@ -390,6 +466,20 @@ pub fn run(store: Storage) -> Result<unit, string> {
         fn(w: window.Window) -> Result<unit, string> {
             var painter = try desktop.painter_of(start_width as float, start_height as float, scale)
             var st = opened
+            // **An input method is optional and its absence is not an error.** A desktop with no
+            // ibus daemon is an ordinary desktop, and a Latin-script user may never notice it is
+            // missing; said once in the status line and then left alone, exactly as the
+            // accessibility bridge is. `composing` stays false and every call below is skipped.
+            var composing_on = switch ibus.open("curly") {
+                Ok(_) { true }
+                Err(why) {
+                    st = with st { status: concat("input method off: ", why) }
+                    false
+                }
+            }
+            if composing_on {
+                ibus.focused(true)
+            }
             var width_pt = start_width as float
             var height_pt = start_height as float
             var closing = false
@@ -457,6 +547,23 @@ pub fn run(store: Storage) -> Result<unit, string> {
                     val painted = try desktop.repaint(painter, w, scene_now, options)
                     painter = painted.next
 
+                    // **Where the caret is, in screen pixels, so the candidate list appears under
+                    // it rather than at the corner of the display.** Only on a frame that was
+                    // rebuilt: the position changes when the layout does and not otherwise, and
+                    // `window.origin` is a round trip to the server. `None` is the ordinary
+                    // answer when the focus is on a button, and then the method is left where it
+                    // was rather than told something false.
+                    if composing_on {
+                        switch window.origin(w) {
+                            Ok(at) {
+                                if Some(box) = desktop.caret_on_screen(at, laid, density) {
+                                    ibus.caret_at(box.x, box.y, box.width, box.height)
+                                }
+                            }
+                            Err(_) { unit }
+                        }
+                    }
+
                     // **Published when something changed.** The accessibility tree describes
                     // the same widgets the scene draws, so it is stale in exactly the cases the
                     // scene is -- which `repaint` has already worked out. Republishing an
@@ -491,6 +598,39 @@ pub fn run(store: Storage) -> Result<unit, string> {
                 for e in try window.poll(w) {
                     if is_close(e) {
                         closing = true
+                    }
+                    // **The method is told about the focus, and about every key, before the
+                    // application sees either.** `press` answering true means the key belonged to
+                    // the composition: it must not be inserted, must not be read as a shortcut
+                    // and must not move the caret, which is why this `continue`s rather than
+                    // falling through to `input_of`. Getting that wrong is a window where typing
+                    // Japanese also triggers Ctrl-S.
+                    if composing_on {
+                        if Some(on) = focus_change(e) {
+                            ibus.focused(on)
+                            if !on {
+                                // Leaving the window abandons a half-typed word rather than
+                                // committing it somewhere the user cannot see.
+                                ibus.reset()
+                                st = composition_dropped(st)
+                                dirty = true
+                            }
+                        }
+                        var taken = false
+                        if Some(k) = key_down_of(e) {
+                            taken = ibus.press(k)
+                        }
+                        if Some(k) = key_up_of(e) {
+                            taken = ibus.release(k)
+                        }
+                        val changes = ibus.changes()
+                        if len(changes) > 0 {
+                            st = composed_into(st, changes)
+                            dirty = true
+                        }
+                        if taken {
+                            continue
+                        }
                     }
                     // The contents are gone and the scene has not changed, so without this the
                     // window would stay as the compositor left it. **`forget` is not enough on
@@ -609,6 +749,14 @@ pub fn run(store: Storage) -> Result<unit, string> {
                 // above was built, laid out, painted and diffed anyway, and only the last step
                 // was skipped.
                 clock.sleep_millis(16)
+            }
+            // **Dropped on the way out, and the order matters.** A method still holding a
+            // composition for a window that has gone is the one leak a user can see: a candidate
+            // list hanging over an empty desktop.
+            if composing_on {
+                ibus.reset()
+                ibus.focused(false)
+                ibus.close()
             }
             return ok(unit)
         }

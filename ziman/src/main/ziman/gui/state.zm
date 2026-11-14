@@ -1085,8 +1085,7 @@ pub fn pair_table(kind: string, title: string, add_label: string, pairs: [saved.
 
 // The non-empty rows, as the pairs a request carries. A row whose name is blank is not a header,
 // whatever its value says -- which is how one is deleted.
-pub
-fn pairs_of(t: PairTable) -> [saved.KvPair] {
+pub fn pairs_of(t: PairTable) -> [saved.KvPair] {
     val out = mutable_array_new<saved.KvPair>()
     for row in t.rows {
         val name = trim(row.name.editor.text)
@@ -1349,6 +1348,172 @@ fn naming_step(
         Text(_) { kept(s) }
         Paste(_) { kept(s) }
     }
+}
+
+// A row's value field, by index. Everything inside this module reaches a cell through the name
+// dispatch; reading one back by position is what a caller outside it needs, and a test asserting
+// on a composition is the first.
+pub fn pair_value_of(t: PairTable, at: int) -> controls.Entry {
+    if at < 0 || at >= len(t.rows) {
+        return controls.entry_of("", "", "")
+    }
+    return t.rows[at].value
+}
+
+// ------------------------------------------------- an input method reaching the focused field
+
+// Applies `change` to whichever field has the focus, and leaves the state alone when the focus is
+// not on one.
+//
+// **One traversal with three callers, because a composition is not a `controls.Input`.** `lib/ui`
+// refuses to make it one on purpose: a composition is not routed by what is under the pointer or
+// by a focus that falls back, it belongs to the field holding the input-method context and
+// nothing else. So it cannot go through `step`, and this is the only other place that knows which
+// field `focused` names. Written once: three copies of this dispatch is how two of them drift.
+fn with_focused_entry(s: State, change: fn(controls.Entry) -> controls.Entry) -> State {
+    val name = s.focused
+    // **A dialog takes the whole window**, so a composition cannot reach a field behind it -- the
+    // same rule `step` follows by handling `naming` before anything else.
+    if Some(n) = s.naming {
+        if name == "save-collection" {
+            return with s { naming: Option<Naming>.Some(with n { collection: change(n.collection) }) }
+        }
+        if name == "save-path" {
+            return with s { naming: Option<Naming>.Some(with n { path: change(n.path) }) }
+        }
+        return s
+    }
+    if name == "filter" {
+        return with s { filter: change(s.filter) }
+    }
+    if name == "method" {
+        return with s { method: change(s.method) }
+    }
+    if name == "url" {
+        return with s { url: change(s.url) }
+    }
+    if name == "body" {
+        return with s { body: change(s.body) }
+    }
+    if name == "auth-user" {
+        return with s { auth: with s.auth { user: change(s.auth.user) } }
+    }
+    if name == "auth-secret" {
+        return with s { auth: with s.auth { secret: change(s.auth.secret) } }
+    }
+    val in_headers = table_mapped(s.headers, name, change)
+    if in_headers.handled {
+        return with s { headers: in_headers.table }
+    }
+    val in_query = table_mapped(s.query, name, change)
+    if in_query.handled {
+        return with s { query: in_query.table }
+    }
+    val in_rules = rules_mapped(s.rules, name, change)
+    if in_rules.handled {
+        return with s { rules: in_rules.table }
+    }
+    // The focus is on a button, a list, the tree or the response, none of which can compose. The
+    // method is still open and will commit into the next field that takes the focus, which is what
+    // a user switching fields mid-word means.
+    return s
+}
+
+struct MappedTable {
+    table: PairTable
+    handled: bool
+}
+
+fn table_mapped(t: PairTable, name: string, change: fn(controls.Entry) -> controls.Entry) -> MappedTable {
+    var row = 0
+    while row < len(t.rows) {
+        if name == concat(t.kind, str(row), "name") {
+            return MappedTable {
+                table: with_pair_row(t, row, with t.rows[row] { name: change(t.rows[row].name) }),
+                handled: true
+            }
+        }
+        if name == concat(t.kind, str(row), "value") {
+            return MappedTable {
+                table: with_pair_row(t, row, with t.rows[row] { value: change(t.rows[row].value) }),
+                handled: true
+            }
+        }
+        row = row + 1
+    }
+    return MappedTable { table: t, handled: false }
+}
+
+fn with_pair_row(t: PairTable, at: int, row: PairRow) -> PairTable {
+    val rows = mutable_array_new<PairRow>()
+    var i = 0
+    while i < len(t.rows) {
+        push(rows, if i == at { row } else { t.rows[i] })
+        i = i + 1
+    }
+    return with t { rows: snapshot(rows) }
+}
+
+struct MappedRules {
+    table: RuleTable
+    handled: bool
+}
+
+fn rules_mapped(t: RuleTable, name: string, change: fn(controls.Entry) -> controls.Entry) -> MappedRules {
+    var at = 0
+    while at < len(t.rows) {
+        val tag = concat("rule", str(at))
+        if name == concat(tag, "name") {
+            return MappedRules {
+                table: with_rule_row(t, at, with t.rows[at] { name: change(t.rows[at].name) }),
+                handled: true
+            }
+        }
+        if name == concat(tag, "source") {
+            return MappedRules {
+                table: with_rule_row(t, at, with t.rows[at] { source: change(t.rows[at].source) }),
+                handled: true
+            }
+        }
+        at = at + 1
+    }
+    return MappedRules { table: t, handled: false }
+}
+
+fn with_rule_row(t: RuleTable, at: int, row: RuleRow) -> RuleTable {
+    val rows = mutable_array_new<RuleRow>()
+    var i = 0
+    while i < len(t.rows) {
+        push(rows, if i == at { row } else { t.rows[i] })
+        i = i + 1
+    }
+    return with t { rows: snapshot(rows) }
+}
+
+// A pre-edit: text the method is still working on, not in the document until it commits. The
+// marked run is the part being converted, which a method moves as the user chooses among
+// candidates; equal indices mean nothing is marked, which is every composition before its first
+// conversion.
+pub fn composing(s: State, text: string, caret: int, from: int, to: int) -> State {
+    return with_focused_entry(s, fn(e: controls.Entry) -> controls.Entry {
+        return controls.entry_composing_marked(e, text, caret, from, to).entry
+    })
+}
+
+// A commit: **the method's text and not the pre-edit's**, because a conversion commits what was
+// chosen and that is allowed to be neither what was typed nor what was last shown.
+pub fn committed(s: State, text: string) -> State {
+    return with_focused_entry(s, fn(e: controls.Entry) -> controls.Entry {
+        return controls.entry_commit(e, text).entry
+    })
+}
+
+// The method gave up -- the context closed, or the focus left the field. The pre-edit goes without
+// being inserted, which is what abandoning a half-typed word means.
+pub fn composition_dropped(s: State) -> State {
+    return with_focused_entry(s, fn(e: controls.Entry) -> controls.Entry {
+        return controls.entry_commit(e, "").entry
+    })
 }
 
 pub fn step(s: State, input: controls.Input, laid: widget.Laid, style: controls.Style, m: widget.Metrics) -> Step {

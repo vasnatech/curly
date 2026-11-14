@@ -238,6 +238,44 @@ A fifth was reported here and **was not a gap**: growable rows need no control. 
 the array, `push` adds a row and a `Button` removes one. The four fixed header rows were a shortcut,
 not a limitation.
 
+### Typing with an input method
+
+`curly gui` is an ibus client. Japanese, Chinese, Korean, Vietnamese and anything else that
+composes can be typed into any field it has: the URL, the method, the body, both authorization
+fields, the Save As dialog, and the cells of the headers, query and extraction tables.
+
+**A composition is not a `controls.Input`, and `lib/ui` refuses to make it one on purpose**: it is
+not routed by what is under the pointer or by a focus that falls back, it belongs to the field
+holding the input-method context and nothing else. So it cannot travel through `step`, and
+`gui/state.zm` gives it three functions of its own -- `composing`, `committed`,
+`composition_dropped` -- over a single dispatch that knows which field `focused` names.
+
+Three things in that are easy to get backwards, and each has a test:
+
+* **A pre-edit shows without entering the document.** That split is the whole of what a
+  composition is; a field that put it in the editor would save a half-typed word.
+* **A commit inserts the method's text, not the pre-edit's.** A conversion commits what was
+  *chosen*, which is allowed to be neither what was typed nor what was last shown. Committing the
+  pre-edit is the bug that makes a Japanese field insert romaji.
+* **Every key goes to the method before the application sees it.** `ibus.press` answering true
+  means the key belonged to the composition: it must not be inserted, must not be read as a
+  shortcut and must not move the caret. Get that wrong and typing Japanese also fires Ctrl-S.
+
+The candidate list is placed by telling ibus where the caret is **in screen pixels**, which needs
+two things an application does not have in one place: `window.origin` for the window's corner and
+the caret's box out of the laid tree, added to ziman as `desktop.caret_on_screen` for this. Told
+once per rebuilt frame, since the position changes when the layout does and not otherwise.
+
+A desktop with no ibus daemon is an ordinary desktop: one status line, and every call skipped --
+the same way the accessibility bridge already behaves.
+
+**What is tested and what is not.** The routing is unit-tested, the caret arithmetic is
+unit-tested, `window.origin` is gated against an independent process asking the same X server, and
+the lifecycle is verified against a live daemon. A real composition is not gated, because
+exercising one means switching the machine's active input method to a composing engine and back --
+which changes what the user's other windows do while it runs. ziman's own `tests/run_ibus_test.sh`
+makes that half opt-in behind `ZIMAN_IBUS_ENGINE` for exactly that reason.
+
 ## The design files, and the builder that reads them
 
 `curly gui` is not one module per screen but two: `gui/state.zm` is the logic and `gui/request_ui.zm`

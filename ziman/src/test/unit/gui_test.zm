@@ -555,3 +555,106 @@ fn report(baseline_path: string, got: [string], why: string) {
     }
     test.fail(concat(why, note))
 }
+
+// ------------------------------------------------- an input method reaching a field (2026-11-13)
+
+// **A composition is not a `controls.Input` and so cannot go through `step`.** `lib/ui` refuses to
+// make it one on purpose: it is not routed by what is under the pointer or by a focus that falls
+// back, it belongs to the field holding the input-method context and nothing else. So it arrives
+// through its own three functions, and these are the cases that say the dispatch behind them
+// reaches the same fields `step` does.
+
+fn composing_in(name: string, text: string) -> State {
+    return state.composing(with opened() { focused: name }, text, len(text), 0, 0)
+}
+
+fn shown_in(e: controls.Entry) -> string {
+    return controls.shown_text(e)
+}
+
+// The pre-edit shows and the document does not have it: that split is the whole of what a
+// composition is, and a field that put it in the editor would save a half-typed word.
+#[test]
+fn a_composition_shows_without_entering_the_document() {
+    val s = composing_in("url", "かな")
+    test.assert_eq(shown_in(s.url), "http://127.0.0.1/helloかな")
+    test.assert_eq(s.url.editor.text, "http://127.0.0.1/hello")
+    test.assert(Option.is_Some(s.url.preedit))
+}
+
+// **The method's text, not the pre-edit's.** A conversion commits what was chosen, which is
+// allowed to be neither what was typed nor what was last shown -- committing the pre-edit is the
+// bug that makes a Japanese field insert romaji.
+#[test]
+fn a_commit_inserts_what_the_method_chose() {
+    val s = state.committed(composing_in("url", "kana"), "仮名")
+    test.assert_eq(s.url.editor.text, "http://127.0.0.1/hello仮名")
+    test.assert(Option.is_None(s.url.preedit))
+}
+
+// Abandoning takes the pre-edit away without inserting anything, which is what losing the focus
+// mid-word has to mean.
+#[test]
+fn a_dropped_composition_inserts_nothing() {
+    val s = state.composition_dropped(composing_in("url", "かな"))
+    test.assert_eq(s.url.editor.text, "http://127.0.0.1/hello")
+    test.assert_eq(shown_in(s.url), "http://127.0.0.1/hello")
+    test.assert(Option.is_None(s.url.preedit))
+}
+
+// Every field, not only the two obvious ones: a table cell is where a header value is typed, and
+// a dispatch that stopped at the named fields would compose into the URL instead.
+#[test]
+fn a_composition_reaches_a_table_cell() {
+    val s = composing_in("header0value", "かな")
+    test.assert_eq(shown_in(state.pair_value_of(s.headers, 0)), "application/jsonかな")
+    // ...and the URL, which is not focused, is untouched.
+    test.assert_eq(shown_in(s.url), "http://127.0.0.1/hello")
+}
+
+// **A dialog takes the whole window**, so a composition cannot reach a field behind it -- the same
+// rule `step` follows by handling the dialog before anything else.
+#[test]
+fn a_dialog_takes_the_composition() {
+    val naming = state.Naming {
+        collection: controls.entry_of("save-collection", "Collection", "demo"),
+        path: controls.entry_of("save-path", "Name", "a/"),
+        confirm: controls.button_of("save-confirm", "Save"),
+        cancel: controls.button_of("save-cancel", "Cancel"),
+        error: ""
+    }
+    val open = with opened() { naming: Option<state.Naming>.Some(naming), focused: "save-path" }
+    val typed = state.composing(open, "かな", 2, 0, 0)
+    switch typed.naming {
+        Some(n) { test.assert_eq(shown_in(n.path), "a/かな") }
+        None { test.fail("the dialog closed") }
+    }
+    // And a composition aimed at a field behind the dialog reaches nothing at all.
+    val behind = state.composing(with open { focused: "url" }, "かな", 2, 0, 0)
+    test.assert_eq(shown_in(behind.url), "http://127.0.0.1/hello")
+}
+
+// The focus is on a button, which cannot compose. Nothing happens, and in particular the method's
+// text does not land in the last field that could take it.
+#[test]
+fn a_composition_with_the_focus_on_a_button_changes_nothing() {
+    val s = state.composing(with opened() { focused: "send" }, "かな", 2, 0, 0)
+    test.assert_eq(shown_in(s.url), "http://127.0.0.1/hello")
+    test.assert_eq(shown_in(s.method), "GET")
+}
+
+// The marked run is the part being converted, which a method moves as the user picks among
+// candidates. It is carried through rather than dropped, because it is what the field draws
+// differently.
+#[test]
+fn the_marked_run_is_carried_to_the_field() {
+    val s = state.composing(with opened() { focused: "url" }, "かなもじ", 4, 0, 2)
+    switch s.url.preedit {
+        Some(p) {
+            test.assert_eq(p.highlight_start, 0)
+            test.assert_eq(p.highlight_end, 2)
+            test.assert_eq(p.caret, 4)
+        }
+        None { test.fail("no composition") }
+    }
+}

@@ -56,7 +56,13 @@ pub struct State {
     remove: controls.Button
     up: controls.Button
     down: controls.Button
+    undo: controls.Button
     picked: Option<Spot>
+    // The file as it was before the last edit, so one mistake is recoverable. **One step, not a
+    // stack**: four buttons here write to somebody's source the instant they are pressed, and
+    // the case this exists for is the press you did not mean -- Delete, mostly. A stack invites
+    // redo and a history panel, which is a text editor, which this is not.
+    before: Option<string>
     status: string
     focused: string
 }
@@ -172,7 +178,9 @@ pub fn state_of(path: string, text: string) -> State {
         remove: controls.button_of("remove", "Delete"),
         up: controls.button_of("up", "Up"),
         down: controls.button_of("down", "Down"),
+        undo: controls.button_of("undo", "Undo"),
         picked: Option<Spot>.None,
+        before: Option<string>.None,
         status: format("{} component(s)", str(len(all))),
         focused: "parts"
     }
@@ -307,6 +315,7 @@ pub fn view(s: State, style: controls.Style, m: widget.Metrics) -> widget.Widget
                 controls.button_widget(s.remove, style),
                 controls.button_widget(s.up, style),
                 controls.button_widget(s.down, style),
+                controls.button_widget(s.undo, style),
                 widget.expand(widget.flex())
             ])),
             heading("Inputs", style),
@@ -720,7 +729,10 @@ fn applied(s: State) -> Step {
                             // rewrite the wrong bytes on the very next Apply.
                             val grown = reparsed(s, after)
                             Step {
-                                state: with with_source(grown, source_of(grown, spot)) {
+                                state: with with_source(
+                                    with grown { before: Option<string>.Some(s.text) },
+                                    source_of(grown, spot)
+                                ) {
                                     status: format(
                                         "rewrote {} of {}",
                                         read_design.path_text(spot.path),
@@ -825,7 +837,10 @@ fn removed(s: State) -> Step {
     return Step {
         // **The selection goes with the node.** A path that named the deleted item now names its
         // successor, so keeping it would outline a different node and Delete would eat the list.
-        state: with with_source(with grown { picked: Option<Spot>.None }, "") {
+        state: with with_source(
+            with grown { picked: Option<Spot>.None, before: Option<string>.Some(s.text) },
+            ""
+        ) {
             status: format("deleted item {} of {}", str(slot.index), read_design.path_text(slot.list))
         },
         write: true
@@ -872,7 +887,10 @@ fn moved(s: State, by: int) -> Step {
     val grown = reparsed(shorter, read_design.with_span_replaced(without, edit.at, edit.text))
     return Step {
         // The node has moved, so the path that named it names something else now.
-        state: with with_source(with grown { picked: Option<Spot>.None }, "") {
+        state: with with_source(
+            with grown { picked: Option<Spot>.None, before: Option<string>.Some(s.text) },
+            ""
+        ) {
             status: format("moved to {} of {}", str(target), read_design.path_text(slot.list))
         },
         write: true
@@ -913,10 +931,40 @@ fn inserted(s: State, shown: Shown) -> Step {
     val after = read_design.with_span_replaced(s.text, edit.at, edit.text)
     val grown = reparsed(s, after)
     return Step {
-        state: with with_source(with grown { picked: Option<Spot>.None }, "") {
+        state: with with_source(
+            with grown { picked: Option<Spot>.None, before: Option<string>.Some(s.text) },
+            ""
+        ) {
             status: format("added {} to {}", snippet.label, read_design.path_text(slot.list))
         },
         write: true
+    }
+}
+
+// Puts the file back as it was before the last edit.
+//
+// **The text, not the state.** A state carries a selection, a scroll offset and which component
+// is on the canvas, all of which belong to now; restoring them would undo more than the edit did
+// and would move the window out from under whoever pressed the button.
+//
+// One step, and it clears itself afterwards. There is no redo: the case this exists for is the
+// press you did not mean, which is one press ago, and a second level invites a history panel --
+// which is a text editor, which this is not.
+fn undone(s: State) -> Step {
+    return switch s.before {
+        Some(text) {
+            val back = reparsed(s, text)
+            Step {
+                state: with with_source(
+                    with back { picked: Option<Spot>.None, before: Option<string>.None },
+                    ""
+                ) {
+                    status: "undone"
+                },
+                write: true
+            }
+        }
+        None { kept(with s { status: "nothing to undo" }) }
     }
 }
 
@@ -995,6 +1043,14 @@ pub fn step(
         }
         if taken.activated {
             return moved(pressed, if name == "up" { 0 - 1 } else { 1 })
+        }
+        return kept(pressed)
+    }
+    if name == "undo" {
+        val taken = controls.button_input(here.undo, input, bounds_of(laid, "undo"))
+        val pressed = with here { undo: taken.button }
+        if taken.activated {
+            return undone(pressed)
         }
         return kept(pressed)
     }

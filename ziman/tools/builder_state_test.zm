@@ -700,3 +700,68 @@ fn moving_with_nothing_selected_writes_nothing() {
     test.assert_false(step.write)
     test.assert_eq(step.state.text, fixture())
 }
+
+// ---- undo
+
+// **Four buttons here write to somebody's source the instant they are pressed**, and Delete is
+// the one you press by accident. One step back is what makes that recoverable.
+#[test]
+fn undo_puts_back_what_a_delete_removed() {
+    val chosen = pressed_on_design(opened(), "go").state
+    val gone = pressing(chosen, "remove").state
+    test.assert_eq(names_of(gone.text), "widget.fixed_of widget.expand")
+    val back = pressing(gone, "undo")
+    test.assert(back.write)
+    test.assert_eq(back.state.text, fixture())
+}
+
+// It covers every edit, not only Delete, because every edit goes through the same write.
+#[test]
+fn undo_puts_back_what_a_move_and_an_add_did() {
+    val chosen = pressed_on_design(opened(), "go").state
+    val moved = pressing(chosen, "down").state
+    test.assert_eq(pressing(moved, "undo").state.text, fixture())
+    val added = pressing(with_palette(chosen, 0), "insert").state
+    test.assert_eq(pressing(added, "undo").state.text, fixture())
+}
+
+// **One step, and it clears itself.** There is no redo and no second level: pressing Undo twice
+// leaves the file where the first one put it rather than walking further back.
+#[test]
+fn undo_is_one_step_and_says_so_afterwards() {
+    val chosen = pressed_on_design(opened(), "go").state
+    val gone = pressing(chosen, "remove").state
+    val back = pressing(gone, "undo").state
+    test.assert_eq(back.text, fixture())
+    val again = pressing(back, "undo")
+    test.assert_false(again.write)
+    test.assert_eq(again.state.status, "nothing to undo")
+    test.assert_eq(again.state.text, fixture())
+}
+
+// Nothing has been edited yet, so there is nothing to put back -- and in particular the button
+// does not write the file it just read.
+#[test]
+fn undo_before_any_edit_writes_nothing() {
+    val step = pressing(opened(), "undo")
+    test.assert_false(step.write)
+    test.assert_eq(step.state.status, "nothing to undo")
+}
+
+// **The text comes back and the window does not jump.** Which component is on the canvas belongs
+// to now, not to the edit, so undoing an edit made while looking at a part leaves you looking at
+// that part.
+//
+// It starts on `field` rather than the default, which is the whole point: the first version of
+// this compared two states that were both showing `screen`, so an undo that rebuilt the state
+// from scratch -- resetting the canvas to the root -- passed it.
+#[test]
+fn undo_leaves_the_canvas_where_it_was() {
+    val on_field = with opened() { parts: with opened().parts { selected: 0 } }
+    test.assert_eq(builder_state.showing(on_field), "field")
+    val chosen = pressed_on_design(on_field, "name").state
+    val gone = pressing(chosen, "remove").state
+    val back = pressing(gone, "undo").state
+    test.assert_eq(back.text, fixture())
+    test.assert_eq(builder_state.showing(back), "field")
+}

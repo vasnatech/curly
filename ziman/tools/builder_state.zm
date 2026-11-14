@@ -53,6 +53,9 @@ pub struct State {
     // What can be added. See `palette_items` for why the list is short.
     palette: controls.List
     insert: controls.Button
+    remove: controls.Button
+    up: controls.Button
+    down: controls.Button
     picked: Option<Spot>
     status: string
     focused: string
@@ -166,6 +169,9 @@ pub fn state_of(path: string, text: string) -> State {
         inputs: controls.list_of("inputs", "Inputs", input_rows(read_design.records_of(text))),
         palette: controls.list_of("palette", "Add", palette_labels()),
         insert: controls.button_of("insert", "Insert after"),
+        remove: controls.button_of("remove", "Delete"),
+        up: controls.button_of("up", "Up"),
+        down: controls.button_of("down", "Down"),
         picked: Option<Spot>.None,
         status: format("{} component(s)", str(len(all))),
         focused: "parts"
@@ -298,6 +304,9 @@ pub fn view(s: State, style: controls.Style, m: widget.Metrics) -> widget.Widget
             )),
             widget.fixed_of(0.0, row_height, widget.row_of(gap, [
                 controls.button_widget(s.insert, style),
+                controls.button_widget(s.remove, style),
+                controls.button_widget(s.up, style),
+                controls.button_widget(s.down, style),
                 widget.expand(widget.flex())
             ])),
             heading("Inputs", style),
@@ -731,6 +740,145 @@ fn applied(s: State) -> Step {
     }
 }
 
+// The bytes to cut to remove an item, **including one separator**, and which side that comma is
+// on depends on where the item sits. Cutting the item alone leaves `[a, , c]`, which is a parse
+// error in a file somebody was halfway through editing.
+//
+//   * not last -- cut to the start of the next item, taking the comma that followed this one
+//   * last of several -- cut from the end of the previous item, taking the comma that preceded it
+//   * the only item -- cut just the item, leaving an empty list
+//
+// An empty list is left deliberately rather than refused: a container with nothing in it is a
+// thing a person building a screen passes through on the way to filling it, and a builder that
+// would not let you empty a row would make you delete the row and make a new one.
+pub fn deletion_of(s: State, slot: Slot) -> Option<read_design.Span> {
+    val owner = switch component_named(slot.component, s.components) {
+        Some(c) { c }
+        None { return Option<read_design.Span>.None }
+    }
+    val items = list_items(owner, slot.list)
+    if slot.index < 0 || slot.index >= len(items) {
+        return Option<read_design.Span>.None
+    }
+    val from = owner.body_from
+    val cur = read_design.span_of(items[slot.index])
+    if len(items) == 1 {
+        return Option<read_design.Span>.Some(read_design.Span {
+            from: from + cur.from,
+            to: from + cur.to
+        })
+    }
+    if slot.index + 1 < len(items) {
+        val next = read_design.span_of(items[slot.index + 1])
+        return Option<read_design.Span>.Some(read_design.Span {
+            from: from + cur.from,
+            to: from + next.from
+        })
+    }
+    val prev = read_design.span_of(items[slot.index - 1])
+    return Option<read_design.Span>.Some(read_design.Span {
+        from: from + prev.to,
+        to: from + cur.to
+    })
+}
+
+// The item the selection is, rather than the gap after it: `slot_after_selection` answers where a
+// new node goes, and deleting is about the node that is already there.
+pub fn slot_of_selection(s: State) -> Option<Slot> {
+    val spot = switch s.picked {
+        Some(one) { one }
+        None { return Option<Slot>.None }
+    }
+    return switch component_named(spot.component, s.components) {
+        Some(owner) { list_holding(owner, spot.path) }
+        None { Option<Slot>.None }
+    }
+}
+
+fn list_items(owner: Component, list: read_design.Path) -> [read_design.Node] {
+    val none: [read_design.Node] = []
+    return switch read_design.node_at(tree_of(owner), list) {
+        Some(node) {
+            switch node {
+                List(got) { got.items }
+                Call(_) { none }
+                Struct(_) { none }
+                Str(_) { none }
+                Num(_) { none }
+                Path(_) { none }
+            }
+        }
+        None { none }
+    }
+}
+
+fn removed(s: State) -> Step {
+    val slot = switch slot_of_selection(s) {
+        Some(one) { one }
+        None { return kept(with s { status: "that node is not in a list" }) }
+    }
+    val cut = switch deletion_of(s, slot) {
+        Some(one) { one }
+        None { return kept(with s { status: "nothing to delete there" }) }
+    }
+    val grown = reparsed(s, read_design.with_span_replaced(s.text, cut, ""))
+    return Step {
+        // **The selection goes with the node.** A path that named the deleted item now names its
+        // successor, so keeping it would outline a different node and Delete would eat the list.
+        state: with with_source(with grown { picked: Option<Spot>.None }, "") {
+            status: format("deleted item {} of {}", str(slot.index), read_design.path_text(slot.list))
+        },
+        write: true
+    }
+}
+
+// Moves the selected item one place along its list.
+//
+// **Cut, re-read, paste -- in that order and with the re-read in the middle.** Every span after
+// the cut has moved, so pasting against the offsets the cut was planned with would write into
+// the wrong bytes. It is the same rule Apply follows for the same reason, and the reason there
+// is a `reparsed` between the two edits rather than one combined splice.
+//
+// The arithmetic after the cut needs no adjustment and that is worth saying, because it looks
+// like it should. Moving item `i` up means index `i - 1`, which is below the cut and so did not
+// move; moving it down means `i + 1`, and the item that was there has slid into `i`, so `i + 1`
+// is past it -- which is exactly where it belongs.
+fn moved(s: State, by: int) -> Step {
+    val slot = switch slot_of_selection(s) {
+        Some(one) { one }
+        None { return kept(with s { status: "that node is not in a list" }) }
+    }
+    val owner = switch component_named(slot.component, s.components) {
+        Some(one) { one }
+        None { return kept(with s { status: "that component is gone" }) }
+    }
+    val items = list_items(owner, slot.list)
+    val target = slot.index + by
+    if target < 0 || target >= len(items) {
+        return kept(with s { status: if by < 0 { "already first" } else { "already last" } })
+    }
+    val here = read_design.span_of(items[slot.index])
+    val source = substring(s.text, owner.body_from + here.from, owner.body_from + here.to)
+    val cut = switch deletion_of(s, slot) {
+        Some(one) { one }
+        None { return kept(with s { status: "nothing to move there" }) }
+    }
+    val without = read_design.with_span_replaced(s.text, cut, "")
+    val shorter = reparsed(s, without)
+    val edit = switch insertion_of(shorter, with slot { index: target }, source) {
+        Some(one) { one }
+        None { return kept(with s { status: "nowhere to put it" }) }
+    }
+    val grown = reparsed(shorter, read_design.with_span_replaced(without, edit.at, edit.text))
+    return Step {
+        // The node has moved, so the path that named it names something else now.
+        state: with with_source(with grown { picked: Option<Spot>.None }, "") {
+            status: format("moved to {} of {}", str(target), read_design.path_text(slot.list))
+        },
+        write: true
+    }
+}
+
 fn chosen_snippet(s: State) -> Option<Snippet> {
     val all = palette_items()
     if s.palette.selected < 0 || s.palette.selected >= len(all) {
@@ -826,6 +974,27 @@ pub fn step(
         val pressed = with here { insert: taken.button }
         if taken.activated {
             return inserted(pressed, shown)
+        }
+        return kept(pressed)
+    }
+    if name == "remove" {
+        val taken = controls.button_input(here.remove, input, bounds_of(laid, "remove"))
+        val pressed = with here { remove: taken.button }
+        if taken.activated {
+            return removed(pressed)
+        }
+        return kept(pressed)
+    }
+    if name == "up" || name == "down" {
+        val which = if name == "up" { here.up } else { here.down }
+        val taken = controls.button_input(which, input, bounds_of(laid, name))
+        val pressed = if name == "up" {
+            with here { up: taken.button }
+        } else {
+            with here { down: taken.button }
+        }
+        if taken.activated {
+            return moved(pressed, if name == "up" { 0 - 1 } else { 1 })
         }
         return kept(pressed)
     }

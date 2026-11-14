@@ -535,3 +535,168 @@ fn a_container_can_be_added_and_then_filled() {
     test.assert(contains(step.state.text, "widget.row_of(8.0, [widget.flex()])"))
     test.assert_len(2, read_design.components_of(step.state.text))
 }
+
+// ---- deleting a node
+
+// **The file still parses, which is the only thing that makes this an edit rather than damage.**
+// Cutting the item and leaving its comma gives `[a, , c]`, which is a parse error in a file
+// somebody was halfway through changing.
+#[test]
+fn deleting_a_middle_item_leaves_a_file_that_parses() {
+    val chosen = pressed_on_design(opened(), "go").state
+    val step = pressing(chosen, "remove")
+    test.assert(step.write)
+    val items = root_children(step.state.text)
+    test.assert_len(2, items)
+    test.assert_eq(read_design.text_of(items[0]), "widget.fixed_of")
+    test.assert_eq(read_design.text_of(items[1]), "widget.expand")
+    test.assert_len(2, read_design.components_of(step.state.text))
+}
+
+// The last item takes the comma *before* it instead, which is the other half of the rule.
+//
+// **Driven through `deletion_of` with a built slot, not by clicking.** The first version pressed
+// the bottom of the canvas hoping to land on the last child and wrapped its assertions in
+// `if step.write`, so when the press missed the test asserted nothing and passed -- and a mutant
+// that cut the last item forwards, past the end of the list, lived through it.
+#[test]
+fn deleting_the_last_item_takes_the_comma_before_it() {
+    val s = pressed_on_design(opened(), "go").state
+    switch builder_state.slot_of_selection(s) {
+        Some(slot) {
+            // The fixture's root list has three items; the last is `widget.expand(...)`.
+            val cut = switch builder_state.deletion_of(s, with slot { index: 2 }) {
+                Some(one) { one }
+                None {
+                    test.fail("no cut")
+                    read_design.Span { from: 0, to: 0 }
+                }
+            }
+            test.assert(contains(substring(s.text, cut.from, cut.to), ","))
+            val after = read_design.with_span_replaced(s.text, cut, "")
+            test.assert_len(2, root_children(after))
+            test.assert_len(2, read_design.components_of(after))
+        }
+        None { test.fail("no slot") }
+    }
+}
+
+// **An empty list is left rather than refused.** A container with nothing in it is a state a
+// person passes through on the way to filling it, and a builder that would not let you empty a
+// row would make you delete the row and build a new one.
+//
+// `field`'s body is `widget.row_of(gap, [entry, flex])`, so two cuts empty it.
+#[test]
+fn the_only_item_can_go_and_leaves_an_empty_list() {
+    val s = opened()
+    val list = read_design.Path { steps: [1] }
+    val one = builder_state.Slot {
+        list: list,
+        component: "field",
+        index: 1,
+        at: geom.rect_of(0.0, 0.0, 0.0, 0.0)
+    }
+    val once = switch builder_state.deletion_of(s, one) {
+        Some(cut) { read_design.with_span_replaced(s.text, cut, "") }
+        None {
+            test.fail("no cut")
+            ""
+        }
+    }
+    test.assert_len(2, read_design.components_of(once))
+    // Now one item is left, and cutting it leaves the list empty and the file readable.
+    val left = builder_state.state_of("fixture_ui.zm", once)
+    val empty = switch builder_state.deletion_of(left, with one { index: 0 }) {
+        Some(cut) { read_design.with_span_replaced(once, cut, "") }
+        None {
+            test.fail("no second cut")
+            ""
+        }
+    }
+    test.assert(contains(empty, "widget.row_of(gap, [])"))
+    test.assert_len(2, read_design.components_of(empty))
+}
+
+#[test]
+fn deleting_with_nothing_selected_writes_nothing() {
+    val step = pressing(opened(), "remove")
+    test.assert_false(step.write)
+    test.assert_eq(step.state.text, fixture())
+}
+
+// **The selection goes with the node.** Its path would name the successor afterwards, so keeping
+// it would outline a different node and a second Delete would eat the list.
+#[test]
+fn deleting_clears_the_selection() {
+    val chosen = pressed_on_design(opened(), "go").state
+    test.assert(Option.is_Some(chosen.picked))
+    test.assert(Option.is_None(pressing(chosen, "remove").state.picked))
+}
+
+// ---- moving a node
+
+fn names_of(text: string) -> string {
+    val out = mutable_array_new<string>()
+    for one in root_children(text) {
+        push(out, read_design.text_of(one))
+    }
+    return join(separator: " ", pieces: snapshot(out))
+}
+
+// The fixture's root is `[fixed_of(field), fixed_of(button), expand(flex)]`. The button's row is
+// item 1, so Down puts it last.
+#[test]
+fn down_moves_the_item_past_the_next_one() {
+    val chosen = pressed_on_design(opened(), "go").state
+    test.assert_eq(names_of(chosen.text), "widget.fixed_of widget.fixed_of widget.expand")
+    val step = pressing(chosen, "down")
+    test.assert(step.write)
+    test.assert_eq(names_of(step.state.text), "widget.fixed_of widget.expand widget.fixed_of")
+    // ...and the thing that moved is the one that was selected, not some other row.
+    test.assert(contains(step.state.text, "controls.button_widget(it.go, style)"))
+    test.assert_len(2, read_design.components_of(step.state.text))
+}
+
+// Up is the same machinery the other way, and lands the item before the one above it.
+#[test]
+fn up_moves_the_item_before_the_previous_one() {
+    val chosen = pressed_on_design(opened(), "go").state
+    val step = pressing(chosen, "up")
+    test.assert(step.write)
+    test.assert_eq(names_of(step.state.text), "widget.fixed_of widget.fixed_of widget.expand")
+    // Both rows are `fixed_of`, so the order is told by what is inside them: the button first.
+    val text = step.state.text
+    test.assert(index_of(text, "controls.button_widget", 0) < index_of(text, "field(it.name", 0))
+}
+
+// **A move is a cut and a paste with a re-read between**, and this is the case that says the
+// re-read is there: moving twice rewrites bytes whose offsets the first move changed.
+#[test]
+fn a_second_move_lands_where_the_first_one_left_it() {
+    val chosen = pressed_on_design(opened(), "go").state
+    val once = pressing(chosen, "down").state
+    test.assert_eq(names_of(once.text), "widget.fixed_of widget.expand widget.fixed_of")
+    // Select the button again -- it is last now -- and bring it back up.
+    val again = pressed_on_design(once, "go").state
+    val twice = pressing(again, "up")
+    test.assert(twice.write)
+    test.assert_eq(names_of(twice.state.text), "widget.fixed_of widget.fixed_of widget.expand")
+    test.assert_len(2, read_design.components_of(twice.state.text))
+}
+
+// The ends refuse rather than wrapping or writing nothing quietly.
+#[test]
+fn the_ends_of_a_list_refuse_to_move_further() {
+    val chosen = pressed_on_design(opened(), "name").state
+    val step = pressing(chosen, "up")
+    test.assert_false(step.write)
+    test.assert_eq(step.state.text, fixture())
+    test.assert_eq(step.state.status, "already first")
+}
+
+#[test]
+fn moving_with_nothing_selected_writes_nothing() {
+    val step = pressing(opened(), "down")
+    test.assert_false(step.write)
+    test.assert_eq(step.state.text, fixture())
+}

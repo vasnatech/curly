@@ -50,9 +50,48 @@ pub struct State {
     apply: controls.Button
     revert: controls.Button
     inputs: controls.List
+    // What can be added. See `palette_items` for why the list is short.
+    palette: controls.List
+    insert: controls.Button
     picked: Option<Spot>
     status: string
     focused: string
+}
+
+// What a builder can put on a canvas, as source.
+//
+// **Every one of these stands on its own**, which is the whole of why the list is this short. A
+// snippet is spliced into a component's body and then has to compile there, so it may not mention
+// a name the component does not have: `widget.label_of("x", 12.0, style.ink)` is the obvious entry
+// to want and it needs a `style` parameter, which most parts have and nothing guarantees. The
+// four below name nothing but `widget`.
+//
+// The real palette is the file's own `pub fn` parts, and they are not here for the reason already
+// recorded against the dialect: `pub` means "a part" and also means "reachable", so a palette
+// keyed off it offers `mono_label` -- and a part takes arguments this cannot invent.
+pub struct Snippet {
+    label: string
+    source: string
+}
+
+pub fn palette_items() -> [Snippet] {
+    return [
+        Snippet { label: "space (flexible)", source: "widget.flex()" },
+        Snippet {
+            label: "space (30 points)",
+            source: "widget.fixed_of(0.0, 30.0, widget.flex())"
+        },
+        Snippet { label: "a row", source: "widget.row_of(8.0, [widget.flex()])" },
+        Snippet { label: "a column", source: "widget.column_of(8.0, [widget.flex()])" }
+    ]
+}
+
+fn palette_labels() -> [string] {
+    val out = mutable_array_new<string>()
+    for one in palette_items() {
+        push(out, one.label)
+    }
+    return snapshot(out)
 }
 
 pub fn showing(s: State) -> string {
@@ -125,6 +164,8 @@ pub fn state_of(path: string, text: string) -> State {
         apply: controls.button_of("apply", "Apply"),
         revert: controls.button_of("revert", "Revert"),
         inputs: controls.list_of("inputs", "Inputs", input_rows(read_design.records_of(text))),
+        palette: controls.list_of("palette", "Add", palette_labels()),
+        insert: controls.button_of("insert", "Insert after"),
         picked: Option<Spot>.None,
         status: format("{} component(s)", str(len(all))),
         focused: "parts"
@@ -250,11 +291,259 @@ pub fn view(s: State, style: controls.Style, m: widget.Metrics) -> widget.Widget
                 controls.button_widget(s.revert, style),
                 widget.expand(widget.flex())
             ])),
+            heading("Add", style),
+            widget.fixed_of(0.0, (len(palette_items()) as float) * row_height, controls.list_widget(
+                s.palette,
+                style
+            )),
+            widget.fixed_of(0.0, row_height, widget.row_of(gap, [
+                controls.button_widget(s.insert, style),
+                widget.expand(widget.flex())
+            ])),
             heading("Inputs", style),
             widget.expand(controls.list_widget(s.inputs, style)),
             note(s.status, style)
         ]))
     ])
+}
+
+// ------------------------------------------------- where a new node would go
+
+// A place a node could be inserted: a list in the source, and a position in it.
+//
+// **A position between children, which is a different question from "what is here".** Selecting
+// asks which node a point is on; inserting asks which gap it is nearest, and a gap belongs to the
+// list that holds the children rather than to either of them.
+pub struct Slot {
+    // The `List` node in the component's tree -- the `[...]` a row or column was given.
+    list: read_design.Path
+    component: string
+    // Where in it, from 0 to the number of items.
+    index: int
+    // Where to draw the insertion line, in the canvas's coordinates.
+    at: geom.Rect
+}
+
+// The nearest list **above** a node, and which of its items the node is inside.
+//
+// **It walks up, and the first version only looked one step.** A click lands on the deepest thing
+// it can -- `controls.button_widget(it.go, style)` -- whose parent is the `widget.fixed_of` that
+// wraps it, not the column's list. One step up finds a `Call` and gives up, so nothing inside a
+// wrapped child was ever a drop target, which is every child of every container in the file.
+//
+// The item is the ancestor that is the list's own child, and that is what a gap sits beside:
+// dropping next to a button means dropping next to the row that holds it.
+fn list_holding(owner: Component, path: read_design.Path) -> Option<Slot> {
+    val steps = path.steps
+    val tree = tree_of(owner)
+    var depth = len(steps) - 1
+    while depth >= 0 {
+        val up = mutable_array_new<int>()
+        var i = 0
+        while i < depth {
+            push(up, steps[i])
+            i = i + 1
+        }
+        val parent = read_design.Path { steps: snapshot(up) }
+        val is_list = switch read_design.node_at(tree, parent) {
+            Some(node) {
+                switch node {
+                    List(_) { true }
+                    Call(_) { false }
+                    Struct(_) { false }
+                    Str(_) { false }
+                    Num(_) { false }
+                    Path(_) { false }
+                }
+            }
+            None { false }
+        }
+        if is_list {
+            return Option<Slot>.Some(Slot {
+                list: parent,
+                component: owner.name,
+                index: steps[depth],
+                at: geom.rect_of(0.0, 0.0, 0.0, 0.0)
+            })
+        }
+        depth = depth - 1
+    }
+    return Option<Slot>.None
+}
+
+// The box a node was drawn in, found through the tag the renderer gave it. **The item's box, not
+// the clicked node's**: a gap goes beside the row that holds the button, so the edge to measure
+// against and the line to draw are the row's.
+fn box_of_node(shown: Shown, component: string, path: read_design.Path) -> Option<geom.Rect> {
+    for one in shown.spots {
+        if one.component == component && same_path(one.path, path) {
+            return render_design.box_of(shown.laid, one.tag)
+        }
+    }
+    return Option<geom.Rect>.None
+}
+
+fn same_path(a: read_design.Path, b: read_design.Path) -> bool {
+    if len(a.steps) != len(b.steps) {
+        return false
+    }
+    var i = 0
+    while i < len(a.steps) {
+        if a.steps[i] != b.steps[i] {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn step_into(path: read_design.Path, index: int) -> read_design.Path {
+    val out = mutable_array_new<int>()
+    for one in path.steps {
+        push(out, one)
+    }
+    push(out, index)
+    return read_design.Path { steps: snapshot(out) }
+}
+
+// Whether the list is laid across or down, **read from the call that owns it rather than guessed
+// from a box**. The first version took the child's own aspect -- wider than tall meant a row --
+// which is backwards for the usual case: a column of full-width rows is all wide children, and
+// every insertion line would have been drawn vertically down their right-hand edge.
+//
+// A `widget.Stack` literal says so in a field; the two helpers say so in their names. A direction
+// nothing states is a column, which is what `render_design` builds for a Stack that omits it.
+fn list_runs_across(owner: Component, list: read_design.Path) -> bool {
+    val steps = list.steps
+    if len(steps) == 0 {
+        return false
+    }
+    val up = mutable_array_new<int>()
+    var i = 0
+    while i < len(steps) - 1 {
+        push(up, steps[i])
+        i = i + 1
+    }
+    return switch read_design.node_at(tree_of(owner), read_design.Path { steps: snapshot(up) }) {
+        Some(node) {
+            switch node {
+                Call(c) { c.name == "widget.row_of" }
+                Struct(f) { stack_runs_across(f) }
+                List(_) { false }
+                Str(_) { false }
+                Num(_) { false }
+                Path(_) { false }
+            }
+        }
+        None { false }
+    }
+}
+
+fn stack_runs_across(f: read_design.Fields) -> bool {
+    var i = 0
+    for key in f.keys {
+        if key == "direction" {
+            return read_design.text_of(f.values[i]) == "widget.Direction.Row"
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// The gap after whatever is selected, and the line to draw for it.
+//
+// **Taken from the selection rather than from a pointer.** This builder has no drag: you select a
+// node and say where relative to it, so there is one place a new node can go and the line says
+// which. A pointer-driven drop target is a different function and will want `list_holding` the
+// same way this does.
+pub fn slot_after_selection(s: State, shown: Shown) -> Option<Slot> {
+    val spot = switch s.picked {
+        Some(one) { one }
+        None { return Option<Slot>.None }
+    }
+    val owner = switch component_named(spot.component, s.components) {
+        Some(one) { one }
+        None { return Option<Slot>.None }
+    }
+    val base = switch list_holding(owner, spot.path) {
+        Some(one) { one }
+        None { return Option<Slot>.None }
+    }
+    val after = with base { index: base.index + 1 }
+    val item = step_into(base.list, base.index)
+    return switch box_of_node(shown, base.component, item) {
+        Some(box) {
+            Option<Slot>.Some(with after {
+                at: trailing_edge(box, list_runs_across(owner, base.list))
+            })
+        }
+        // Drawn by something with nowhere to hang a name -- an `expand`, a `flex`. The slot is
+        // still real; only the line is unavailable.
+        None { Option<Slot>.Some(after) }
+    }
+}
+
+// Where the insertion line goes: past the far edge of the item the new node will follow, along
+// the list's own axis.
+fn trailing_edge(box: geom.Rect, across: bool) -> geom.Rect {
+    if across {
+        return geom.rect_of(box.x + box.width, box.y, 1.0, box.height)
+    }
+    return geom.rect_of(box.x, box.y + box.height, box.width, 1.0)
+}
+
+// Where a new item is written, and what to write there -- **which is not just the source**,
+// because the comma goes on a different side in each case.
+//
+// Inserting in the middle lands *before* the item being displaced, which already carries the
+// comma that separated it from its predecessor, so the new text needs one after it. Inserting at
+// the end lands *after* the last item, where there is no comma at all, so it needs one before.
+// Getting that backwards produces `, widget.flex()widget.expand(...)` -- two items with no
+// separator, which the reader parses as a stray `?,` and a lost node, and which the first version
+// of this did while its comment claimed one rule covered both.
+//
+// The whitespace is left to `--fmt`: the dialect's lint is only sound because the formatter runs
+// first, and the same bargain pays here, so this has to produce valid syntax and nothing more.
+pub struct Insertion {
+    at: read_design.Span
+    text: string
+}
+
+pub fn insertion_of(s: State, slot: Slot, source: string) -> Option<Insertion> {
+    val owner = switch component_named(slot.component, s.components) {
+        Some(c) { c }
+        None { return Option<Insertion>.None }
+    }
+    val none: [read_design.Node] = []
+    val items = switch read_design.node_at(tree_of(owner), slot.list) {
+        Some(node) {
+            switch node {
+                List(got) { got.items }
+                Call(_) { none }
+                Struct(_) { none }
+                Str(_) { none }
+                Num(_) { none }
+                Path(_) { none }
+            }
+        }
+        None { none }
+    }
+    if len(items) == 0 {
+        return Option<Insertion>.None
+    }
+    val from = owner.body_from
+    if slot.index >= len(items) {
+        val last = read_design.span_of(items[len(items) - 1])
+        return Option<Insertion>.Some(Insertion {
+            at: read_design.Span { from: from + last.to, to: from + last.to },
+            text: concat(", ", source)
+        })
+    }
+    val next = read_design.span_of(items[slot.index])
+    return Option<Insertion>.Some(Insertion {
+        at: read_design.Span { from: from + next.from, to: from + next.from },
+        text: concat(source, ", ")
+    })
 }
 
 // ------------------------------------------------- what an input does
@@ -286,29 +575,16 @@ fn kept(s: State) -> Step {
 // this program clicked the canvas and changed the component list.
 //
 // A name is inherited by every child that has none of its own, so the box wanted is the outermost
-// one carrying it, which a pre-order walk finds first. Controls answer the same way they did.
+// one carrying it. **That walk lives in `lib/ui` now** -- `widget.node_named`, added the same day
+// and for the same reason, because an input method needs the caret's box and the caret is a named
+// group too. This was the private copy that asked for it.
 pub fn bounds_of(laid: widget.Laid, name: string) -> geom.Rect {
-    return switch node_named(laid, name) {
+    return switch widget.node_named(laid, name) {
         Some(node) { node.bounds }
         // A box the layout does not hold cannot have been pressed, and an empty rectangle makes
         // every hit test miss rather than inventing a position.
         None { geom.rect_of(0.0, 0.0, 0.0, 0.0) }
     }
-}
-
-fn node_named(laid: widget.Laid, name: string) -> Option<widget.Laid> {
-    if name == "" {
-        return Option<widget.Laid>.None
-    }
-    if laid.name == name {
-        return Option<widget.Laid>.Some(laid)
-    }
-    for child in laid.children {
-        if Some(found) = node_named(child, name) {
-            return Option<widget.Laid>.Some(found)
-        }
-    }
-    return Option<widget.Laid>.None
 }
 
 // The bytes a node reads in the file as it stands.
@@ -455,6 +731,47 @@ fn applied(s: State) -> Step {
     }
 }
 
+fn chosen_snippet(s: State) -> Option<Snippet> {
+    val all = palette_items()
+    if s.palette.selected < 0 || s.palette.selected >= len(all) {
+        return Option<Snippet>.None
+    }
+    return Option<Snippet>.Some(all[s.palette.selected])
+}
+
+// Writes a new item into the list the selection sits in, after it.
+//
+// **The comma goes before the new text, not after.** Inserting at the end of a list means landing
+// after the last item, where there is no comma yet; inserting in the middle means landing before
+// the next one, which already has the comma that used to separate it from its predecessor. One
+// rule covers both only because this always inserts *after* something.
+//
+// The whitespace is left to `--fmt`. The dialect's lint is only sound because the formatter runs
+// first, and the same bargain pays here: `[a, b,c]` is a correct edit and a tidy one after a
+// format, so this has to produce valid syntax and nothing more.
+fn inserted(s: State, shown: Shown) -> Step {
+    val snippet = switch chosen_snippet(s) {
+        Some(one) { one }
+        None { return kept(with s { status: "nothing chosen to add" }) }
+    }
+    val slot = switch slot_after_selection(s, shown) {
+        Some(one) { one }
+        None { return kept(with s { status: "that node is not in a list" }) }
+    }
+    val edit = switch insertion_of(s, slot, snippet.source) {
+        Some(one) { one }
+        None { return kept(with s { status: "that list is empty" }) }
+    }
+    val after = read_design.with_span_replaced(s.text, edit.at, edit.text)
+    val grown = reparsed(s, after)
+    return Step {
+        state: with with_source(with grown { picked: Option<Spot>.None }, "") {
+            status: format("added {} to {}", snippet.label, read_design.path_text(slot.list))
+        },
+        write: true
+    }
+}
+
 pub fn step(
     s: State,
     input: controls.Input,
@@ -499,6 +816,18 @@ pub fn step(
         return kept(with with_source(with moved { picked: Option<Spot>.None }, "") {
             status: format("showing {}", showing(moved))
         })
+    }
+    if name == "palette" {
+        val taken = controls.list_input(here.palette, input, bounds_of(laid, "palette"))
+        return kept(with here { palette: taken.list })
+    }
+    if name == "insert" {
+        val taken = controls.button_input(here.insert, input, bounds_of(laid, "insert"))
+        val pressed = with here { insert: taken.button }
+        if taken.activated {
+            return inserted(pressed, shown)
+        }
+        return kept(pressed)
     }
     if name == "inputs" {
         val taken = controls.list_input(here.inputs, input, bounds_of(laid, "inputs"))

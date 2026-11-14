@@ -108,6 +108,18 @@ fn painted(
         }
         None { unit }
     }
+    // **Where Insert would put it**, drawn along the list's own axis. Without this the button is
+    // a guess: a user has to know that "after" means after the row the selection is inside, not
+    // after the selection, and that the row is in a column rather than the row it looks like.
+    switch builder_state.slot_after_selection(st, shown) {
+        Some(slot) {
+            push(ops, scene.fill(
+                shape.rect_path(slot.at),
+                paint.solid(paint.rgb(0.15, 0.55, 0.25))
+            ))
+        }
+        None { unit }
+    }
     return controls.paint_scroll_bars(laid, scene.with_ops(base, snapshot(ops)), style)
 }
 

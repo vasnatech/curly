@@ -314,3 +314,224 @@ fn tab_moves_the_focus_and_reaches_no_control() {
     test.assert(step.state.focused != s.focused)
     test.assert_false(step.write)
 }
+
+// ---- where a new node would go
+
+// **Inserting asks a different question from selecting**: a point selects the node it is *on*,
+// and the slot is the gap *after* whatever that turned out to be -- in the nearest list above it,
+// which is rarely the node's own parent.
+
+fn slot_text(got: Option<builder_state.Slot>) -> string {
+    return switch got {
+        Some(slot) {
+            format(
+                "{} of {} at {}",
+                read_design.path_text(slot.list),
+                slot.component,
+                str(slot.index)
+            )
+        }
+        None { "(none)" }
+    }
+}
+
+fn slot_after(name: string) -> Option<builder_state.Slot> {
+    val s = pressed_on_design(opened(), name).state
+    val laid = laid_of(s)
+    return builder_state.slot_after_selection(s, shown_of(s, laid))
+}
+
+// The fixture's root is a column of three and the button is inside its second child, so the gap
+// is at index 2 -- **the list above the node, not its own parent**, which is the `widget.fixed_of`
+// wrapping it. Looking only one step up finds that `Call` and gives up, which would make every
+// child of every container in the file undroppable.
+#[test]
+fn the_slot_is_in_the_nearest_list_above_the_selection() {
+    test.assert_eq(slot_text(slot_after("go")), "1 of screen at 2")
+}
+
+// A node inside a part reports a gap in *that part's* list, which is the file an editor would
+// open to make the change.
+#[test]
+fn a_slot_inside_a_part_belongs_to_the_part() {
+    test.assert(contains(slot_text(slot_after("name")), "of field"))
+}
+
+// The root is in no list, so there is no gap beside it: a node has to have a parent before it can
+// have a neighbour.
+#[test]
+fn the_root_offers_no_slot() {
+    val laid = laid_of(opened())
+    val box = builder_state.bounds_of(laid, "canvas")
+    val low = geom.point_of(box.x + box.width / 2.0, box.y + box.height - 2.0)
+    val s = builder_state.step(
+        opened(),
+        controls.Input.Press(low),
+        laid,
+        shown_of(opened(), laid),
+        style(),
+        metrics()
+    ).state
+    test.assert_eq(slot_text(builder_state.slot_after_selection(s, shown_of(s, laid_of(s)))), "(none)")
+}
+
+// **The line is drawn along the list's axis, read from the call that owns it.** The fixture's
+// root is a column, so the gap after a full-width row is a horizontal line under it -- not a
+// vertical one down its right-hand edge, which is what taking the child's own aspect gives.
+#[test]
+fn the_line_runs_across_the_list_and_not_across_the_child() {
+    switch slot_after("go") {
+        Some(slot) { test.assert(slot.at.width > slot.at.height) }
+        None { test.fail("no slot") }
+    }
+}
+
+// The byte offset an insertion lands at is **before the item that is there now**, so the new node
+// takes its place in the order and the old one follows it.
+#[test]
+fn an_insertion_lands_before_the_item_it_displaces() {
+    val s = pressed_on_design(opened(), "go").state
+    switch slot_after("go") {
+        Some(slot) {
+            switch builder_state.insertion_of(s, slot, "x") {
+                Some(edit) {
+                    test.assert_eq(edit.at.from, edit.at.to)
+                    // What is at that offset is the start of the node being displaced...
+                    test.assert(starts_with(
+                        substring(s.text, edit.at.from, len(s.text)),
+                        "widget.expand(widget.flex())"
+                    ))
+                    // ...so the comma goes after the new text, to separate it from that node.
+                    test.assert_eq(edit.text, "x, ")
+                }
+                None { test.fail("no insertion point") }
+            }
+        }
+        None { test.fail("no slot") }
+    }
+}
+
+// ...and past the end of the list it lands after the last item, where there is no comma yet.
+#[test]
+fn an_insertion_at_the_end_lands_after_the_last_item() {
+    val s = pressed_on_design(opened(), "go").state
+    switch slot_after("go") {
+        Some(slot) {
+            switch builder_state.insertion_of(s, with slot { index: 99 }, "x") {
+                Some(edit) {
+                    test.assert_eq(edit.at.from, edit.at.to)
+                    test.assert(starts_with(substring(s.text, edit.at.from, len(s.text)), "\n    ])"))
+                    test.assert_eq(edit.text, ", x")
+                }
+                None { test.fail("no insertion point") }
+            }
+        }
+        None { test.fail("no slot") }
+    }
+}
+
+// ---- adding a node
+
+fn with_palette(s: builder_state.State, which: int) -> builder_state.State {
+    return with s { palette: with s.palette { selected: which } }
+}
+
+fn pressing(s: builder_state.State, name: string) -> builder_state.Step {
+    val laid = laid_of(s)
+    val box = builder_state.bounds_of(laid, name)
+    val at = geom.point_of(box.x + box.width / 2.0, box.y + box.height / 2.0)
+    val shown = shown_of(s, laid)
+    val down = builder_state.step(s, controls.Input.Press(at), laid, shown, style(), metrics())
+    return builder_state.step(
+        down.state,
+        controls.Input.Release(at),
+        laid,
+        shown,
+        style(),
+        metrics()
+    )
+}
+
+// **The file still parses afterwards, which is the only thing that makes this an edit rather
+// than damage.** A splice that produced `[a, bwidget.flex()]` would place the text correctly and
+// destroy the component.
+#[test]
+fn adding_a_node_leaves_a_file_that_still_parses() {
+    val chosen = pressed_on_design(opened(), "go").state
+    val step = pressing(with_palette(chosen, 0), "insert")
+    test.assert(step.write)
+    test.assert(contains(step.state.text, "widget.flex()"))
+    test.assert_len(2, read_design.components_of(step.state.text))
+    // ...and the root is still the root, not a casualty of the splice.
+    test.assert_eq(read_design.components_of(step.state.text)[1].name, "screen")
+}
+
+// It goes *after* the selection, which is what the button says.
+//
+// **Asserted on the parsed list, not on where the text landed**, which is what the first version
+// did: the fixture's `field` already contains a `widget.flex()` earlier in the file than the
+// button, so a search for the first one can never see the insertion wherever it went. The list
+// has four items afterwards and the new one is at index 2, which says it exactly.
+#[test]
+fn a_new_node_follows_the_one_that_was_selected() {
+    val chosen = pressed_on_design(opened(), "go").state
+    val text = pressing(with_palette(chosen, 0), "insert").state.text
+    val items = root_children(text)
+    test.assert_len(4, items)
+    test.assert_eq(read_design.text_of(items[1]), "widget.fixed_of")
+    test.assert_eq(read_design.text_of(items[2]), "widget.flex")
+    test.assert_eq(read_design.text_of(items[3]), "widget.expand")
+}
+
+// The children of `screen`'s root column, as the reader sees them after an edit.
+fn root_children(text: string) -> [read_design.Node] {
+    val none: [read_design.Node] = []
+    for c in read_design.components_of(text) {
+        if c.name == "screen" {
+            val ts = read_design.tokens_of(c.body)
+            val start = if len(ts) > 0 && ts[0].text == "return" { 1 } else { 0 }
+            val root = read_design.expr_at(ts, start).node
+            return switch read_design.node_at(root, read_design.Path { steps: [1] }) {
+                Some(node) {
+                    switch node {
+                        List(got) { got.items }
+                        Call(_) { none }
+                        Struct(_) { none }
+                        Str(_) { none }
+                        Num(_) { none }
+                        Path(_) { none }
+                    }
+                }
+                None { none }
+            }
+        }
+    }
+    return none
+}
+
+// Nothing selected is a refusal with a reason, not a write into a guessed place.
+#[test]
+fn adding_with_nothing_selected_writes_nothing() {
+    val step = pressing(with_palette(opened(), 0), "insert")
+    test.assert_false(step.write)
+    test.assert_eq(step.state.text, fixture())
+}
+
+// ...and the same when the palette has nothing chosen.
+#[test]
+fn adding_with_nothing_chosen_writes_nothing() {
+    val chosen = pressed_on_design(opened(), "go").state
+    val step = pressing(with_palette(chosen, 0 - 1), "insert")
+    test.assert_false(step.write)
+    test.assert_eq(step.state.text, fixture())
+}
+
+// A container goes in whole, brackets and all, so the next thing can be added inside it.
+#[test]
+fn a_container_can_be_added_and_then_filled() {
+    val chosen = pressed_on_design(opened(), "go").state
+    val step = pressing(with_palette(chosen, 2), "insert")
+    test.assert(step.write)
+    test.assert(contains(step.state.text, "widget.row_of(8.0, [widget.flex()])"))
+    test.assert_len(2, read_design.components_of(step.state.text))
+}

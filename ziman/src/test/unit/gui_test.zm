@@ -22,6 +22,7 @@ use gui/state.Loaded
 use gui/state.State
 use gui/state.opening_state
 use gui/state.sidebar_of
+use shape
 use test
 use uuid.uuid_new
 use widget
@@ -657,4 +658,113 @@ fn the_marked_run_is_carried_to_the_field() {
         }
         None { test.fail("no composition") }
     }
+}
+
+// ------------------------------------------------- the desktop's icons (2026-11-14)
+
+// **The window asks the user's icon theme for `document-save-symbolic` and the rest**, and these
+// cases are about what that does to the buttons rather than about the lookup, which `icons`' own
+// tests cover against a theme built in a temporary directory.
+//
+// The icon here is built by hand, so **nothing in this file touches the filesystem or depends on
+// the machine having a theme**: `opening_state` opens with `no_icons()` for exactly that reason,
+// which is also why the geometry baseline above did not move when icons arrived.
+fn an_icon(says: string) -> widget.Icon {
+    val b = shape.path_builder()
+    shape.move_to(b, geom.point_of(0.2, 0.2))
+    shape.line_to(b, geom.point_of(0.8, 0.8))
+    return widget.icon_of(shape.built(b, shape.Winding.NonZero), says)
+}
+
+fn all_icons() -> state.Icons {
+    return state.Icons {
+        send: Option<widget.Icon>.Some(an_icon("send")),
+        save: Option<widget.Icon>.Some(an_icon("save")),
+        save_as: Option<widget.Icon>.Some(an_icon("save as")),
+        add: Option<widget.Icon>.Some(an_icon("add")),
+        remove: Option<widget.Icon>.Some(an_icon("remove")),
+        close: Option<widget.Icon>.Some(an_icon("close"))
+    }
+}
+
+// How many glyph runs a laid-out tree draws whose text is exactly this, which is how a label is
+// read back without a painter: the words are in the tree, and an icon is not a word.
+fn says_count(l: widget.Laid, text: string) -> int {
+    var found = 0
+    if Text(it) = l.widget {
+        if it.text == text {
+            found = 1
+        }
+    }
+    for child in l.children {
+        found = found + says_count(child, text)
+    }
+    return found
+}
+
+#[test]
+fn an_add_buttons_plus_becomes_the_icon() {
+    // `+ header` draws its plus as *text*, which is a drawing made of letters. With an icon beside
+    // the word the plus says the same thing twice, so the words shorten to the noun.
+    val plain = laid_of(opened())
+    test.assert_eq(1, says_count(plain, "+ header"))
+    test.assert_eq(0, says_count(plain, "header"))
+    val themed = laid_of(with opened() { icons: all_icons() })
+    test.assert_eq(0, says_count(themed, "+ header"))
+    test.assert_eq(1, says_count(themed, "header"))
+}
+
+#[test]
+fn a_rows_remove_button_becomes_icon_only() {
+    // The `x` was the other text-as-drawing. An icon-only button announces itself by the icon's
+    // name, which is what `controls.announced_name` is for.
+    val plain = laid_of(opened())
+    test.assert(says_count(plain, "x") > 0)
+    val themed = laid_of(with opened() { icons: all_icons() })
+    test.assert_eq(0, says_count(themed, "x"))
+}
+
+#[test]
+fn a_toolbar_button_keeps_its_words() {
+    // Send, Save and Save As are named commands rather than glyphs: the icon goes *beside* the
+    // word, which is what `widget.Icon`'s leading side is for.
+    val themed = laid_of(with opened() { icons: all_icons() })
+    test.assert_eq(1, says_count(themed, "Send"))
+    test.assert_eq(1, says_count(themed, "Save"))
+    test.assert_eq(1, says_count(themed, "Save As"))
+}
+
+#[test]
+fn no_theme_is_the_window_that_was_there_before() {
+    // **The degradation path, asserted rather than assumed.** A machine with no icon theme, or a
+    // theme missing these names, gets `no_icons()` -- and then every label is exactly what it was,
+    // which is the claim that lets `desktop_icons` fail silently in `run`.
+    val plain = laid_of(opened())
+    test.assert_eq(1, says_count(plain, "+ header"))
+    test.assert_eq(1, says_count(plain, "Send"))
+    test.assert(says_count(plain, "x") > 0)
+}
+
+#[test]
+fn the_icons_reach_the_tree_as_drawings() {
+    // **The icon is a drawn path in the tree**, which is the consequence to assert: the send
+    // button's own box cannot say so, because the design file gives it a fixed width
+    // (`fixed_of(field_width, ...)`) and an icon inside a fixed box takes room from the label
+    // rather than from the window.
+    val plain = drawings_in(laid_of(opened()))
+    val themed = drawings_in(laid_of(with opened() { icons: all_icons() }))
+    // Send, Save, Save As, the header table's add, and one remove per row.
+    test.assert(themed > plain + 4)
+}
+
+// Drawn paths in a laid-out tree. An icon from a theme is one of these; a glyph icon would be text.
+fn drawings_in(l: widget.Laid) -> int {
+    var found = 0
+    if Drawing(_) = l.widget {
+        found = 1
+    }
+    for child in l.children {
+        found = found + drawings_in(child)
+    }
+    return found
 }

@@ -52,6 +52,7 @@ use geom
 use gui/request_ui
 use gui/request_ui.mono_label
 use gui/request_ui.tab_width
+use icons
 use os
 use paint
 use raster
@@ -457,6 +458,109 @@ pub struct State {
     // One line under everything: what just happened, or what went wrong.
     status: string
     focused: string
+    // The desktop's icons, read once when the window opens.
+    icons: Icons
+}
+
+// ---- the desktop's icons
+
+// The icons this window draws, each resolved once at startup.
+//
+// **Every one is optional and absent is an ordinary answer.** A machine with no icon theme, a theme
+// that does not carry one of these names, and an icon whose SVG this reader cannot flatten all end
+// up here as `None` -- and a button with `None` is exactly the button curly had before any of this,
+// words and all. An application that depended on the desktop having artwork would be an application
+// that fails to start on a server.
+pub struct Icons {
+    send: Option<widget.Icon>
+    save: Option<widget.Icon>
+    save_as: Option<widget.Icon>
+    add: Option<widget.Icon>
+    remove: Option<widget.Icon>
+    close: Option<widget.Icon>
+}
+
+// What a test gets, and what a window with no theme behind it gets: no artwork and no filesystem
+// touched. `opening_state` uses this so that **no assertion in the suite depends on the machine's
+// icon theme** -- the real window overrides it in `run`.
+pub fn no_icons() -> Icons {
+    return Icons {
+        send: Option<widget.Icon>.None,
+        save: Option<widget.Icon>.None,
+        save_as: Option<widget.Icon>.None,
+        add: Option<widget.Icon>.None,
+        remove: Option<widget.Icon>.None,
+        close: Option<widget.Icon>.None
+    }
+}
+
+// **The freedesktop names, which is the whole point of using them**: `document-save-symbolic` is
+// the icon the user's own desktop draws for saving, in the theme they chose, and asking for it by
+// name is how an application stops looking imported.
+//
+// `CURLY_ICON_THEME` names a theme; otherwise Adwaita, which every GNOME desktop has and which
+// `icons.theme` backs with `hicolor` on any other. **The theme a user actually configured lives in
+// their desktop's settings store** (gsettings, for GNOME), which is a thing to read one day and not
+// a thing this window needs to guess at today.
+//
+// Read once per window, because each of these is a file read, an XML parse and a path merge -- and
+// a frame costs 6 ms before any of that.
+pub fn desktop_icons() -> Icons {
+    val wanted = switch os.get_env("CURLY_ICON_THEME") {
+        Some(name) { name }
+        None { "Adwaita" }
+    }
+    val theme = switch icons.theme(wanted) {
+        Ok(t) { t }
+        Err(_) { return no_icons() }
+    }
+    return Icons {
+        send: drawn(theme, "mail-send-symbolic", "send"),
+        save: drawn(theme, "document-save-symbolic", "save"),
+        save_as: drawn(theme, "document-save-as-symbolic", "save as"),
+        add: drawn(theme, "list-add-symbolic", "add"),
+        remove: drawn(theme, "list-remove-symbolic", "remove"),
+        close: drawn(theme, "window-close-symbolic", "close")
+    }
+}
+
+// 16 pixels, which is the size every symbolic icon set is drawn at -- and the one the lookup is
+// asked for rather than the size it is painted at, which is an em square from the text size.
+val icon_pixels = 16
+
+fn drawn(theme: icons.Theme, name: string, says: string) -> Option<widget.Icon> {
+    // **The tolerant door, on purpose**: a fifth of a desktop's symbolic icons are two-tone -- a
+    // solid outline over a fill at 0.35 -- and one path cannot hold an alpha. Dropping the faint
+    // layer keeps the part that carries the shape, where the exact reading would leave the button
+    // wordless *and* iconless.
+    return switch icons.icon_path(theme, name, icon_pixels, 1.0) {
+        Ok(path) { Option<widget.Icon>.Some(widget.icon_of(path, says)) }
+        Err(_) { Option<widget.Icon>.None }
+    }
+}
+
+// A button with the desktop's icon on it, **and its words shortened to suit**: `+ header` beside a
+// plus icon says the same thing twice, and `header` on its own says nothing without one. A machine
+// with no icon keeps exactly the button it had, label included, which is why the shortened text is
+// an argument rather than an edit to the button where it is built.
+fn with_icon(b: controls.Button, icon: Option<widget.Icon>, words: string) -> controls.Button {
+    if Some(it) = icon {
+        return with b {
+            icon: Option<widget.Icon>.Some(it),
+            label: words
+        }
+    }
+    return b
+}
+
+// An add button's words without the `+` it drew as text. **Derived rather than written twice**: the
+// label is defined where the table is built (`+ header`, `+ parameter`, `+ rule`), and a second
+// list of nouns here is a second thing to keep in step.
+fn shortened(label: string) -> string {
+    if starts_with(label, "+") {
+        return trim(substring(label, 1, len(label)))
+    }
+    return label
 }
 
 val headers_editor = 0
@@ -500,7 +604,8 @@ pub fn opening_state(loaded: [Loaded], scopes: [string]) -> State {
         response: response_entry(""),
         scroll: 0.0,
         status: concat(str(len(sidebar.items)), " request(s) loaded"),
-        focused: "requests"
+        focused: "requests",
+        icons: no_icons()
     }
     // The tree opens with its first row selected, so the fields open showing a request rather
     // than blank -- a selection the pane disagrees with is the same trap as a stale one. The
@@ -679,7 +784,7 @@ fn drop_last_text(xs: MutableArray<string>) {
 // ---- building the view
 
 // The Save As dialog's contents: two fields and two buttons.
-fn naming_widget(n: Naming, style: controls.Style, m: widget.Metrics) -> widget.Widget {
+fn naming_widget(n: Naming, ic: Icons, style: controls.Style, m: widget.Metrics) -> widget.Widget {
     // **Every width is given, and none is `expand`.** A dialog is centred by its own natural size --
     // `dialog_layer` puts flexible space either side of it -- so a child that asks to fill its
     // parent is asking the box how big it is while the box is asking the child. The window's own
@@ -691,7 +796,13 @@ fn naming_widget(n: Naming, style: controls.Style, m: widget.Metrics) -> widget.
     if len(n.error) > 0 {
         push(rows, request_ui.dialog_error_row(n.error, style))
     }
-    push(rows, request_ui.dialog_buttons(n.confirm, n.cancel, style))
+    // A dialog's two buttons keep their words -- "Save" and "Cancel" are what a user reads before
+    // committing something -- and take the icons beside them.
+    push(rows, request_ui.dialog_buttons(
+        with_icon(n.confirm, ic.save, n.confirm.label),
+        with_icon(n.cancel, ic.close, n.cancel.label),
+        style
+    ))
     return request_ui.naming_dialog(snapshot(rows))
 }
 
@@ -699,12 +810,20 @@ fn naming_widget(n: Naming, style: controls.Style, m: widget.Metrics) -> widget.
 // **The loop, and nothing else.** A table is a repeat over data and a design file has no loops,
 // so what is left here is the iteration: the row's layout and the table's arrangement both live
 // in `request_ui`, and this calls the row template once per row.
-fn table_widget(t: PairTable, style: controls.Style, m: widget.Metrics) -> widget.Widget {
+fn table_widget(t: PairTable, ic: Icons, style: controls.Style, m: widget.Metrics) -> widget.Widget {
     val rows = mutable_array_new<widget.Widget>()
     for row in t.rows {
-        push(rows, request_ui.pair_row(row.name, row.value, row.remove, style, m))
+        // A row's remove button becomes icon-only: the `x` it carried was a drawing made of text,
+        // and the icon's own name is what a reader is told.
+        push(rows, request_ui.pair_row(
+            row.name,
+            row.value,
+            with_icon(row.remove, ic.remove, ""),
+            style,
+            m
+        ))
     }
-    return request_ui.pair_table(snapshot(rows), t.add, style)
+    return request_ui.pair_table(snapshot(rows), with_icon(t.add, ic.add, shortened(t.add.label)), style)
 }
 
 // The authorization editor: a picker, and the fields the picked kind needs.
@@ -735,17 +854,18 @@ fn auth_widget(a: AuthEditors, style: controls.Style, m: widget.Metrics) -> widg
 }
 
 // The extraction rules: one row of five controls per rule, and a button that adds one.
-fn rules_widget(t: RuleTable, style: controls.Style, m: widget.Metrics) -> widget.Widget {
+fn rules_widget(t: RuleTable, ic: Icons, style: controls.Style, m: widget.Metrics) -> widget.Widget {
     val rows = mutable_array_new<widget.Widget>()
     for row in t.rows {
-        rows_push_rule(rows, row, style, m)
+        rows_push_rule(rows, row, ic, style, m)
     }
-    return request_ui.pair_table(snapshot(rows), t.add, style)
+    return request_ui.pair_table(snapshot(rows), with_icon(t.add, ic.add, shortened(t.add.label)), style)
 }
 
 fn rows_push_rule(
     rows: MutableArray<widget.Widget>,
     row: RuleRow,
+    ic: Icons,
     style: controls.Style,
     m: widget.Metrics
 ) {
@@ -764,7 +884,7 @@ fn rows_push_rule(
         said,
         with row.source { label: said },
         row.secret,
-        row.remove,
+        with_icon(row.remove, ic.remove, ""),
         style,
         m
     ))
@@ -776,18 +896,18 @@ pub fn view(s: State, style: controls.Style, m: widget.Metrics) -> widget.Widget
     // the response left the response a sliver, and a request with eight headers pushed it off the
     // window entirely. The strip costs one row and the shown editor gets its natural height.
     val chosen_editor = if s.editors.selected == query_editor {
-        table_widget(s.query, style, m)
+        table_widget(s.query, s.icons, style, m)
     } else {
         if s.editors.selected == auth_editor {
             auth_widget(s.auth, style, m)
         } else {
             if s.editors.selected == extract_editor {
-                rules_widget(s.rules, style, m)
+                rules_widget(s.rules, s.icons, style, m)
             } else {
                 if s.editors.selected == body_editor {
                     widget.fixed_of(0.0, body_height, controls.entry_widget(s.body, style, m))
                 } else {
-                    table_widget(s.headers, style, m)
+                    table_widget(s.headers, s.icons, style, m)
                 }
             }
         }
@@ -808,9 +928,11 @@ pub fn view(s: State, style: controls.Style, m: widget.Metrics) -> widget.Widget
         tree: s.sidebar.tree,
         method: s.method,
         url: s.url,
-        send: s.send,
-        save: s.save,
-        save_as: s.save_as,
+        // The words stay on these three: a toolbar button with a name is not the same control as
+        // a row's `x`, and "Send" is what a user looks for.
+        send: with_icon(s.send, s.icons.send, s.send.label),
+        save: with_icon(s.save, s.icons.save, s.save.label),
+        save_as: with_icon(s.save_as, s.icons.save_as, s.save_as.label),
         editors: s.editors,
         editor: chosen_editor,
         env: s.env,
@@ -826,7 +948,7 @@ pub fn view(s: State, style: controls.Style, m: widget.Metrics) -> widget.Widget
         Some(n) {
             widget.layered_of([
                 widget.base_layer(body),
-                controls.dialog_layer("save-as", "Save Request As", naming_widget(n, style, m), style)
+                controls.dialog_layer("save-as", "Save Request As", naming_widget(n, s.icons, style, m), style)
             ])
         }
         None { body }

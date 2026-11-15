@@ -72,6 +72,7 @@ use gui/state.bounds_of
 use gui/state.committed
 use gui/state.composing
 use gui/state.composition_dropped
+use gui/state.desktop_icons
 use gui/state.edited_request
 use gui/state.edited_request_from
 use gui/state.env_name
@@ -437,7 +438,12 @@ pub fn run(store: Storage) -> Result<unit, string> {
     for one in try list_environments(store) {
         push(scopes, one)
     }
-    val opened = opening_state(loaded, snapshot(scopes))
+    // **The desktop's icons, read once.** `opening_state` opens with none -- which is what every
+    // test gets and what a machine with no icon theme gets -- and the window that is about to be
+    // shown to a person asks the theme for them.
+    val opened = with opening_state(loaded, snapshot(scopes)) {
+        icons: desktop_icons()
+    }
     val density = chosen_density().density
     val scale = density.px_per_pt
     val options = with raster.options() {

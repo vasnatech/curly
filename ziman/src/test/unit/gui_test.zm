@@ -867,10 +867,35 @@ fn anything_else_stays_text() {
     // A body that claims to be a PNG and is not: the decode fails and the text pane shows the
     // headers, which is more use than refusing to show the response at all.
     test.assert(absent(state.preview_of(png_response("image/png", to_bytes("not a png")))))
-    // A JPEG, which ziman can measure and cannot decode. Also text, for now.
+    // A JPEG body that is really a PNG: the content type picks the decoder, and the decoder
+    // refuses what it was handed rather than guessing from the bytes.
     test.assert(absent(state.preview_of(png_response("image/jpeg", a_png(4, 4)))))
+    // And a real JPEG is shown, which is what the decoder landing today bought.
+    test.assert_false(absent(state.preview_of(png_response("image/jpeg", a_jpeg()))))
     // The header's case and its parameters do not matter.
     test.assert_false(absent(state.preview_of(png_response("IMAGE/PNG; charset=binary", a_png(4, 4)))))
+}
+
+// A real baseline JPEG, resolved through `ZIMAN_RESOURCE_PATH` like every other fixture here.
+//
+// **A copy of ziman's own, rather than a path into its repository**: a test that read a file out of
+// a sibling checkout would pass on this machine and nowhere else, and curly is a separate project
+// that happens to live next door.
+fn a_jpeg() -> [byte] {
+    val path = switch fs.resolve("sample.jpg") {
+        Some(found) { found }
+        None {
+            test.fail("sample.jpg is not on ZIMAN_RESOURCE_PATH")
+            return []
+        }
+    }
+    return switch fs.read_bytes(path) {
+        Ok(data) { data }
+        Err(e) {
+            test.fail(fs.fs_error_message(e))
+            []
+        }
+    }
 }
 
 fn absent(p: Option<state.Preview>) -> bool {

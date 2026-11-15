@@ -483,18 +483,28 @@ pub struct Preview {
 
 // The response body as a picture, when it is one this reader can decode.
 //
-// **PNG only, and the Err is discarded on purpose**: a body that claims to be an image and is not
-// one, or is a JPEG (for which ziman has dimensions and no decoder), falls back to the text pane,
-// which shows the headers and whatever the bytes look like. A REST client that refused to show a
-// response because it could not draw it would be worse than one that shows the bytes.
+// **PNG and baseline JPEG, and the Err is discarded on purpose**: a body that claims to be an
+// image and is not one, or is a progressive JPEG, falls back to the text pane, which shows the
+// headers and whatever the bytes look like. A REST client that refused to show a response because
+// it could not draw it would be worse than one that shows the bytes.
 pub fn preview_of(r: ResponseSummary) -> Option<Preview> {
     val kind = to_lower(header_value(r.headers, "content-type"), locale.root())
-    if !starts_with(kind, "image/png") {
-        return Option<Preview>.None
-    }
     // The same budget the window's own renderer takes: a response that claims a billion pixels is
     // a response to show as text.
-    return switch image.decode_png(r.body_bytes, 16000000) {
+    val decoded: Result<image.Image, string> = if starts_with(kind, "image/png") {
+        image.decode_png(r.body_bytes, 16000000)
+    } else {
+        if starts_with(kind, "image/jpeg") || starts_with(kind, "image/jpg") {
+            // **A big JPEG is seconds of decoding**, which is a window that stops answering: the
+            // decoder is interpreted and costs about 7 us a pixel, so a megapixel photograph is
+            // seven seconds with no way to cancel it. A quarter of a megapixel is about 1.7 s,
+            // which is the most a response pane should take before it shows something.
+            image.decode_jpeg(r.body_bytes, 250000)
+        } else {
+            err("not an image")
+        }
+    }
+    return switch decoded {
         Ok(picture) {
             Option<Preview>.Some(Preview {
                 picture: picture,

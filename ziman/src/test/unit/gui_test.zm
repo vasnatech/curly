@@ -8,6 +8,7 @@
 // `step` needs a laid-out tree to route an input by, so each test lays the real `view` out at a
 // window-sized box with the metrics below. That is not a stub for the layout -- it *is* the
 // layout, with a stub for the font.
+use a11y
 use controls
 use core/saved
 use core/saved.Collection
@@ -767,4 +768,35 @@ fn drawings_in(l: widget.Laid) -> int {
         found = found + drawings_in(child)
     }
     return found
+}
+
+#[test]
+fn every_rows_remove_button_says_which_row() {
+    // **An icon-only button is announced by its icon's name**, so three rows that all said
+    // "remove" would be exactly as useless as the three `x`es they replaced -- and worse, because
+    // nothing on screen shows it. The first row of the demo collection's request carries an
+    // `Accept` header; the blank rows below it fall back to their position.
+    val themed = laid_of(with opened() { icons: all_icons() })
+    val tree = a11y.tree_of(themed, "curly", "")
+    val said = mutable_array_new<string>()
+    for node in a11y.reachable(tree) {
+        if starts_with(node.name, "remove") {
+            push(said, node.name)
+        }
+    }
+    val names = snapshot(said)
+    test.assert(len(names) > 1)
+    // No two rows announce the same thing, which is the whole claim.
+    var i = 0
+    while i < len(names) {
+        var j = i + 1
+        while j < len(names) {
+            test.assert_ne(names[i], names[j])
+            j = j + 1
+        }
+        i = i + 1
+    }
+    // And a row with a header typed into it is named for the header rather than its position.
+    test.assert_contains(names, "remove Accept")
+    test.assert_contains(names, "remove Header 2")
 }

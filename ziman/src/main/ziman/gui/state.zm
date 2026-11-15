@@ -553,6 +553,32 @@ fn with_icon(b: controls.Button, icon: Option<widget.Icon>, words: string) -> co
     return b
 }
 
+// The same for a button whose words are gone altogether, **with the icon renamed to say which one
+// it is**. An icon-only button announces itself by its icon's name (`controls.announced_name`), so
+// three rows of a table would otherwise all say "remove" -- which is exactly as useless as the
+// three `x`es they replaced, and worse for being invisible.
+//
+// The row's own first field is what names it, falling back to its position: a reader hears "remove
+// Authorization" where there is a header name to say, and "remove Header 2" where the row is still
+// blank.
+fn with_row_icon(b: controls.Button, icon: Option<widget.Icon>, says: string) -> controls.Button {
+    if Some(it) = icon {
+        return with b {
+            icon: Option<widget.Icon>.Some(with it { name: says }),
+            label: ""
+        }
+    }
+    return b
+}
+
+fn removes(what: string, title: string, at: int) -> string {
+    val typed = trim(what)
+    if len(typed) > 0 {
+        return concat("remove ", typed)
+    }
+    return concat("remove ", title, " ", str(at + 1))
+}
+
 // An add button's words without the `+` it drew as text. **Derived rather than written twice**: the
 // label is defined where the table is built (`+ header`, `+ parameter`, `+ rule`), and a second
 // list of nouns here is a second thing to keep in step.
@@ -812,16 +838,18 @@ fn naming_widget(n: Naming, ic: Icons, style: controls.Style, m: widget.Metrics)
 // in `request_ui`, and this calls the row template once per row.
 fn table_widget(t: PairTable, ic: Icons, style: controls.Style, m: widget.Metrics) -> widget.Widget {
     val rows = mutable_array_new<widget.Widget>()
+    var at = 0
     for row in t.rows {
         // A row's remove button becomes icon-only: the `x` it carried was a drawing made of text,
-        // and the icon's own name is what a reader is told.
+        // and the icon's own name is what a reader is told -- so it is named for its row.
         push(rows, request_ui.pair_row(
             row.name,
             row.value,
-            with_icon(row.remove, ic.remove, ""),
+            with_row_icon(row.remove, ic.remove, removes(row.name.editor.text, t.title, at)),
             style,
             m
         ))
+        at = at + 1
     }
     return request_ui.pair_table(snapshot(rows), with_icon(t.add, ic.add, shortened(t.add.label)), style)
 }
@@ -856,8 +884,10 @@ fn auth_widget(a: AuthEditors, style: controls.Style, m: widget.Metrics) -> widg
 // The extraction rules: one row of five controls per rule, and a button that adds one.
 fn rules_widget(t: RuleTable, ic: Icons, style: controls.Style, m: widget.Metrics) -> widget.Widget {
     val rows = mutable_array_new<widget.Widget>()
+    var at = 0
     for row in t.rows {
-        rows_push_rule(rows, row, ic, style, m)
+        rows_push_rule(rows, row, ic, at, style, m)
+        at = at + 1
     }
     return request_ui.pair_table(snapshot(rows), with_icon(t.add, ic.add, shortened(t.add.label)), style)
 }
@@ -866,6 +896,7 @@ fn rows_push_rule(
     rows: MutableArray<widget.Widget>,
     row: RuleRow,
     ic: Icons,
+    at: int,
     style: controls.Style,
     m: widget.Metrics
 ) {
@@ -884,7 +915,7 @@ fn rows_push_rule(
         said,
         with row.source { label: said },
         row.secret,
-        with_icon(row.remove, ic.remove, ""),
+        with_row_icon(row.remove, ic.remove, removes(row.name.editor.text, "rule", at)),
         style,
         m
     ))

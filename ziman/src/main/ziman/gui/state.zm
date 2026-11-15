@@ -52,7 +52,10 @@ use geom
 use gui/request_ui
 use gui/request_ui.mono_label
 use gui/request_ui.tab_width
+use http
 use icons
+use image
+use locale
 use os
 use paint
 use raster
@@ -460,6 +463,64 @@ pub struct State {
     focused: string
     // The desktop's icons, read once when the window opens.
     icons: Icons
+    // The response body as a picture, when it is one. The text pane shows it otherwise.
+    preview: Option<Preview>
+}
+
+// ---- a response that is a picture
+
+// What the response pane shows when the body is an image rather than text.
+//
+// **Decoded once, when the response arrives.** A pane that decoded on every frame would decode a
+// PNG sixty times a second to show the same picture, and the frame is already the expensive part
+// of this window.
+pub struct Preview {
+    picture: image.Image
+    width: float
+    height: float
+    alt: string
+}
+
+// The response body as a picture, when it is one this reader can decode.
+//
+// **PNG only, and the Err is discarded on purpose**: a body that claims to be an image and is not
+// one, or is a JPEG (for which ziman has dimensions and no decoder), falls back to the text pane,
+// which shows the headers and whatever the bytes look like. A REST client that refused to show a
+// response because it could not draw it would be worse than one that shows the bytes.
+pub fn preview_of(r: ResponseSummary) -> Option<Preview> {
+    val kind = to_lower(header_value(r.headers, "content-type"), locale.root())
+    if !starts_with(kind, "image/png") {
+        return Option<Preview>.None
+    }
+    // The same budget the window's own renderer takes: a response that claims a billion pixels is
+    // a response to show as text.
+    return switch image.decode_png(r.body_bytes, 16000000) {
+        Ok(picture) {
+            Option<Preview>.Some(Preview {
+                picture: picture,
+                width: picture.width as float,
+                height: picture.height as float,
+                alt: concat(
+                    "the response body, a ",
+                    str(picture.width),
+                    " by ",
+                    str(picture.height),
+                    " picture"
+                )
+            })
+        }
+        Err(_) { Option<Preview>.None }
+    }
+}
+
+fn header_value(headers: [http.Header], name: string) -> string {
+    val wanted = to_lower(name, locale.root())
+    for h in headers {
+        if to_lower(h.name, locale.root()) == wanted {
+            return h.value
+        }
+    }
+    return ""
 }
 
 // ---- the desktop's icons
@@ -631,7 +692,8 @@ pub fn opening_state(loaded: [Loaded], scopes: [string]) -> State {
         scroll: 0.0,
         status: concat(str(len(sidebar.items)), " request(s) loaded"),
         focused: "requests",
-        icons: no_icons()
+        icons: no_icons(),
+        preview: Option<Preview>.None
     }
     // The tree opens with its first row selected, so the fields open showing a request rather
     // than blank -- a selection the pane disagrees with is the same trap as a stale one. The
@@ -948,7 +1010,17 @@ pub fn view(s: State, style: controls.Style, m: widget.Metrics) -> widget.Widget
     // control owns its view now, which is the right place for it -- only the code that moved the
     // caret knows where it went.
     val lower = switch showing(s) {
-        Response { controls.entry_widget(s.response, style, m) }
+        Response {
+            // **A picture rather than its bytes**, when the body is one: a PNG shown as text is a
+            // screenful of mojibake, and the headers above it are what a reader wanted anyway.
+            // `widget.Picture` keeps its aspect and centres itself in whatever the pane is --
+            // **shrinking to fit and never enlarging**, because a 16-point favicon blown up to
+            // fill 600 points is a wall of blur rather than a preview of anything.
+            switch s.preview {
+                Some(it) { widget.picture_shrunk(0, it.width, it.height, it.alt) }
+                None { controls.entry_widget(s.response, style, m) }
+            }
+        }
         History { controls.list_widget(s.history, style) }
     }
     // **The whole arrangement lives in the design file now**, so what is left here is the data it
@@ -1443,6 +1515,11 @@ fn show_request(s: State, item: Item) -> State {
         auth: auth_editors(item.saved.auth),
         rules: rule_table(item.saved.extract),
         body: controls.text_area_of("body", "Body", body_text_of(item.saved.body), body_rows),
+        // **Selecting another request drops the picture with everything else it is showing.** The
+        // response text is left alone here deliberately -- it is the last answer and a user may
+        // still be reading it -- but a *picture* of it filling the pane while the fields say
+        // something else reads as the new request's answer, which it is not.
+        preview: Option<Preview>.None,
         status: concat(item.collection, "/", item.path)
     }
 }
@@ -1853,6 +1930,10 @@ pub fn step(s: State, input: controls.Input, laid: widget.Laid, style: controls.
             // the Response button, is how you go and read it.
             val chosen = with with_list {
                 response: response_entry(history_text(with_list.past[at])),
+                // **The picture goes with the response it came from.** A history entry is text --
+                // what was sent and what came back -- and leaving the last response's picture up
+                // would show one response's image over another's headers.
+                preview: Option<Preview>.None,
                 status: concat("history: ", with_list.past[at].sent_at)
             }
             return kept(if taken.activated { show_pane(chosen, Pane.Response) } else { chosen })

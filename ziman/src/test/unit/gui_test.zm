@@ -10,6 +10,7 @@
 // layout, with a stub for the font.
 use a11y
 use controls
+use core/exec as exec
 use core/saved
 use core/saved.Collection
 use core/saved.Folder
@@ -23,6 +24,9 @@ use gui/state.Loaded
 use gui/state.State
 use gui/state.opening_state
 use gui/state.sidebar_of
+use http
+use image
+use paint
 use shape
 use test
 use uuid.uuid_new
@@ -799,4 +803,123 @@ fn every_rows_remove_button_says_which_row() {
     // And a row with a header typed into it is named for the header rather than its position.
     test.assert_contains(names, "remove Accept")
     test.assert_contains(names, "remove Header 2")
+}
+
+// ------------------------------------------- a response that is a picture (2026-11-14)
+
+// **A PNG body is shown as a picture rather than as its bytes**, which is what `widget.Picture`
+// made possible. The cases are about which responses become one: the decode itself is `image`'s.
+fn png_response(kind: string, body: [byte]) -> exec.ResponseSummary {
+    return exec.ResponseSummary {
+        status: 200,
+        headers: [http.Header { name: "Content-Type", value: kind }],
+        body: "",
+        body_bytes: body,
+        elapsed_millis: 3
+    }
+}
+
+fn a_png(width: int, height: int) -> [byte] {
+    val canvas = switch image.canvas(width, height, image.Pixels.Rgba8) {
+        Ok(c) { c }
+        Err(why) {
+            test.fail(why)
+            return []
+        }
+    }
+    var x = 0
+    while x < width {
+        var y = 0
+        while y < height {
+            if Err(why) = image.set(canvas, x, y, paint.rgb(0.2, 0.6, 0.9)) {
+                test.fail(why)
+            }
+            y = y + 1
+        }
+        x = x + 1
+    }
+    return image.encode_png(image.snapshot_image(canvas))
+}
+
+#[test]
+fn a_png_body_becomes_a_preview() {
+    val preview = state.preview_of(png_response("image/png", a_png(40, 20)))
+    test.assert(switch preview {
+        Some(it) { true }
+        None { false }
+    })
+    switch preview {
+        Some(it) {
+            test.assert_near(40.0, it.width, 0.001)
+            test.assert_near(20.0, it.height, 0.001)
+            // The alt text is what a reader is told, and it says what the picture is rather than
+            // that there is one.
+            test.assert_contains(it.alt, "40 by 20")
+        }
+        None { unit }
+    }
+}
+
+#[test]
+fn anything_else_stays_text() {
+    // A JSON body, the ordinary case.
+    test.assert(absent(state.preview_of(png_response("application/json", to_bytes("{}")))))
+    // A body that claims to be a PNG and is not: the decode fails and the text pane shows the
+    // headers, which is more use than refusing to show the response at all.
+    test.assert(absent(state.preview_of(png_response("image/png", to_bytes("not a png")))))
+    // A JPEG, which ziman can measure and cannot decode. Also text, for now.
+    test.assert(absent(state.preview_of(png_response("image/jpeg", a_png(4, 4)))))
+    // The header's case and its parameters do not matter.
+    test.assert_false(absent(state.preview_of(png_response("IMAGE/PNG; charset=binary", a_png(4, 4)))))
+}
+
+fn absent(p: Option<state.Preview>) -> bool {
+    return switch p {
+        Some(_) { false }
+        None { true }
+    }
+}
+
+#[test]
+fn the_response_pane_draws_the_picture() {
+    // The view shows one where there is one, and the text entry where there is not.
+    val plain = laid_of(opened())
+    test.assert_eq(0, pictures_in(plain))
+    val showing = switch state.preview_of(png_response("image/png", a_png(40, 20))) {
+        Some(it) { with opened() { preview: Option<state.Preview>.Some(it) } }
+        None {
+            test.fail("no preview")
+            opened()
+        }
+    }
+    test.assert_eq(1, pictures_in(laid_of(showing)))
+    // **The handle is 0 at both ends or the window draws the wrong picture.** `app.zm` registers
+    // the preview as the only image in `raster.Options.images`, and the view asks for index 0;
+    // nothing else in this window registers one, so the two lines are the whole wiring and this
+    // pins them together.
+    test.assert_eq(0, handle_of(laid_of(showing)))
+}
+
+fn handle_of(l: widget.Laid) -> int {
+    if Picture(it) = l.widget {
+        return it.image
+    }
+    for child in l.children {
+        val found = handle_of(child)
+        if found >= 0 {
+            return found
+        }
+    }
+    return 0 - 1
+}
+
+fn pictures_in(l: widget.Laid) -> int {
+    var found = 0
+    if Picture(_) = l.widget {
+        found = 1
+    }
+    for child in l.children {
+        found = found + pictures_in(child)
+    }
+    return found
 }

@@ -66,6 +66,7 @@ use geom
 use gui/state.Item
 use gui/state.Loaded
 use gui/state.Naming
+use gui/state.Preview
 use gui/state.Sidebar
 use gui/state.State
 use gui/state.bounds_of
@@ -81,6 +82,7 @@ use gui/state.history_rows
 use gui/state.history_text
 use gui/state.open_menu
 use gui/state.opening_state
+use gui/state.preview_of
 use gui/state.relaid
 use gui/state.response_entry
 use gui/state.response_text
@@ -550,7 +552,16 @@ pub fn run(store: Storage) -> Result<unit, string> {
                     // the content. The alternative was to lay the window out, read the extents and
                     // lay it out again, which measured at 5 ms a frame over 200 rows.
                     val scene_now = controls.paint_scroll_bars(laid, with_focus, style)
-                    val painted = try desktop.repaint(painter, w, scene_now, options)
+                    // **The images table is per frame, and it costs nothing to rebuild.** `repaint`
+                    // compares the scene against the last one and the scale against the painter's;
+                    // it does not compare the options by value, so handing it a different `images`
+                    // array is a struct literal and not a copy of any pixels. A response that is a
+                    // picture is registered as image 0, which is the handle `view` draws.
+                    val framed = switch st.preview {
+                        Some(it) { with options { images: [it.picture] } }
+                        None { options }
+                    }
+                    val painted = try desktop.repaint(painter, w, scene_now, framed)
                     painter = painted.next
 
                     // **Where the caret is, in screen pixels, so the candidate list appears under
@@ -667,12 +678,15 @@ pub fn run(store: Storage) -> Result<unit, string> {
                                 Ok(r) {
                                     st = with st {
                                         response: response_entry(response_text(r)),
+                                        // Decoded here, once, where the response arrives.
+                                        preview: preview_of(r),
                                         scroll: 0.0,
                                         status: concat("HTTP ", str(r.status), " in ", str(r.elapsed_millis), " ms")
                                     }
                                 }
                                 Err(why) { st = with st {
                                     response: response_entry(""),
+                                    preview: Option<Preview>.None,
                                     scroll: 0.0,
                                     status: concat("error: ", why)
                                 } }

@@ -570,10 +570,17 @@ pub fn run(store: Storage) -> Result<unit, string> {
                     // `window.origin` is a round trip to the server. `None` is the ordinary
                     // answer when the focus is on a button, and then the method is left where it
                     // was rather than told something false.
+                    //
+                    // **`st.focused` since ziman 2026-11-15**, when `caret_on_screen` gained it.
+                    // Every field put a caret box in the tree, so the old three-argument form
+                    // answered the *first* caret in document order -- the field nearest the top
+                    // left, not the one being typed into -- and the candidate list opened under
+                    // the wrong field. The "`None` when the focus is on a button" above is now
+                    // how it is actually computed rather than a happy accident.
                     if composing_on {
                         switch window.origin(w) {
                             Ok(at) {
-                                if Some(box) = desktop.caret_on_screen(at, laid, density) {
+                                if Some(box) = desktop.caret_on_screen(at, laid, density, st.focused) {
                                     ibus.caret_at(box.x, box.y, box.width, box.height)
                                 }
                             }

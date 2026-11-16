@@ -640,13 +640,18 @@ fn a_dialog_takes_the_composition() {
     test.assert_eq(shown_in(behind.url), "http://127.0.0.1/hello")
 }
 
-// The focus is on a button, which cannot compose. Nothing happens, and in particular the method's
-// text does not land in the last field that could take it.
+// The focus is on a button, which cannot compose. Nothing happens, and in particular the text does
+// not land in the last field that could take it.
+//
+// **The method is a picker since 2026-11-15 and so cannot take a composition at all** -- it left
+// `with_focused_entry` with its `controls.Entry`. That makes this assertion weaker than it was and
+// the guarantee behind it stronger: the method used to be a text field that a stray composition
+// could have reached, and now there is no route to it even if the dispatch were wrong.
 #[test]
 fn a_composition_with_the_focus_on_a_button_changes_nothing() {
     val s = state.composing(with opened() { focused: "send" }, "かな", 2, 0, 0)
     test.assert_eq(shown_in(s.url), "http://127.0.0.1/hello")
-    test.assert_eq(shown_in(s.method), "GET")
+    test.assert_eq(state.method_text(s.method), "GET")
 }
 
 // The marked run is the part being converted, which a method moves as the user picks among

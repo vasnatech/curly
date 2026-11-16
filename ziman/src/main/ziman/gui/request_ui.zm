@@ -90,7 +90,7 @@ pub fn sidebar(
 }
 
 pub fn bar(
-    method: controls.Entry,
+    method: controls.ComboBox,
     url: controls.Entry,
     send: controls.Button,
     save: controls.Button,
@@ -99,7 +99,7 @@ pub fn bar(
     m: widget.Metrics
 ) -> widget.Widget {
     return widget.row_of(gap, [
-        widget.fixed_of(field_width, 0.0, controls.entry_widget(method, style, m)),
+        widget.fixed_of(field_width, 0.0, controls.combo_box_widget(method, style)),
         widget.expand(controls.entry_widget(url, style, m)),
         widget.fixed_of(field_width, 0.0, controls.button_widget(send, style)),
         widget.fixed_of(field_width, 0.0, controls.button_widget(save, style)),
@@ -117,7 +117,7 @@ pub fn bar(
 pub fn editors(
     tabs: controls.Tabs,
     body: widget.Widget,
-    env: controls.Menu,
+    env: controls.ComboBox,
     style: controls.Style,
     m: widget.Metrics
 ) -> widget.Widget {
@@ -129,7 +129,7 @@ pub fn editors(
         body,
         widget.fixed_of(0.0, row_height, widget.row_of(gap, [
             widget.fixed_of(env_label_width, 0.0, mono_label("Environment", small_size, style)),
-            widget.fixed_of(env_width, 0.0, controls.menu_title_widget(env, style)),
+            widget.fixed_of(env_width, 0.0, controls.combo_box_widget(env, style)),
             widget.expand(widget.flex())
         ]))
     ]))
@@ -154,7 +154,7 @@ pub fn pane_switcher(panes: controls.Tabs, style: controls.Style) -> widget.Widg
 pub struct Screen {
     filter: controls.Entry
     tree: controls.Tree
-    method: controls.Entry
+    method: controls.ComboBox
     url: controls.Entry
     send: controls.Button
     save: controls.Button
@@ -165,7 +165,7 @@ pub struct Screen {
     // carries four points of padding below it, so the column measures the height the logic file
     // used to compute. That removed `editor_height` and the three functions behind it.
     editor: widget.Widget
-    env: controls.Menu
+    env: controls.ComboBox
     panes: controls.Tabs
     // The response or the history, whichever the pane switcher chose.
     lower: widget.Widget
@@ -252,10 +252,10 @@ pub fn field_row(
 }
 
 // A labelled row holding a picker, which takes its own width rather than the line's.
-pub fn picker_row(label: string, picker: controls.Menu, style: controls.Style) -> widget.Widget {
+pub fn picker_row(label: string, picker: controls.ComboBox, style: controls.Style) -> widget.Widget {
     return widget.fixed_of(0.0, row_height, widget.row_of(gap, [
         widget.fixed_of(auth_label_width, 0.0, mono_label(label, small_size, style)),
-        widget.fixed_of(auth_picker_width, 0.0, controls.menu_title_widget(picker, style)),
+        widget.fixed_of(auth_picker_width, 0.0, controls.combo_box_widget(picker, style)),
         widget.expand(widget.flex())
     ]))
 }
@@ -280,7 +280,7 @@ pub fn rows_panel(rows: [widget.Widget]) -> widget.Widget {
 // One extraction rule: where it reads from, what it is called, the word for its kind, the source
 // itself, whether it is a secret, and the button that removes it.
 pub fn rule_row(
-    kind: controls.Menu,
+    kind: controls.ComboBox,
     name: controls.Entry,
     said: string,
     source: controls.Entry,
@@ -290,7 +290,7 @@ pub fn rule_row(
     m: widget.Metrics
 ) -> widget.Widget {
     return widget.fixed_of(0.0, row_height, widget.row_of(gap, [
-        widget.fixed_of(rule_kind_width, 0.0, controls.menu_title_widget(kind, style)),
+        widget.fixed_of(rule_kind_width, 0.0, controls.combo_box_widget(kind, style)),
         widget.fixed_of(rule_name_width, 0.0, controls.entry_widget(name, style, m)),
         widget.fixed_of(rule_said_width, 0.0, mono_label(said, small_size, style)),
         widget.expand(controls.entry_widget(source, style, m)),

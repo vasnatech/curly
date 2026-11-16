@@ -34,7 +34,7 @@ pub enum Value {
     E(controls.Entry)
     B(controls.Button)
     T(controls.Tabs)
-    M(controls.Menu)
+    M(controls.ComboBox)
     R(controls.Tree)
     C(controls.CheckBox)
     L(Widgets)
@@ -238,8 +238,8 @@ pub fn placeholder(said: string, name: string, counts: [Count]) -> Value {
     if said == "controls.Tabs" {
         return Value.T(controls.tabs_of(name, name, made_up_labels(name, how_many)))
     }
-    if said == "controls.Menu" {
-        return Value.M(controls.choice_of(name, name, made_up_labels(name, how_many), 0))
+    if said == "controls.ComboBox" {
+        return Value.M(controls.combo_box_of(name, name, made_up_labels(name, how_many), 0))
     }
     if said == "controls.Tree" {
         val rows = mutable_array_new<controls.TreeRow>()
@@ -455,9 +455,9 @@ fn call(name: string, args: [Value], style: controls.Style, m: widget.Metrics) -
             None { Value.None }
         }
     }
-    if name == "controls.menu_title_widget" {
+    if name == "controls.combo_box_widget" {
         return switch args[0] {
-            M(menu) { Value.W(controls.menu_title_widget(menu, style)) }
+            M(combo) { Value.W(controls.combo_box_widget(combo, style)) }
             W(_) { Value.None }
             F(_) { Value.None }
             S(_) { Value.None }

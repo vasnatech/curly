@@ -80,7 +80,7 @@ use gui/state.env_name
 use gui/state.global_scope
 use gui/state.history_rows
 use gui/state.history_text
-use gui/state.open_menu
+use gui/state.open_picker
 use gui/state.opening_state
 use gui/state.preview_of
 use gui/state.relaid
@@ -522,14 +522,14 @@ pub fn run(store: Storage) -> Result<unit, string> {
                     val whole = geom.rect_of(0.0, 0.0, width_pt, height_pt)
                     val base = view(st, style, m)
                     val first = widget.layout(base, whole, m)
-                    laid = switch open_menu(st) {
+                    laid = switch open_picker(st) {
                         Some(menu) {
                             val at = bounds_of(first, menu.name)
                             val rows = (len(menu.items.items) as float) * menu.items.row_height
                             widget.layout(
                                 widget.layered_of([
                                     widget.base_layer(base),
-                                    controls.menu_popup_layer(
+                                    controls.combo_box_popup_layer(
                                         menu,
                                         style,
                                         geom.rect_of(at.x, at.y + at.height, at.width, rows)

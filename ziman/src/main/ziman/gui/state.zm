@@ -235,7 +235,7 @@ pub fn show_pane(s: State, which: Pane) -> State {
 // nothing of the code, so sharing the code would have meant a `PairTable` carrying an optional
 // menu and an optional check box for the benefit of one caller each.
 struct RuleRow {
-    kind: controls.Menu
+    kind: controls.ComboBox
     name: controls.Entry
     source: controls.Entry
     secret: controls.CheckBox
@@ -266,7 +266,7 @@ fn source_label(at: int) -> string {
 fn rule_row(index: int, kind: int, name: string, source: string, secret: bool) -> RuleRow {
     val tag = concat("rule", str(index))
     return RuleRow {
-        kind: controls.choice_of(concat(tag, "kind"), "Rule kind", ["Body", "Header", "Template"], kind),
+        kind: controls.combo_box_of(concat(tag, "kind"), "Rule kind", ["Body", "Header", "Template"], kind),
         name: controls.entry_of(concat(tag, "name"), "Variable", name),
         source: controls.entry_of(concat(tag, "source"), source_label(kind), source),
         secret: controls.check_box_of(
@@ -350,7 +350,7 @@ fn rules_of(t: RuleTable) -> [Extraction] {
 // value is a trap -- a user who picked Basic by mistake could not undo it without editing the file
 // by hand.
 struct AuthEditors {
-    kind: controls.Menu
+    kind: controls.ComboBox
     user: controls.Entry
     secret: controls.Entry
 }
@@ -377,7 +377,7 @@ fn auth_editors(a: Option<saved.SavedAuth>) -> AuthEditors {
         }
     }
     return AuthEditors {
-        kind: controls.choice_of("auth-kind", "Authorization", ["None", "Basic", "Bearer"], chosen),
+        kind: controls.combo_box_of("auth-kind", "Authorization", ["None", "Basic", "Bearer"], chosen),
         user: controls.entry_of("auth-user", "Username", user),
         // **`password_of`, so it is bullets on the screen and bullets on the accessibility bus.**
         // A Basic password and a Bearer token are both secrets, and this window is the reason
@@ -417,7 +417,7 @@ pub struct State {
     // Narrows the sidebar by path. A `lib/ui` entry and nothing more -- the whole feature is
     // `sidebar_of` taking a query.
     filter: controls.Entry
-    method: controls.Entry
+    method: controls.ComboBox
     url: controls.Entry
     headers: PairTable
     query: PairTable
@@ -435,7 +435,7 @@ pub struct State {
     // The environment to resolve `{{variables}}` against, picked from the ones on disk. The first
     // item is "(global)", which is the absence of an environment rather than one named that -- a
     // picker with no way back to "none" is a trap, and `merged_variables` takes an `Option`.
-    env: controls.Menu
+    env: controls.ComboBox
     send: controls.Button
     save: controls.Button
     save_as: controls.Button
@@ -678,7 +678,7 @@ pub fn opening_state(loaded: [Loaded], scopes: [string]) -> State {
         loaded: loaded,
         sidebar: sidebar,
         filter: controls.entry_of("filter", "Filter requests", ""),
-        method: controls.entry_of("method", "Method", "GET"),
+        method: method_choice("GET"),
         url: controls.entry_of("url", "URL", ""),
         headers: pair_table("header", "Header", "+ header", []),
         query: pair_table("query", "Query", "+ parameter", []),
@@ -688,7 +688,7 @@ pub fn opening_state(loaded: [Loaded], scopes: [string]) -> State {
             tab_width: tab_width
         },
         body: controls.text_area_of("body", "Body", "", body_rows),
-        env: controls.choice_of("env", "Environment", scopes, 0),
+        env: controls.combo_box_of("env", "Environment", scopes, 0),
         send: controls.button_of("send", "Send"),
         save: controls.button_of("save", "Save"),
         save_as: controls.button_of("save-as", "Save As"),
@@ -1170,13 +1170,13 @@ fn rules_input(
             return rule_held(t, at, with t.rows[at] { remove: taken.button })
         }
         if name == concat(tag, "kind") || name == concat(tag, "kind/items") {
-            val taken = controls.menu_input(
+            val taken = controls.combo_box_input(
                 t.rows[at].kind,
                 input,
                 bounds_of(laid, concat(tag, "kind")),
                 bounds_of(laid, concat(tag, "kind/items"))
             )
-            return rule_held(t, at, with t.rows[at] { kind: taken.menu })
+            return rule_held(t, at, with t.rows[at] { kind: taken.combo })
         }
         if name == concat(tag, "name") {
             val taken = controls.entry_input(t.rows[at].name, input, bounds_of(laid, name), style, m)
@@ -1253,19 +1253,59 @@ fn is_press(input: controls.Input) -> bool {
 // The dropdown that is open, if one is -- which the frame needs because a popup is drawn in a
 // layer of its own, under the collapsed control, and where that is cannot be known until the tree
 // has been laid out. One at a time, which `dismiss_other_menus` is what makes true.
-pub fn open_menu(s: State) -> Option<controls.Menu> {
+// **The methods the picker offers, and why this is a picker at all (2026-11-15).** The method was
+// a `controls.Entry` -- a free-text box holding "GET" -- so a typo built a request the server
+// rejected, and a screen reader announced it as a text field where every other fixed-choice field
+// in this window announces itself as a combo box. `controls.choice_of` is the control for it, and
+// the three fields beside it (the environment, the auth kind, a rule's kind) already used it.
+pub val http_methods = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]
+
+// **A method this list does not know is kept rather than dropped**, which is the one thing a
+// closed picker could get badly wrong here: HTTP allows extension methods, curly's own curl
+// importer writes whatever it parsed, and a saved request holding `PROPFIND` must not quietly
+// become `GET` the moment someone opens it. So the unknown method joins the list as its last item
+// and is the one selected; the list is the standard seven for everything else.
+fn method_choice(current: string) -> controls.ComboBox {
+    var at = 0 - 1
+    var i = 0
+    for one in http_methods {
+        if one == current {
+            at = i
+        }
+        i = i + 1
+    }
+    val items = if at >= 0 { http_methods } else { push(http_methods, current) }
+    val selected = if at >= 0 { at } else { prelude.len(http_methods) }
+    return controls.combo_box_of("method", "Method", items, selected)
+}
+
+// What the picker is set to. **`controls.chosen_value` already answers this** -- it was written
+// for exactly this question and reads the item at the selection -- so this is a thin wrapper for
+// the one case it cannot have an opinion about: an empty selection, which for a method is `GET`.
+pub fn method_text(m: controls.ComboBox) -> string {
+    val chosen = controls.combo_box_value(m)
+    return if chosen == "" { "GET" } else { chosen }
+}
+
+// Whichever picker is open, or none. **`open_menu` until 2026-11-16**, when the pickers stopped
+// being `controls.Menu`: this window has no menus at all, and never did -- every one of its four
+// dropdowns picks a value.
+pub fn open_picker(s: State) -> Option<controls.ComboBox> {
+    if s.method.open {
+        return Option<controls.ComboBox>.Some(s.method)
+    }
     if s.env.open {
-        return Option<controls.Menu>.Some(s.env)
+        return Option<controls.ComboBox>.Some(s.env)
     }
     if s.auth.kind.open {
-        return Option<controls.Menu>.Some(s.auth.kind)
+        return Option<controls.ComboBox>.Some(s.auth.kind)
     }
     for row in s.rules.rows {
         if row.kind.open {
-            return Option<controls.Menu>.Some(row.kind)
+            return Option<controls.ComboBox>.Some(row.kind)
         }
     }
-    return Option<controls.Menu>.None
+    return Option<controls.ComboBox>.None
 }
 
 pub fn kept(s: State) -> Step {
@@ -1380,7 +1420,7 @@ pub fn edited_request_from(s: State, source: saved.SavedRequest) -> saved.SavedR
         source.body
     }
     return with source {
-        method: s.method.editor.text,
+        method: method_text(s.method),
         url: s.url.editor.text,
         headers: pairs_of(s.headers),
         query_params: pairs_of(s.query),
@@ -1497,7 +1537,7 @@ pub fn selected_item(s: State) -> Option<Item> {
 }
 
 pub fn env_name(s: State) -> Option<string> {
-    val chosen = controls.chosen_value(s.env)
+    val chosen = controls.combo_box_value(s.env)
     // "(global)" is the absence of an environment rather than one named that, which is why it is
     // tested here and not stored as an empty item: a picker with no way back to "none" is a trap.
     if len(chosen) == 0 || chosen == global_scope {
@@ -1518,7 +1558,7 @@ pub fn bounds_of(laid: widget.Laid, name: string) -> geom.Rect {
 // Loads a saved request into the editable fields.
 fn show_request(s: State, item: Item) -> State {
     return with s {
-        method: controls.entry_of("method", "Method", item.saved.method),
+        method: method_choice(item.saved.method),
         url: controls.entry_of("url", "URL", item.saved.url),
         headers: pair_table("header", "Header", "+ header", item.saved.headers),
         query: pair_table("query", "Query", "+ parameter", item.saved.query_params),
@@ -1625,9 +1665,6 @@ fn with_focused_entry(s: State, change: fn(controls.Entry) -> controls.Entry) ->
     }
     if name == "filter" {
         return with s { filter: change(s.filter) }
-    }
-    if name == "method" {
-        return with s { method: change(s.method) }
     }
     if name == "url" {
         return with s { url: change(s.url) }
@@ -1818,9 +1855,16 @@ pub fn step(s: State, input: controls.Input, laid: widget.Laid, style: controls.
         }
         return kept(moved_to)
     }
-    if name == "method" {
-        val taken = controls.entry_input(after_click.method, input, bounds_of(laid, "method"), style, m)
-        return kept(with after_click { method: taken.entry })
+    if name == "method" || name == "method/items" {
+        // The popup is a layer of its own, so a click on a row arrives under `method/items` and
+        // its box is asked for separately -- the same pairing the environment picker needs.
+        val taken = controls.combo_box_input(
+            after_click.method,
+            input,
+            bounds_of(laid, "method"),
+            bounds_of(laid, "method/items")
+        )
+        return kept(with after_click { method: taken.combo })
     }
     if name == "url" {
         val taken = controls.entry_input(after_click.url, input, bounds_of(laid, "url"), style, m)
@@ -1833,13 +1877,13 @@ pub fn step(s: State, input: controls.Input, laid: widget.Laid, style: controls.
     if name == "env" || name == "env/items" {
         // The popup is a layer of its own, so its box is asked for separately -- it is not inside
         // the collapsed control and a hit test against that box would miss every item.
-        val taken = controls.menu_input(
+        val taken = controls.combo_box_input(
             after_click.env,
             input,
             bounds_of(laid, "env"),
             bounds_of(laid, "env/items")
         )
-        return kept(with after_click { env: taken.menu })
+        return kept(with after_click { env: taken.combo })
     }
     if name == "save-as" {
         val taken = controls.button_input(after_click.save_as, input, bounds_of(laid, "save-as"))
@@ -1891,13 +1935,13 @@ pub fn step(s: State, input: controls.Input, laid: widget.Laid, style: controls.
         return kept(if in_rules.dropped { with next { focused: "requests" } } else { next })
     }
     if name == "auth-kind" || name == "auth-kind/items" {
-        val taken = controls.menu_input(
+        val taken = controls.combo_box_input(
             after_click.auth.kind,
             input,
             bounds_of(laid, "auth-kind"),
             bounds_of(laid, "auth-kind/items")
         )
-        return kept(with after_click { auth: with after_click.auth { kind: taken.menu } })
+        return kept(with after_click { auth: with after_click.auth { kind: taken.combo } })
     }
     if name == "auth-user" {
         val taken = controls.entry_input(after_click.auth.user, input, bounds_of(laid, name), style, m)

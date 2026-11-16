@@ -285,7 +285,7 @@ fn slot_box(name: string) -> widget.Widget {
         surface: widget.Surface {
             fill: Option<paint.Color>.Some(paint.rgb(0.93, 0.93, 0.96)),
             border: Option<widget.Border>.Some(widget.border_of(paint.rgb(0.6, 0.6, 0.7), 1.0)),
-            corner_radius: 3.0
+            corner: widget.Radius.Points(3.0)
         },
         align: widget.centred(),
         name: "",
@@ -629,6 +629,9 @@ fn own_name(w: widget.Widget) -> string {
         Scroll(it) { it.name }
         Layered(it) { it.name }
         Text(it) { it.name }
+        // A picture is a box with a name, like a drawing: a click on it finds the node that
+        // placed it. Its `alt` is for a screen reader, not for this.
+        Picture(it) { it.name }
         Control(it) { it.name }
         Nothing { "" }
         Flex(_) { "" }
@@ -649,6 +652,7 @@ fn with_name(w: widget.Widget, tag: string) -> widget.Widget {
         Scroll(it) { widget.Widget.Scroll(with it { name: tag }) }
         Layered(it) { widget.Widget.Layered(with it { name: tag }) }
         Text(it) { widget.Widget.Text(with it { name: tag }) }
+        Picture(it) { widget.Widget.Picture(with it { name: tag }) }
         Control(_) { w }
         Nothing { w }
         Flex(_) { w }

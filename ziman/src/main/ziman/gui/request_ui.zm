@@ -35,7 +35,27 @@ val env_width = 200.0
 // where a component's own spacing cannot live: padding is a thing this box has, so the box says
 // it, and the measured height comes out right without anyone computing it.
 val below_editors = 8.0
-val sidebar_width = 280.0
+// **The sidebar's width is where the divider opens, not where it stays.** It was a `fixed_of` and
+// the user could not move it; it is a split pane's starting position now, so this token is the
+// first frame and nothing after it. `pub` for `tab_width`'s reason: the window's state holds the
+// divider and needs the number to start it at.
+pub val sidebar_width = 280.0
+// The least either side of the divider may be squeezed to.
+//
+// **The request pane's minimum is the toolbar's own width, not a round number.** `bar` holds four
+// fixed 90-point controls and four gaps -- 392 points before the URL field gets anything -- so a
+// smaller minimum would let the divider squeeze the URL to nothing while the buttons stayed put,
+// which looks like a broken field rather than a pane that has run out of room. 420 leaves the URL
+// a visible stub at the limit.
+pub val sidebar_min = 120.0
+pub val main_min = 420.0
+// **What the window's chrome takes out of the row before the panes get any**: the gap either side
+// and the two spacings between the three children of `screen`. The split pane is given its extent
+// rather than measuring it -- a position in points cannot be laid out without knowing the room --
+// and this is the number that turns a window width into that extent. Arithmetic over constants,
+// which is where the dialect allows it, and it lives here because it is a fact about this
+// arrangement rather than about the window.
+pub val frame_width = gap * 4.0
 val status_height = 18.0
 val pair_name_width = 220.0
 val pair_remove_width = 28.0
@@ -152,6 +172,14 @@ pub fn pane_switcher(panes: controls.Tabs, style: controls.Style) -> widget.Widg
 // editor most needs: a single struct saying exactly what a screen consumes, from which it can
 // synthesise placeholder values to draw a preview.
 pub struct Screen {
+    // **The divider between the sidebar and the request pane.** The only control here that is not
+    // in one of the two halves it separates -- it *is* the arrangement, which is why a split pane
+    // belongs to a design file in a way a button never does.
+    split: controls.SplitPane
+    // How much room the split has along its row, which the window knows and this layer cannot
+    // measure. See `frame_width`; it is the same idea as the slot height the editors took, and the
+    // same answer: a slot is a widget and its size.
+    split_extent: float
     filter: controls.Entry
     tree: controls.Tree
     method: controls.ComboBox
@@ -179,8 +207,13 @@ pub struct Screen {
 pub fn screen(it: Screen, style: controls.Style, m: widget.Metrics) -> widget.Widget {
     return widget.row_of(gap, [
         widget.fixed_of(gap, 0.0, widget.flex()),
-        widget.fixed_of(sidebar_width, 0.0, sidebar(it.filter, it.tree, style, m)),
-        widget.expand(main_column(it, style, m)),
+        widget.expand(controls.split_pane_widget(
+            it.split,
+            style,
+            it.split_extent,
+            sidebar(it.filter, it.tree, style, m),
+            main_column(it, style, m)
+        )),
         widget.fixed_of(gap, 0.0, widget.flex())
     ])
 }

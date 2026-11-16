@@ -50,7 +50,11 @@ use font
 use fs
 use geom
 use gui/request_ui
+use gui/request_ui.frame_width
+use gui/request_ui.main_min
 use gui/request_ui.mono_label
+use gui/request_ui.sidebar_min
+use gui/request_ui.sidebar_width
 use gui/request_ui.tab_width
 use http
 use icons
@@ -409,6 +413,14 @@ fn auth_value_of(a: AuthEditors) -> Option<saved.SavedAuth> {
 }
 
 pub struct State {
+    // **The divider between the sidebar and the request pane**, which the user can now drag. It
+    // was `widget.fixed_of(sidebar_width, ...)` for sixteen tasks and the first thing anyone tries
+    // on a two-pane window is to move the line between them.
+    split: controls.SplitPane
+    // How wide the window is, in points. **Held here because the view needs it and only the event
+    // loop knows it**: a divider at a position in points cannot be laid out without knowing how
+    // much room the row has, and `view` is handed no bounds. `app.zm` writes it on every resize.
+    window_width: float
     // **What is on disk**, which the filter re-derives the sidebar from on every keystroke. Kept
     // because a filtered sidebar cannot answer what a wider query would show, and re-reading the
     // collections to find out would put the filesystem in the path of a key press.
@@ -457,7 +469,12 @@ pub struct State {
     // The past exchanges, newest first, and the list that picks one. Read when the pane is opened
     // rather than every frame: history is written by sends, and this window knows when it sent.
     past: [HistoryEntry]
-    history: controls.List
+    // **A table, not a list.** It was one line of text per exchange -- a status, a method, a URL
+    // and a time run together with double spaces for columns -- which is a table drawn with
+    // spaces: it cannot be sorted, the columns do not line up once a URL is long, and a reader
+    // heard one undifferentiated sentence per row. Five columns say the same thing in a shape a
+    // user can scan and a reader can read out field by field.
+    history: controls.Table
     // One line under everything: what just happened, or what went wrong.
     status: string
     focused: string
@@ -675,6 +692,13 @@ val extract_editor = 4
 pub fn opening_state(loaded: [Loaded], scopes: [string]) -> State {
     val sidebar = sidebar_of(loaded, "")
     val begin = State {
+        split: with controls.split_pane_of("layout", "Sidebar", widget.Direction.Row, sidebar_width) {
+            first_min: sidebar_min,
+            second_min: main_min
+        },
+        // The window `run` opens, so the first frame is laid out against the width it will have
+        // rather than a width it never has. `app.zm` overwrites it on the first resize either way.
+        window_width: 1100.0,
         loaded: loaded,
         sidebar: sidebar,
         filter: controls.entry_of("filter", "Filter requests", ""),
@@ -696,7 +720,7 @@ pub fn opening_state(loaded: [Loaded], scopes: [string]) -> State {
             tab_width: tab_width
         },
         past: [],
-        history: controls.list_of("history", "History", []),
+        history: history_table([]),
         naming: Option<Naming>.None,
         response: response_entry(""),
         scroll: 0.0,
@@ -1031,12 +1055,17 @@ pub fn view(s: State, style: controls.Style, m: widget.Metrics) -> widget.Widget
                 None { controls.entry_widget(s.response, style, m) }
             }
         }
-        History { controls.list_widget(s.history, style) }
+        History { controls.table_widget(s.history, style) }
     }
     // **The whole arrangement lives in the design file now**, so what is left here is the data it
     // draws itself from: the two slots a conditional picks, the one height a slot cannot know, and
     // the bindings.
     val body = request_ui.screen(request_ui.Screen {
+        split: s.split,
+        // **The window's width less what the frame takes**, which is the one number the design
+        // file cannot work out for itself. `frame_width` is its own token over there, so this is
+        // one subtraction here and no layout arithmetic duplicated.
+        split_extent: s.window_width - frame_width,
         filter: s.filter,
         tree: s.sidebar.tree,
         method: s.method,
@@ -1546,10 +1575,20 @@ pub fn env_name(s: State) -> Option<string> {
     return Option<string>.Some(chosen)
 }
 
+// The box the layout gave the node called `name`.
+//
+// **`widget.node_named`, not `focus.node_of`, and the split pane is what found the difference.**
+// `focus.node_of` walks tab stops only, so it answers `None` for any node that is declared but not
+// focusable -- and the box a split pane's gesture needs is the *pane's*, which is a declared group
+// and deliberately not a tab stop. Asked through `focus`, every press on the divider was tested
+// against a zero-sized rectangle and missed, silently: the focus moved to the divider, the drag
+// reported nothing, and the sidebar did not move. `widget.node_named`'s own comment names this
+// exact failure ("an empty rectangle is a hit test that silently misses"), which is where the fix
+// came from.
 pub fn bounds_of(laid: widget.Laid, name: string) -> geom.Rect {
-    return switch focus.node_of(laid, name) {
+    return switch widget.node_named(laid, name) {
         Some(node) { node.bounds }
-        // A control the layout does not hold cannot have been pressed, and an empty box makes every
+        // A node the layout does not hold cannot have been pressed, and an empty box makes every
         // hit test miss rather than inventing a position.
         None { geom.rect_of(0.0, 0.0, 0.0, 0.0) }
     }
@@ -1969,10 +2008,17 @@ pub fn step(s: State, input: controls.Input, laid: widget.Laid, style: controls.
             open_history: taken.moved && taken.tabs.selected == history_tab
         }
     }
+    if name == "layout/divider" {
+        // **The pane's own box, not the divider's.** A split pane is asked about the room it has
+        // and works out where its divider is from that -- which is why `split_at` exists -- so
+        // handing it the divider's six points would have it drag inside its own handle.
+        val taken = controls.split_pane_input(after_click.split, input, bounds_of(laid, "layout"))
+        return kept(with after_click { split: taken.split })
+    }
     if name == "history" {
-        val taken = controls.list_input(after_click.history, input, bounds_of(laid, "history"))
-        val with_list = with after_click { history: taken.list }
-        val at = taken.list.selected
+        val taken = controls.table_input(after_click.history, input, bounds_of(laid, "history"))
+        val with_list = with after_click { history: taken.table }
+        val at = taken.table.selected
         if (taken.moved || taken.activated) && at >= 0 && at < len(with_list.past) {
             // Showing a past exchange puts it where a fresh one goes, so there is one place a
             // response is read and one way it looks.
@@ -2072,13 +2118,38 @@ pub fn history_text(e: HistoryEntry) -> string {
     return join(separator: "\n", pieces: snapshot(out))
 }
 
+// The columns a past exchange is scanned by.
+//
+// **The status and the time are numbers, so they read from the right** -- which is the whole
+// reason `numeric_column_of` exists rather than an `align` to remember to set. A column of
+// statuses with 404 and 50 left-aligned does not line up where it matters, which is the digit
+// that says which family the code is in.
+fn history_columns() -> [controls.Column] {
+    return [
+        controls.numeric_column_of("Status", 60.0),
+        controls.column_of("Method", 70.0),
+        controls.column_of("URL", 300.0),
+        controls.numeric_column_of("ms", 60.0),
+        controls.column_of("Sent", 180.0)
+    ]
+}
+
 // One row per exchange: what was asked and what came back, which is what a user scans for.
-pub fn history_rows(entries: [HistoryEntry]) -> [string] {
-    val rows = mutable_array_new<string>()
+//
+// **Five cells rather than one line with double spaces in it.** The old shape was a table drawn
+// with spaces -- it could not line up once a URL was long, and a reader heard one sentence per
+// row with no way to hear just the status.
+pub fn history_cells(entries: [HistoryEntry]) -> [[string]] {
+    val rows = mutable_array_new<[string]>()
     for e in entries {
-        push(rows, concat(str(e.status), "  ", e.method, " ", e.url, "   ", e.sent_at))
+        push(rows, [str(e.status), e.method, e.url, str(e.elapsed_ms), e.sent_at])
     }
     return snapshot(rows)
+}
+
+// The history pane's table, over whatever exchanges have been read.
+pub fn history_table(entries: [HistoryEntry]) -> controls.Table {
+    return controls.table_of("history", "History", history_columns(), history_cells(entries))
 }
 
 pub fn response_text(r: ResponseSummary) -> string {

@@ -78,7 +78,7 @@ use gui/state.edited_request
 use gui/state.edited_request_from
 use gui/state.env_name
 use gui/state.global_scope
-use gui/state.history_rows
+use gui/state.history_table
 use gui/state.history_text
 use gui/state.open_picker
 use gui/state.opening_state
@@ -473,7 +473,10 @@ pub fn run(store: Storage) -> Result<unit, string> {
         ((start_height as float) * scale) as int,
         fn(w: window.Window) -> Result<unit, string> {
             var painter = try desktop.painter_of(start_width as float, start_height as float, scale)
-            var st = opened
+            // **The width goes in before the first layout**, not on the first resize: the opening
+            // frame has a split pane in it, and a divider clamped against the wrong extent would
+            // put the sidebar somewhere the user has to drag it back from.
+            var st = with opened { window_width: start_width as float }
             // **An input method is optional and its absence is not an error.** A desktop with no
             // ibus daemon is an ordinary desktop, and a Latin-script user may never notice it is
             // missing; said once in the status line and then left alone, exactly as the
@@ -668,6 +671,11 @@ pub fn run(store: Storage) -> Result<unit, string> {
                         // A resize arrives in pixels and the layout wants points.
                         width_pt = (size.width as float) / scale
                         height_pt = (size.height as float) / scale
+                        // **The state carries the width too**, because the split pane's divider is
+                        // at a position in points and `view` is handed no bounds to clamp it
+                        // against. Written here rather than read in `view` for the reason the laid
+                        // tree is kept: the event loop is the only thing that knows.
+                        st = with st { window_width: width_pt }
                         dirty = true
                     }
                     if Some(input) = desktop.input_of(e, density) {
@@ -704,7 +712,7 @@ pub fn run(store: Storage) -> Result<unit, string> {
                                 Ok(entries) {
                                     st = with st {
                                         past: entries,
-                                        history: controls.list_of("history", "History", history_rows(entries))
+                                        history: history_table(entries)
                                     }
                                 }
                                 Err(why) { st = with st { status: concat("history: ", why) } }

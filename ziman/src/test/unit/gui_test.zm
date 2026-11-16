@@ -190,7 +190,7 @@ fn browsing_history() -> State {
     ]
     val showing = with opened() {
         past: entries,
-        history: controls.list_of("history", "History", state.history_rows(entries)),
+        history: state.history_table(entries),
         // **Focused on the list, because a key goes where the focus is.** Without this the Down
         // below is routed to the request tree and both tests pass for the wrong reason.
         focused: "history"
@@ -200,7 +200,7 @@ fn browsing_history() -> State {
 
 // **Moving in the history list loads the exchange; only Enter leaves the list.** Switching the
 // pane on a move threw a keyboard user out of the list on their first Down, which made history
-// unreachable without a mouse. `controls.list_input` reports `moved` for an arrow key *and* for a
+// unreachable without a mouse. `controls.table_input` reports `moved` for an arrow key *and* for a
 // mouse press, so the two cannot be told apart by the kind of input.
 #[test]
 fn arrowing_the_history_list_does_not_leave_it() {
@@ -209,6 +209,20 @@ fn arrowing_the_history_list_does_not_leave_it() {
     // It still loaded what it landed on, which is the half that must not be lost in fixing the
     // other one.
     test.assert(contains(moved.state.response.editor.text, "second"))
+}
+
+// **The history pane is a table, and its cells are the fields rather than one run-together
+// line.** The old shape put a status, a method, a URL and a time in one string with double spaces
+// standing in for columns, so this is what says that is gone: five cells, and the status on its
+// own.
+#[test]
+fn a_history_row_is_cells_and_not_a_sentence() {
+    val h = browsing_history().history
+    test.assert_len(5, h.columns)
+    test.assert_eq(controls.cell_at(h, 0, 1), "GET")
+    test.assert_eq(controls.cell_at(h, 0, 2), "http://a.test/one")
+    // A reader hears them as fields, in the columns' order.
+    test.assert(contains(controls.row_label(h, 0), "GET, http://a.test/one"))
 }
 
 // Enter is what leaves the list, and it shows the exchange the user was on.
@@ -322,6 +336,43 @@ fn a_reload_keeps_the_shape_by_path_and_not_by_index() {
     test.assert_eq(kept.key_of[4], "demo/local/")
     test.assert_false(kept.tree.rows[4].expanded)
     test.assert_eq(kept.key_of[kept.tree.selected], collapsed.key_of[collapsed.tree.selected])
+}
+
+// ---- the divider between the panes
+
+// **The sidebar is draggable, which it was not for sixteen tasks.** It was
+// `widget.fixed_of(sidebar_width, ...)`; it is a split pane now, and this is the only test that
+// says the two halves of it are wired together -- `lib/ui` has its own tests for the arithmetic,
+// and what this one proves is that the drag reaches the window's state and the window lays itself
+// out from it.
+#[test]
+fn dragging_the_divider_resizes_the_sidebar() {
+    val s = opened()
+    val before = state.bounds_of(laid_of(s), "requests").width
+    val box = state.bounds_of(laid_of(s), "layout/divider")
+    // Pressed three points into the divider, so the grab offset is not zero -- see
+    // `controls_test.zm`, where pressing exactly on an edge is what makes a jumping divider pass.
+    val held = pressed(s, "layout/divider", 3.0, 100.0)
+    val dragged = acted(held.state, controls.Input.Move(geom.point_of(box.x + 103.0, 100.0)))
+    test.assert_eq(state.bounds_of(laid_of(dragged.state), "requests").width, before + 100.0)
+    // And the request pane gave up exactly what the sidebar took.
+    test.assert_eq(
+        state.bounds_of(laid_of(dragged.state), "url").x,
+        state.bounds_of(laid_of(s), "url").x + 100.0
+    )
+}
+
+// **The divider stops rather than squeezing the toolbar to nothing.** `main_min` is the bar's own
+// width, so a drag to the right edge of the window leaves the URL field a stub instead of a
+// negative box -- which is the one failure mode a minimum exists for.
+#[test]
+fn the_divider_stops_before_the_toolbar_runs_out_of_room() {
+    val s = opened()
+    val held = pressed(s, "layout/divider", 3.0, 100.0)
+    val shoved = acted(held.state, controls.Input.Move(geom.point_of(2000.0, 100.0)))
+    val url = state.bounds_of(laid_of(shoved.state), "url")
+    test.assert(url.width > 0.0)
+    test.assert(state.bounds_of(laid_of(shoved.state), "requests").width > 0.0)
 }
 
 // ---- the keyboard

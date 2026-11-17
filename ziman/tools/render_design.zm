@@ -11,6 +11,7 @@ use font
 use fs
 use geom
 use image
+use looknfeel
 use os
 use paint
 use raster
@@ -989,7 +990,7 @@ fn main() {
             return
         }
     }
-    val style = controls.default_style()
+    val style = looknfeel.plain()
     val all = read_design.components_of(text)
     val known = read_design.constants_of(text)
     val records = read_design.records_of(text)

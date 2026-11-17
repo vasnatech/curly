@@ -16,6 +16,7 @@ use font
 use fs
 use geom
 use image
+use looknfeel
 use os
 use paint
 use raster
@@ -165,7 +166,7 @@ fn check_component(
     m: widget.Metrics
 ) -> int {
     var bad = 0
-    val shop = render_design.shop_of(known, all, records, controls.default_style(), m)
+    val shop = render_design.shop_of(known, all, records, looknfeel.plain(), m)
     val drawn = render_design.render(c, [], shop)
     val spots = snapshot(shop.spots)
     val laid = widget.layout(render_design.widget_of(drawn), canvas, m)
@@ -481,7 +482,7 @@ fn set(path: string, wanted: string, p: geom.Point, replacement: string) {
         read_design.constants_of(text),
         all,
         read_design.records_of(text),
-        controls.default_style(),
+        looknfeel.plain(),
         m
     )
     val drawn = render_design.render(c, [], shop)
@@ -550,7 +551,7 @@ fn draw(face: font.FontRef, path: string, wanted: string, p: geom.Point, out_pat
         read_design.constants_of(text),
         all,
         read_design.records_of(text),
-        controls.default_style(),
+        looknfeel.plain(),
         m
     )
     val drawn = render_design.render(c, [], shop)
@@ -656,7 +657,7 @@ fn main() {
         read_design.constants_of(text),
         all,
         read_design.records_of(text),
-        controls.default_style(),
+        looknfeel.plain(),
         m
     )
     val drawn = render_design.render(c, [], shop)

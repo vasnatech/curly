@@ -71,6 +71,11 @@ pub struct State {
     counts: [render_design.Count]
     status: string
     focused: string
+    // What the last press went to, until the release. **A move during a drag belongs to the
+    // control that took the press**, not to whatever has the keyboard -- a scroll bar and a split
+    // pane's divider are never the focus, so without this they could be grabbed and not dragged.
+    // See `controls.pressed_after`.
+    pressed: string
 }
 
 // What a builder can put on a canvas, as source.
@@ -244,7 +249,8 @@ pub fn state_of(path: string, text: string) -> State {
         before: Option<string>.None,
         counts: [],
         status: format("{} component(s)", str(len(all))),
-        focused: "parts"
+        focused: "parts",
+        pressed: ""
     }
 }
 
@@ -1147,8 +1153,11 @@ pub fn step(
         Some(at) { focus.clicked(laid, at, s.focused) }
         None { s.focused }
     }
-    val here = with s { focused: focused_now }
-    val name = controls.target(laid, input, focused_now)
+    val name = controls.target(laid, input, focused_now, s.pressed)
+    val here = with s {
+        focused: focused_now,
+        pressed: controls.pressed_after(s.pressed, input, name)
+    }
     if name == "parts" {
         val taken = controls.list_input(here.parts, input, bounds_of(laid, "parts"))
         val moved = with here { parts: taken.list }

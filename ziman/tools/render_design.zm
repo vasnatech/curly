@@ -287,6 +287,9 @@ fn slot_box(name: string) -> widget.Widget {
             fill: Option<paint.Color>.Some(paint.rgb(0.93, 0.93, 0.96)),
             border: Option<widget.Border>.Some(widget.border_of(paint.rgb(0.6, 0.6, 0.7), 1.0)),
             corner: widget.Radius.Points(3.0),
+            // All four, as every box here is: `widget.Corners` exists for a tab, which rounds
+            // only where it does not meet the page.
+            corners: widget.Corners.All,
             // A slot's placeholder is flat: it marks where a widget will go, and a shadow would
             // say it was in front of the screen it is a hole in.
             shadow: Option<widget.Shadow>.None

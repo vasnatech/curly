@@ -478,6 +478,11 @@ pub struct State {
     // One line under everything: what just happened, or what went wrong.
     status: string
     focused: string
+    // What the last press went to, until the release. **A move during a drag belongs to the
+    // control that took the press**, not to whatever has the keyboard -- a scroll bar and a split
+    // pane's divider are never the focus, so without this they could be grabbed and not dragged.
+    // See `controls.pressed_after`.
+    pressed: string
     // The desktop's icons, read once when the window opens.
     icons: Icons
     // The response body as a picture, when it is one. The text pane shows it otherwise.
@@ -726,6 +731,7 @@ pub fn opening_state(loaded: [Loaded], scopes: [string]) -> State {
         scroll: 0.0,
         status: concat(str(len(sidebar.items)), " request(s) loaded"),
         focused: "requests",
+        pressed: "",
         icons: no_icons(),
         preview: Option<Preview>.None
     }
@@ -1634,7 +1640,7 @@ fn naming_step(
     if controls.DialogAnswer.is_Confirm(answer) {
         return Step { state: s, send: false, save: false, save_as: true, open_history: false }
     }
-    val name = controls.target(laid, input, s.focused)
+    val name = controls.target(laid, input, s.focused, s.pressed)
     if name == "save-collection" {
         val taken = controls.entry_input(n.collection, input, bounds_of(laid, name), style, m)
         return kept(with s { naming: Option<Naming>.Some(with n { collection: taken.entry }) })
@@ -1854,8 +1860,11 @@ pub fn step(s: State, input: controls.Input, laid: widget.Laid, style: controls.
         Text(_) { s.focused }
         Paste(_) { s.focused }
     }
-    val name = controls.target(laid, input, focused_now)
-    val after_click = with dismiss_other_menus(s, name, input) { focused: focused_now }
+    val name = controls.target(laid, input, focused_now, s.pressed)
+    val after_click = with dismiss_other_menus(s, name, input) {
+        focused: focused_now,
+        pressed: controls.pressed_after(s.pressed, input, name)
+    }
     if name == "filter" {
         val taken = controls.entry_input(after_click.filter, input, bounds_of(laid, name), style, m)
         val typed = with after_click { filter: taken.entry }

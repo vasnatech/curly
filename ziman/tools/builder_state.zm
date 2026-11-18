@@ -31,8 +31,6 @@ val panel_width = 250.0
 val inspector_width = 380.0
 val gap = 8.0
 val row_height = 30.0
-val heading_size = 13.0
-val small_size = 11.0
 val source_rows = 6
 
 pub struct State {
@@ -305,11 +303,11 @@ pub fn canvas_of(s: State, style: controls.Style, m: widget.Metrics) -> Canvas {
 // ------------------------------------------------- the window
 
 fn heading(text: string, style: controls.Style) -> widget.Widget {
-    return widget.fixed_of(0.0, 18.0, widget.label_of(text, heading_size, style.ink))
+    return widget.fixed_of(0.0, 18.0, widget.label_of(text, style.text.heading.size, style.ink))
 }
 
 fn note(text: string, style: controls.Style) -> widget.Widget {
-    return widget.fixed_of(0.0, 16.0, widget.label_of(text, small_size, style.ink))
+    return widget.fixed_of(0.0, 16.0, widget.label_of(text, style.text.caption.size, style.ink))
 }
 
 // What the inspector says about the selection, which is the whole of what a builder knows about

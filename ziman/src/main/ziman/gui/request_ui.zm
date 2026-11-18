@@ -23,11 +23,9 @@ use widget
 // table flat enough for a tool to resolve without evaluating anything.
 val gap = 8.0
 val heading_height = 18.0
-val heading_size = 12.0
 val field_width = 90.0
 val row_height = 30.0
 val editor_gap = 4.0
-val small_size = 11.0
 val env_label_width = 110.0
 val env_width = 200.0
 // **The breathing room under the editors block, said here rather than added to its height by the
@@ -103,7 +101,7 @@ pub fn sidebar(
 ) -> widget.Widget {
     return widget.column_of(gap, [
         widget.fixed_of(0.0, gap, widget.flex()),
-        widget.fixed_of(0.0, heading_height, mono_label("Requests", heading_size, style)),
+        widget.fixed_of(0.0, heading_height, mono_label("Requests", style.text.heading.size, style)),
         widget.fixed_of(0.0, row_height, controls.entry_widget(filter, style, m)),
         widget.expand(controls.tree_widget(tree, style))
     ])
@@ -148,7 +146,7 @@ pub fn editors(
         ])),
         body,
         widget.fixed_of(0.0, row_height, widget.row_of(gap, [
-            widget.fixed_of(env_label_width, 0.0, mono_label("Environment", small_size, style)),
+            widget.fixed_of(env_label_width, 0.0, mono_label("Environment", style.text.caption.size, style)),
             widget.fixed_of(env_width, 0.0, controls.combo_box_widget(env, style)),
             widget.expand(widget.flex())
         ]))
@@ -227,7 +225,7 @@ pub fn main_column(it: Screen, style: controls.Style, m: widget.Metrics) -> widg
         editors(it.editors, it.editor, it.env, style, m),
         pane_switcher(it.panes, style),
         widget.expand(it.lower),
-        widget.fixed_of(0.0, status_height, mono_label(it.status, small_size, style)),
+        widget.fixed_of(0.0, status_height, mono_label(it.status, style.text.caption.size, style)),
         widget.fixed_of(0.0, gap, widget.flex())
     ])
 }
@@ -279,7 +277,7 @@ pub fn field_row(
     m: widget.Metrics
 ) -> widget.Widget {
     return widget.fixed_of(0.0, row_height, widget.row_of(gap, [
-        widget.fixed_of(auth_label_width, 0.0, mono_label(label, small_size, style)),
+        widget.fixed_of(auth_label_width, 0.0, mono_label(label, style.text.caption.size, style)),
         widget.expand(controls.entry_widget(field, style, m))
     ]))
 }
@@ -287,7 +285,7 @@ pub fn field_row(
 // A labelled row holding a picker, which takes its own width rather than the line's.
 pub fn picker_row(label: string, picker: controls.ComboBox, style: controls.Style) -> widget.Widget {
     return widget.fixed_of(0.0, row_height, widget.row_of(gap, [
-        widget.fixed_of(auth_label_width, 0.0, mono_label(label, small_size, style)),
+        widget.fixed_of(auth_label_width, 0.0, mono_label(label, style.text.caption.size, style)),
         widget.fixed_of(auth_picker_width, 0.0, controls.combo_box_widget(picker, style)),
         widget.expand(widget.flex())
     ]))
@@ -325,7 +323,7 @@ pub fn rule_row(
     return widget.fixed_of(0.0, row_height, widget.row_of(gap, [
         widget.fixed_of(rule_kind_width, 0.0, controls.combo_box_widget(kind, style)),
         widget.fixed_of(rule_name_width, 0.0, controls.entry_widget(name, style, m)),
-        widget.fixed_of(rule_said_width, 0.0, mono_label(said, small_size, style)),
+        widget.fixed_of(rule_said_width, 0.0, mono_label(said, style.text.caption.size, style)),
         widget.expand(controls.entry_widget(source, style, m)),
         widget.fixed_of(rule_secret_width, 0.0, controls.check_box_widget(secret, style, m)),
         widget.fixed_of(pair_remove_width, 0.0, controls.button_widget(remove, style))
@@ -341,13 +339,13 @@ pub fn dialog_field_row(
     m: widget.Metrics
 ) -> widget.Widget {
     return widget.fixed_of(0.0, row_height, widget.row_of(gap, [
-        widget.fixed_of(dialog_label_width, 0.0, mono_label(label, small_size, style)),
+        widget.fixed_of(dialog_label_width, 0.0, mono_label(label, style.text.caption.size, style)),
         widget.fixed_of(dialog_field_width, 0.0, controls.entry_widget(field, style, m))
     ]))
 }
 
 pub fn dialog_error_row(said: string, style: controls.Style) -> widget.Widget {
-    return widget.fixed_of(0.0, dialog_error_height, mono_label(said, small_size, style))
+    return widget.fixed_of(0.0, dialog_error_height, mono_label(said, style.text.caption.size, style))
 }
 
 pub fn dialog_buttons(

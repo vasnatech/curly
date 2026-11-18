@@ -26,10 +26,10 @@ use gui/state.opening_state
 use gui/state.sidebar_of
 use http
 use image
-use looknfeel
 use paint
 use shape
 use test
+use theme
 use uuid.uuid_new
 use widget
 
@@ -41,7 +41,7 @@ fn metrics() -> widget.Metrics {
 }
 
 fn style() -> controls.Style {
-    return with looknfeel.plain() { collapsed_mark: ">", expanded_mark: "v" }
+    return with theme.plain() { collapsed_mark: ">", expanded_mark: "v" }
 }
 
 val window_box = geom.rect_of(0.0, 0.0, 1100.0, 700.0)

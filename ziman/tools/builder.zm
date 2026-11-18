@@ -17,12 +17,12 @@ use desktop
 use font
 use fs
 use geom
-use looknfeel
 use os
 use paint
 use raster
 use scene
 use shape
+use theme
 use tools/builder_state
 use tools/builder_state.Shown
 use tools/builder_state.State
@@ -127,7 +127,7 @@ fn painted(
 pub fn run(path: string) -> Result<unit, string> {
     val f = try load_font()
     val m = try widget.metrics_for(f)
-    val style = with looknfeel.plain() { collapsed_mark: ">", expanded_mark: "v" }
+    val style = with theme.plain() { collapsed_mark: ">", expanded_mark: "v" }
     val opened = try builder_state.load(path)
     val density = chosen_density().density
     val scale = density.px_per_pt

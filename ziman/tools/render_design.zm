@@ -11,10 +11,10 @@ use font
 use fs
 use geom
 use image
-use looknfeel
 use os
 use paint
 use raster
+use theme
 use tools/read_design
 use tools/read_design.Component
 use tools/read_design.Constant
@@ -993,7 +993,7 @@ fn main() {
             return
         }
     }
-    val style = looknfeel.plain()
+    val style = theme.plain()
     val all = read_design.components_of(text)
     val known = read_design.constants_of(text)
     val records = read_design.records_of(text)

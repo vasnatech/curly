@@ -91,11 +91,11 @@ use gui/state.sidebar_of
 use gui/state.step
 use gui/state.view
 use ibus
-use looknfeel
 use os
 use paint
 use raster
 use scene
+use theme
 use uuid
 use widget
 use window
@@ -431,7 +431,7 @@ pub fn run(store: Storage) -> Result<unit, string> {
     // then fixed by substituting `.notdef`. With that fix the triangles would draw as Caladea's
     // own `.notdef`, which has no outline, so every folder would look identical and nothing would
     // say which was open. That the field exists in `Style` is why this is two lines.
-    val style = with looknfeel.plain() { collapsed_mark: ">", expanded_mark: "v" }
+    val style = with theme.plain() { collapsed_mark: ">", expanded_mark: "v" }
     val loaded = try load_sidebar(store)
     // The environments on disk, with the absence of one first. Read once: a window that re-read
     // them every frame would be asking the filesystem sixty times a second for an answer that

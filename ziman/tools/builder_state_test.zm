@@ -11,8 +11,8 @@
 use controls
 use focus
 use geom
-use looknfeel
 use test
+use theme
 use tools/builder_state
 use tools/builder_state.Shown
 use tools/read_design
@@ -27,7 +27,7 @@ fn metrics() -> widget.Metrics {
 }
 
 fn style() -> controls.Style {
-    return looknfeel.plain()
+    return theme.plain()
 }
 
 val window_box = geom.rect_of(0.0, 0.0, 1400.0, 900.0)

@@ -790,7 +790,7 @@ pub fn sidebar_of(found: [Loaded], query: string) -> Sidebar {
             drop_last_text(key_of)
         }
     }
-    val tree = with controls.tree_of("requests", "Saved requests", snapshot(rows)) { row_height: 20.0 }
+    val tree = controls.tree_of("requests", "Saved requests", snapshot(rows))
     return Sidebar {
         tree: tree,
         items: snapshot(items),
@@ -1061,7 +1061,7 @@ pub fn view(s: State, style: controls.Style, m: widget.Metrics) -> widget.Widget
                 None { controls.entry_widget(s.response, style, m) }
             }
         }
-        History { controls.table_widget(s.history, style) }
+        History { controls.table_widget(s.history, style, m) }
     }
     // **The whole arrangement lives in the design file now**, so what is left here is the data it
     // draws itself from: the two slots a conditional picks, the one height a slot cannot know, and
@@ -1211,6 +1211,8 @@ fn rules_input(
                 style,
                 bounds_of(laid, concat(tag, "kind")),
                 bounds_of(laid, concat(tag, "kind/items"))
+                ,
+                m
             )
             return rule_held(t, at, with t.rows[at] { kind: taken.combo })
         }
@@ -1886,7 +1888,7 @@ pub fn step(s: State, input: controls.Input, laid: widget.Laid, style: controls.
         })
     }
     if name == "requests" {
-        val taken = controls.tree_input(after_click.sidebar.tree, input, style, bounds_of(laid, "requests"))
+        val taken = controls.tree_input(after_click.sidebar.tree, input, style, bounds_of(laid, "requests"), m)
         val moved_to = with after_click { sidebar: with after_click.sidebar { tree: taken.tree } }
         // **A moved selection loads the request, not only an activated one.** `TreeStep` keeps
         // the two apart on purpose -- selecting and opening are different intentions -- but for a
@@ -1913,6 +1915,8 @@ pub fn step(s: State, input: controls.Input, laid: widget.Laid, style: controls.
             style,
             bounds_of(laid, "method"),
             bounds_of(laid, "method/items")
+            ,
+            m
         )
         return kept(with after_click { method: taken.combo })
     }
@@ -1933,6 +1937,8 @@ pub fn step(s: State, input: controls.Input, laid: widget.Laid, style: controls.
             style,
             bounds_of(laid, "env"),
             bounds_of(laid, "env/items")
+            ,
+            m
         )
         return kept(with after_click { env: taken.combo })
     }
@@ -1992,6 +1998,8 @@ pub fn step(s: State, input: controls.Input, laid: widget.Laid, style: controls.
             style,
             bounds_of(laid, "auth-kind"),
             bounds_of(laid, "auth-kind/items")
+            ,
+            m
         )
         return kept(with after_click { auth: with after_click.auth { kind: taken.combo } })
     }
@@ -2029,7 +2037,7 @@ pub fn step(s: State, input: controls.Input, laid: widget.Laid, style: controls.
         return kept(with after_click { split: taken.split })
     }
     if name == "history" {
-        val taken = controls.table_input(after_click.history, input, style, bounds_of(laid, "history"))
+        val taken = controls.table_input(after_click.history, input, style, bounds_of(laid, "history"), m)
         val with_list = with after_click { history: taken.table }
         val at = taken.table.selected
         if (taken.moved || taken.activated) && at >= 0 && at < len(with_list.past) {

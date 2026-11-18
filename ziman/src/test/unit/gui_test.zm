@@ -308,7 +308,8 @@ fn a_reload_keeps_the_shape_by_path_and_not_by_index() {
         with before.tree { selected: 4 },
         controls.Input.Press(geom.point_of(24.0, 70.0)),
         style(),
-        geom.rect_of(0.0, 0.0, 280.0, 400.0)
+        geom.rect_of(0.0, 0.0, 280.0, 400.0),
+        metrics()
     )
     val collapsed = with before { tree: shut.tree }
     test.assert_false(collapsed.tree.rows[3].expanded)

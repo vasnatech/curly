@@ -485,7 +485,7 @@ fn call(name: string, args: [Value], style: controls.Style, m: widget.Metrics) -
     }
     if name == "controls.tree_widget" {
         return switch args[0] {
-            R(t) { Value.W(controls.tree_widget(t, style)) }
+            R(t) { Value.W(controls.tree_widget(t, style, m)) }
             W(_) { Value.None }
             F(_) { Value.None }
             S(_) { Value.None }

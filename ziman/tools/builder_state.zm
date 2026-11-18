@@ -419,7 +419,7 @@ pub fn view(s: State, style: controls.Style, m: widget.Metrics) -> widget.Widget
     return widget.row_of(gap, [
         widget.fixed_of(panel_width, 0.0, widget.column_of(gap, [
             heading("Components", style),
-            widget.expand(controls.list_widget(s.parts, style))
+            widget.expand(controls.list_widget(s.parts, style, m))
         ])),
         // **A `flex` and not a box of its own.** The canvas is where the design is painted, and
         // the design is a separate tree: this reserves the room and names it, and nothing inside
@@ -452,7 +452,8 @@ pub fn view(s: State, style: controls.Style, m: widget.Metrics) -> widget.Widget
             heading("Add", style),
             widget.fixed_of(0.0, (len(palette_items()) as float) * row_height, controls.list_widget(
                 s.palette,
-                style
+                style,
+                m
             )),
             widget.fixed_of(0.0, row_height, widget.row_of(gap, [
                 controls.button_widget(s.insert, style),
@@ -468,7 +469,7 @@ pub fn view(s: State, style: controls.Style, m: widget.Metrics) -> widget.Widget
                 controls.button_widget(s.more, style),
                 widget.expand(note(items_line(s), style))
             ])),
-            widget.expand(controls.list_widget(s.inputs, style)),
+            widget.expand(controls.list_widget(s.inputs, style, m)),
             note(s.status, style)
         ]))
     ])
@@ -1157,7 +1158,7 @@ pub fn step(
         pressed: controls.pressed_after(s.pressed, input, name)
     }
     if name == "parts" {
-        val taken = controls.list_input(here.parts, input, style, bounds_of(laid, "parts"))
+        val taken = controls.list_input(here.parts, input, style, bounds_of(laid, "parts"), m)
         val moved = with here { parts: taken.list }
         if !taken.moved && !taken.activated {
             return kept(moved)
@@ -1178,7 +1179,7 @@ pub fn step(
         })
     }
     if name == "palette" {
-        val taken = controls.list_input(here.palette, input, style, bounds_of(laid, "palette"))
+        val taken = controls.list_input(here.palette, input, style, bounds_of(laid, "palette"), m)
         return kept(with here { palette: taken.list })
     }
     if name == "insert" {
@@ -1232,7 +1233,7 @@ pub fn step(
         return kept(pressed)
     }
     if name == "inputs" {
-        val taken = controls.list_input(here.inputs, input, style, bounds_of(laid, "inputs"))
+        val taken = controls.list_input(here.inputs, input, style, bounds_of(laid, "inputs"), m)
         return kept(with here { inputs: taken.list })
     }
     if name == "source" {

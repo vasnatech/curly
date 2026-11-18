@@ -103,7 +103,7 @@ pub fn sidebar(
         widget.fixed_of(0.0, gap, widget.flex()),
         widget.fixed_of(0.0, heading_height, mono_label("Requests", style.text.heading.size, style)),
         widget.fixed_of(0.0, row_height, controls.entry_widget(filter, style, m)),
-        widget.expand(controls.tree_widget(tree, style))
+        widget.expand(controls.tree_widget(tree, style, m))
     ])
 }
 

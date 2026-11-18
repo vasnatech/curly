@@ -533,14 +533,15 @@ pub fn run(store: Storage) -> Result<unit, string> {
                     laid = switch open_picker(st) {
                         Some(menu) {
                             val at = bounds_of(first, menu.name)
-                            val rows = (len(menu.items.items) as float) * menu.items.row_height
+                            val rows = (len(menu.items.items) as float) * controls.row_height(m, style)
                             widget.layout(
                                 widget.layered_of([
                                     widget.base_layer(base),
                                     controls.combo_box_popup_layer(
                                         menu,
                                         style,
-                                        geom.rect_of(at.x, at.y + at.height, at.width, rows)
+                                        geom.rect_of(at.x, at.y + at.height, at.width, rows),
+                                        m
                                     )
                                 ]),
                                 whole,

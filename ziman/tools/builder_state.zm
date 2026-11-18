@@ -1159,7 +1159,7 @@ pub fn step(
         pressed: controls.pressed_after(s.pressed, input, name)
     }
     if name == "parts" {
-        val taken = controls.list_input(here.parts, input, bounds_of(laid, "parts"))
+        val taken = controls.list_input(here.parts, input, style, bounds_of(laid, "parts"))
         val moved = with here { parts: taken.list }
         if !taken.moved && !taken.activated {
             return kept(moved)
@@ -1180,7 +1180,7 @@ pub fn step(
         })
     }
     if name == "palette" {
-        val taken = controls.list_input(here.palette, input, bounds_of(laid, "palette"))
+        val taken = controls.list_input(here.palette, input, style, bounds_of(laid, "palette"))
         return kept(with here { palette: taken.list })
     }
     if name == "insert" {
@@ -1234,7 +1234,7 @@ pub fn step(
         return kept(pressed)
     }
     if name == "inputs" {
-        val taken = controls.list_input(here.inputs, input, bounds_of(laid, "inputs"))
+        val taken = controls.list_input(here.inputs, input, style, bounds_of(laid, "inputs"))
         return kept(with here { inputs: taken.list })
     }
     if name == "source" {

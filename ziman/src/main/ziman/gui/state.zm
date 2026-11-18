@@ -1208,6 +1208,7 @@ fn rules_input(
             val taken = controls.combo_box_input(
                 t.rows[at].kind,
                 input,
+                style,
                 bounds_of(laid, concat(tag, "kind")),
                 bounds_of(laid, concat(tag, "kind/items"))
             )
@@ -1885,7 +1886,7 @@ pub fn step(s: State, input: controls.Input, laid: widget.Laid, style: controls.
         })
     }
     if name == "requests" {
-        val taken = controls.tree_input(after_click.sidebar.tree, input, bounds_of(laid, "requests"))
+        val taken = controls.tree_input(after_click.sidebar.tree, input, style, bounds_of(laid, "requests"))
         val moved_to = with after_click { sidebar: with after_click.sidebar { tree: taken.tree } }
         // **A moved selection loads the request, not only an activated one.** `TreeStep` keeps
         // the two apart on purpose -- selecting and opening are different intentions -- but for a
@@ -1909,6 +1910,7 @@ pub fn step(s: State, input: controls.Input, laid: widget.Laid, style: controls.
         val taken = controls.combo_box_input(
             after_click.method,
             input,
+            style,
             bounds_of(laid, "method"),
             bounds_of(laid, "method/items")
         )
@@ -1928,6 +1930,7 @@ pub fn step(s: State, input: controls.Input, laid: widget.Laid, style: controls.
         val taken = controls.combo_box_input(
             after_click.env,
             input,
+            style,
             bounds_of(laid, "env"),
             bounds_of(laid, "env/items")
         )
@@ -1986,6 +1989,7 @@ pub fn step(s: State, input: controls.Input, laid: widget.Laid, style: controls.
         val taken = controls.combo_box_input(
             after_click.auth.kind,
             input,
+            style,
             bounds_of(laid, "auth-kind"),
             bounds_of(laid, "auth-kind/items")
         )
@@ -2021,11 +2025,11 @@ pub fn step(s: State, input: controls.Input, laid: widget.Laid, style: controls.
         // **The pane's own box, not the divider's.** A split pane is asked about the room it has
         // and works out where its divider is from that -- which is why `split_at` exists -- so
         // handing it the divider's six points would have it drag inside its own handle.
-        val taken = controls.split_pane_input(after_click.split, input, bounds_of(laid, "layout"))
+        val taken = controls.split_pane_input(after_click.split, input, style, bounds_of(laid, "layout"))
         return kept(with after_click { split: taken.split })
     }
     if name == "history" {
-        val taken = controls.table_input(after_click.history, input, bounds_of(laid, "history"))
+        val taken = controls.table_input(after_click.history, input, style, bounds_of(laid, "history"))
         val with_list = with after_click { history: taken.table }
         val at = taken.table.selected
         if (taken.moved || taken.activated) && at >= 0 && at < len(with_list.past) {

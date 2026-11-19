@@ -289,7 +289,7 @@ fn slot_box(name: string) -> widget.Widget {
         padding: widget.insets_all(6.0),
         surface: widget.Surface {
             inset: 0.0,
-            fill: Option<paint.Color>.Some(paint.rgb(0.93, 0.93, 0.96)),
+            fill: Option<paint.Paint>.Some(paint.Paint.Solid(paint.rgb(0.93, 0.93, 0.96))),
             border: Option<widget.Border>.Some(widget.border_of(paint.rgb(0.6, 0.6, 0.7), 1.0)),
             corner: widget.Radius.Points(3.0),
             // All four, as every box here is: `widget.Corners` exists for a tab, which rounds

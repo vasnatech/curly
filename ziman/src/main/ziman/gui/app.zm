@@ -447,7 +447,10 @@ pub fn run(store: Storage) -> Result<unit, string> {
     // then fixed by substituting `.notdef`. With that fix the triangles would draw as Caladea's
     // own `.notdef`, which has no outline, so every folder would look identical and nothing would
     // say which was open. That the field exists in `Style` is why this is two lines.
-    val style = with theme.plain() { collapsed_mark: ">", expanded_mark: "v" }
+    // **No mark override any more.** The tree's arrows were strings in `Style` and a face
+    // without those triangles drew `.notdef`, so every application had to replace them with
+    // ASCII; they are drawn paths now and need no font at all.
+    val style = theme.plain()
     // **The frame every control here is drawn in**: the look, this window's measurements, and the
     // names the window holds. `frame_at` fills the names in per frame; the look and the metrics do
     // not change while the window is open. See `controls.Frame` and D19.

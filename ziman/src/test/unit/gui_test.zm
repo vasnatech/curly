@@ -41,7 +41,7 @@ fn metrics() -> widget.Metrics {
 }
 
 fn style() -> controls.Style {
-    return with theme.plain() { collapsed_mark: ">", expanded_mark: "v" }
+    return theme.plain()
 }
 
 // The resting frame these tests draw in.

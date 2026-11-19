@@ -129,7 +129,7 @@ fn painted(
 pub fn run(path: string) -> Result<unit, string> {
     val face = try load_font()
     val m = try widget.metrics_for(face)
-    val style = with theme.plain() { collapsed_mark: ">", expanded_mark: "v" }
+    val style = theme.plain()
     val resting = controls.frame_of(style, m)
     val opened = try builder_state.load(path)
     val density = chosen_density().density

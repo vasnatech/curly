@@ -8,20 +8,20 @@ val tab_width = 100.0
 val tabs = 5.0
 val strip = tab_width * tabs
 
-pub fn with_conditional(b: controls.Button, style: controls.Style) -> widget.Widget {
-    return if b.disabled { widget.flex() } else { controls.button_widget(b, style) }
+pub fn with_conditional(b: controls.Button, f: controls.Frame) -> widget.Widget {
+    return if b.disabled { widget.flex() } else { controls.button_widget(b, f) }
 }
 
-pub fn with_local(b: controls.Button, style: controls.Style) -> widget.Widget {
-    val inner = controls.button_widget(b, style)
+pub fn with_local(b: controls.Button, f: controls.Frame) -> widget.Widget {
+    val inner = controls.button_widget(b, f)
     return inner
 }
 
-pub fn with_arithmetic(b: controls.Button, style: controls.Style) -> widget.Widget {
-    return widget.fixed_of(tab_width * 2.0, 0.0, controls.button_widget(b, style))
+pub fn with_arithmetic(b: controls.Button, f: controls.Frame) -> widget.Widget {
+    return widget.fixed_of(tab_width * 2.0, 0.0, controls.button_widget(b, f))
 }
 
-pub fn with_loop(items: [string], style: controls.Style) -> widget.Widget {
+pub fn with_loop(items: [string], f: controls.Frame) -> widget.Widget {
     for i in items {
         print(i)
     }

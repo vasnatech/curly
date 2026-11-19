@@ -44,6 +44,11 @@ fn style() -> controls.Style {
     return with theme.plain() { collapsed_mark: ">", expanded_mark: "v" }
 }
 
+// The resting frame these tests draw in.
+fn frame() -> controls.Frame {
+    return controls.frame_of(style(), metrics())
+}
+
 val window_box = geom.rect_of(0.0, 0.0, 1100.0, 700.0)
 
 fn request_of(name: string, url: string) -> SavedRequest {
@@ -91,11 +96,11 @@ fn opened() -> State {
 }
 
 fn laid_of(s: State) -> widget.Laid {
-    return widget.layout(state.view(s, style(), metrics()), window_box, metrics())
+    return widget.layout(state.view(s, frame()), window_box, metrics())
 }
 
 fn acted(s: State, input: controls.Input) -> state.Step {
-    return state.step(s, input, laid_of(s), style(), metrics())
+    return state.step(s, input, laid_of(s), frame())
 }
 
 fn pressed(s: State, name: string, dx: float, dy: float) -> state.Step {
@@ -256,8 +261,7 @@ fn a_press_on_the_open_dropdown_leaves_it_open() {
         opened_menu,
         controls.Input.Press(geom.point_of(0.0 - 50.0, 0.0 - 50.0)),
         laid_of(opened_menu),
-        style(),
-        metrics()
+        frame()
     )
     // A press that reaches no control at all must not be read as "somewhere else" either.
     test.assert_false(on_items.state.env.open)
@@ -307,9 +311,8 @@ fn a_reload_keeps_the_shape_by_path_and_not_by_index() {
     val shut = controls.tree_input(
         with before.tree { selected: 4 },
         controls.Input.Press(geom.point_of(24.0, 70.0)),
-        style(),
         geom.rect_of(0.0, 0.0, 280.0, 400.0),
-        metrics()
+        frame()
     )
     val collapsed = with before { tree: shut.tree }
     test.assert_false(collapsed.tree.rows[3].expanded)

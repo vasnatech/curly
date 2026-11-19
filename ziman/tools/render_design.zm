@@ -42,6 +42,7 @@ pub enum Value {
     Col(paint.Color)
     Sty(controls.Style)
     Met(widget.Metrics)
+    Frm(controls.Frame)
     Ins(widget.Insets)
     Srf(widget.Surface)
     Aln(widget.Alignment)
@@ -72,8 +73,9 @@ pub struct Shop {
     known: [Constant]
     all: [Component]
     records: [Record]
-    style: controls.Style
-    m: widget.Metrics
+    // The frame the builder draws in. **One field, because a style and a
+    // metrics kept side by side are two things that can disagree about the same frame.**
+    frame: controls.Frame
     // What the builder could not place, for the tool to report.
     missing: MutableArray<string>
     // What it could, for a click to find. Both are handles, so a `with` that changes `component`
@@ -88,15 +90,13 @@ pub fn shop_of(
     known: [Constant],
     all: [Component],
     records: [Record],
-    style: controls.Style,
-    m: widget.Metrics
+    f: controls.Frame
 ) -> Shop {
     return Shop {
         known: known,
         all: all,
         records: records,
-        style: style,
-        m: m,
+        frame: f,
         missing: mutable_array_new<string>(),
         spots: mutable_array_new<Spot>(),
         component: "",
@@ -119,6 +119,7 @@ pub fn widget_of(v: Value) -> widget.Widget {
         Col(_) { widget.flex() }
         Sty(_) { widget.flex() }
         Met(_) { widget.flex() }
+        Frm(_) { widget.flex() }
         Ins(_) { widget.flex() }
         Srf(_) { widget.flex() }
         Aln(_) { widget.flex() }
@@ -141,6 +142,7 @@ fn float_of(v: Value) -> float {
         Col(_) { 0.0 }
         Sty(_) { 0.0 }
         Met(_) { 0.0 }
+        Frm(_) { 0.0 }
         Ins(_) { 0.0 }
         Srf(_) { 0.0 }
         Aln(_) { 0.0 }
@@ -163,6 +165,7 @@ fn string_of(v: Value) -> string {
         Col(_) { "" }
         Sty(_) { "" }
         Met(_) { "" }
+        Frm(_) { "" }
         Ins(_) { "" }
         Srf(_) { "" }
         Aln(_) { "" }
@@ -185,6 +188,7 @@ fn widgets_of(v: Value) -> [widget.Widget] {
         Col(_) { [] }
         Sty(_) { [] }
         Met(_) { [] }
+        Frm(_) { [] }
         Ins(_) { [] }
         Srf(_) { [] }
         Aln(_) { [] }
@@ -284,6 +288,7 @@ fn slot_box(name: string) -> widget.Widget {
         spacing: 0.0,
         padding: widget.insets_all(6.0),
         surface: widget.Surface {
+            inset: 0.0,
             fill: Option<paint.Color>.Some(paint.rgb(0.93, 0.93, 0.96)),
             border: Option<widget.Border>.Some(widget.border_of(paint.rgb(0.6, 0.6, 0.7), 1.0)),
             corner: widget.Radius.Points(3.0),
@@ -332,7 +337,9 @@ fn component_named(name: string, all: [Component]) -> Option<Component> {
 // The call names the dialect actually uses, and what each builds. **Short on purpose**: a design
 // file may call `widget.*`, `controls.*` and its own components, so this is the whole surface a
 // builder has to know, and anything missing is named rather than silently dropped.
-fn call(name: string, args: [Value], style: controls.Style, m: widget.Metrics) -> Value {
+fn call(name: string, args: [Value], f: controls.Frame) -> Value {
+    val style = f.style
+    val m = f.metrics
     if name == "widget.row_of" {
         return Value.W(widget.row_of(float_of(args[0]), widgets_of(args[1])))
     }
@@ -360,18 +367,18 @@ fn call(name: string, args: [Value], style: controls.Style, m: widget.Metrics) -
         return Value.Srf(widget.no_surface())
     }
     if name == "widget.filled" {
-        return Value.Srf(widget.filled(ink_of(args[0], style)))
+        return Value.Srf(widget.filled(ink_of(args[0], f)))
     }
     if name == "widget.rounded" {
-        return Value.Srf(widget.rounded(ink_of(args[0], style), float_of(args[1])))
+        return Value.Srf(widget.rounded(ink_of(args[0], f), float_of(args[1])))
     }
     if name == "widget.outlined" {
-        return Value.Srf(widget.outlined(ink_of(args[0], style), float_of(args[1]), float_of(args[2])))
+        return Value.Srf(widget.outlined(ink_of(args[0], f), float_of(args[1]), float_of(args[2])))
     }
     if name == "widget.edged" {
         return Value.Srf(widget.edged(
-            ink_of(args[0], style),
-            ink_of(args[1], style),
+            ink_of(args[0], f),
+            ink_of(args[1], f),
             float_of(args[2]),
             float_of(args[3])
         ))
@@ -397,11 +404,11 @@ fn call(name: string, args: [Value], style: controls.Style, m: widget.Metrics) -
         return Value.W(widget.flex())
     }
     if name == "widget.label_of" {
-        return Value.W(widget.label_of(string_of(args[0]), float_of(args[1]), ink_of(args[2], style)))
+        return Value.W(widget.label_of(string_of(args[0]), float_of(args[1]), ink_of(args[2], f)))
     }
     if name == "controls.entry_widget" {
         return switch args[0] {
-            E(e) { Value.W(controls.entry_widget(e, style, m)) }
+            E(e) { Value.W(controls.entry_widget(e, f)) }
             W(_) { Value.None }
             F(_) { Value.None }
             S(_) { Value.None }
@@ -414,6 +421,7 @@ fn call(name: string, args: [Value], style: controls.Style, m: widget.Metrics) -
             Col(_) { Value.None }
             Sty(_) { Value.None }
             Met(_) { Value.None }
+            Frm(_) { Value.None }
             Ins(_) { Value.None }
             Srf(_) { Value.None }
             Aln(_) { Value.None }
@@ -422,7 +430,7 @@ fn call(name: string, args: [Value], style: controls.Style, m: widget.Metrics) -
     }
     if name == "controls.button_widget" {
         return switch args[0] {
-            B(b) { Value.W(controls.button_widget(b, style)) }
+            B(b) { Value.W(controls.button_widget(b, f)) }
             W(_) { Value.None }
             F(_) { Value.None }
             S(_) { Value.None }
@@ -435,6 +443,7 @@ fn call(name: string, args: [Value], style: controls.Style, m: widget.Metrics) -
             Col(_) { Value.None }
             Sty(_) { Value.None }
             Met(_) { Value.None }
+            Frm(_) { Value.None }
             Ins(_) { Value.None }
             Srf(_) { Value.None }
             Aln(_) { Value.None }
@@ -443,7 +452,7 @@ fn call(name: string, args: [Value], style: controls.Style, m: widget.Metrics) -
     }
     if name == "controls.tabs_widget" {
         return switch args[0] {
-            T(t) { Value.W(controls.tabs_widget(t, style)) }
+            T(t) { Value.W(controls.tabs_widget(t, f)) }
             W(_) { Value.None }
             F(_) { Value.None }
             S(_) { Value.None }
@@ -456,6 +465,7 @@ fn call(name: string, args: [Value], style: controls.Style, m: widget.Metrics) -
             Col(_) { Value.None }
             Sty(_) { Value.None }
             Met(_) { Value.None }
+            Frm(_) { Value.None }
             Ins(_) { Value.None }
             Srf(_) { Value.None }
             Aln(_) { Value.None }
@@ -464,7 +474,7 @@ fn call(name: string, args: [Value], style: controls.Style, m: widget.Metrics) -
     }
     if name == "controls.combo_box_widget" {
         return switch args[0] {
-            M(combo) { Value.W(controls.combo_box_widget(combo, style)) }
+            M(combo) { Value.W(controls.combo_box_widget(combo, f)) }
             W(_) { Value.None }
             F(_) { Value.None }
             S(_) { Value.None }
@@ -477,6 +487,7 @@ fn call(name: string, args: [Value], style: controls.Style, m: widget.Metrics) -
             Col(_) { Value.None }
             Sty(_) { Value.None }
             Met(_) { Value.None }
+            Frm(_) { Value.None }
             Ins(_) { Value.None }
             Srf(_) { Value.None }
             Aln(_) { Value.None }
@@ -485,7 +496,7 @@ fn call(name: string, args: [Value], style: controls.Style, m: widget.Metrics) -
     }
     if name == "controls.tree_widget" {
         return switch args[0] {
-            R(t) { Value.W(controls.tree_widget(t, style, m)) }
+            R(t) { Value.W(controls.tree_widget(t, f)) }
             W(_) { Value.None }
             F(_) { Value.None }
             S(_) { Value.None }
@@ -498,6 +509,7 @@ fn call(name: string, args: [Value], style: controls.Style, m: widget.Metrics) -
             Col(_) { Value.None }
             Sty(_) { Value.None }
             Met(_) { Value.None }
+            Frm(_) { Value.None }
             Ins(_) { Value.None }
             Srf(_) { Value.None }
             Aln(_) { Value.None }
@@ -506,7 +518,7 @@ fn call(name: string, args: [Value], style: controls.Style, m: widget.Metrics) -
     }
     if name == "controls.check_box_widget" {
         return switch args[0] {
-            C(c) { Value.W(controls.check_box_widget(c, style, m)) }
+            C(c) { Value.W(controls.check_box_widget(c, f)) }
             W(_) { Value.None }
             F(_) { Value.None }
             S(_) { Value.None }
@@ -519,6 +531,7 @@ fn call(name: string, args: [Value], style: controls.Style, m: widget.Metrics) -
             Col(_) { Value.None }
             Sty(_) { Value.None }
             Met(_) { Value.None }
+            Frm(_) { Value.None }
             Ins(_) { Value.None }
             Srf(_) { Value.None }
             Aln(_) { Value.None }
@@ -548,6 +561,7 @@ fn surface_of(v: Value) -> widget.Surface {
         Col(_) { widget.no_surface() }
         Sty(_) { widget.no_surface() }
         Met(_) { widget.no_surface() }
+        Frm(_) { widget.no_surface() }
         Ins(_) { widget.no_surface() }
         Aln(_) { widget.no_surface() }
         None { widget.no_surface() }
@@ -570,6 +584,7 @@ fn align_of(v: Value) -> widget.Alignment {
         Col(_) { widget.stretched() }
         Sty(_) { widget.stretched() }
         Met(_) { widget.stretched() }
+        Frm(_) { widget.stretched() }
         Ins(_) { widget.stretched() }
         Srf(_) { widget.stretched() }
         None { widget.stretched() }
@@ -594,11 +609,13 @@ fn insets_of(v: Value) -> widget.Insets {
         Col(_) { widget.no_insets() }
         Sty(_) { widget.no_insets() }
         Met(_) { widget.no_insets() }
+        Frm(_) { widget.no_insets() }
         None { widget.no_insets() }
     }
 }
 
-fn ink_of(v: Value, style: controls.Style) -> paint.Color {
+fn ink_of(v: Value, f: controls.Frame) -> paint.Color {
+    val style = f.style
     return switch v {
         Col(c) { c }
         W(_) { style.ink }
@@ -613,6 +630,7 @@ fn ink_of(v: Value, style: controls.Style) -> paint.Color {
         L(_) { style.ink }
         Sty(_) { style.ink }
         Met(_) { style.ink }
+        Frm(_) { style.ink }
         Ins(_) { style.ink }
         Srf(_) { style.ink }
         Aln(_) { style.ink }
@@ -783,10 +801,10 @@ pub fn eval(node: Node, env: [Binding], shop: Shop, here: [int]) -> Value {
         Path(leaf) {
             val text = leaf.text
             if text == "style.ink" {
-                return Value.Col(shop.style.ink)
+                return Value.Col(shop.frame.style.ink)
             }
             if text == "style.face" {
-                return Value.Col(shop.style.face)
+                return Value.Col(shop.frame.style.face)
             }
             val bound = look_up(text, env)
             if Value.is_None(bound) {
@@ -884,7 +902,7 @@ pub fn eval(node: Node, env: [Binding], shop: Shop, here: [int]) -> Value {
                 Some(part) { return record(render(part, snapshot(args), shop), shop, here) }
                 None { unit }
             }
-            val built = call(c.name, snapshot(args), shop.style, shop.m)
+            val built = call(c.name, snapshot(args), shop.frame)
             if Value.is_None(built) {
                 push(shop.missing, concat(c.name, "()"))
             }
@@ -922,15 +940,19 @@ pub fn render(c: Component, args: [Value], outer: Shop) -> Value {
             None { false }
         }
         val given = if is_record {
-            Value.Sty(shop.style)
+            Value.Sty(shop.frame.style)
         } else {
             if p.said == "controls.Style" {
-                Value.Sty(shop.style)
+                Value.Sty(shop.frame.style)
             } else {
                 if p.said == "widget.Metrics" {
-                    Value.Met(shop.m)
+                    Value.Met(shop.frame.metrics)
                 } else {
-                    if i < len(args) { args[i] } else { placeholder(p.said, p.name, shop.counts) }
+                    if p.said == "controls.Frame" {
+                        Value.Frm(shop.frame)
+                    } else {
+                        if i < len(args) { args[i] } else { placeholder(p.said, p.name, shop.counts) }
+                    }
                 }
             }
         }
@@ -994,6 +1016,7 @@ fn main() {
         }
     }
     val style = theme.plain()
+    val resting = controls.frame_of(style, m)
     val all = read_design.components_of(text)
     val known = read_design.constants_of(text)
     val records = read_design.records_of(text)
@@ -1012,7 +1035,7 @@ fn main() {
             for p in c.params {
                 print(format("  input {}: {}", p.name, p.said))
             }
-            val shop = shop_of(known, all, records, style, m)
+            val shop = shop_of(known, all, records, resting)
             val drawn = render(c, [], shop)
             if len(shop.missing) > 0 {
                 print(format("  {} thing(s) the builder could not place:", str(len(shop.missing))))

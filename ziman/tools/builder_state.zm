@@ -285,8 +285,10 @@ pub struct Canvas {
 // The component on show, rendered. **Rebuilt when the selection or the file changes and not per
 // frame**: it parses a body, evaluates it and synthesises a placeholder for every input, which is
 // the expensive half of this program.
-pub fn canvas_of(s: State, style: controls.Style, m: widget.Metrics) -> Canvas {
-    val shop = with render_design.shop_of(s.constants, s.components, s.records, style, m) {
+pub fn canvas_of(s: State, f: controls.Frame) -> Canvas {
+    val style = f.style
+    val m = f.metrics
+    val shop = with render_design.shop_of(s.constants, s.components, s.records, f) {
         counts: s.counts
     }
     val drawn = switch component_named(showing(s), s.components) {
@@ -302,11 +304,13 @@ pub fn canvas_of(s: State, style: controls.Style, m: widget.Metrics) -> Canvas {
 
 // ------------------------------------------------- the window
 
-fn heading(text: string, style: controls.Style) -> widget.Widget {
+fn heading(text: string, f: controls.Frame) -> widget.Widget {
+    val style = f.style
     return widget.fixed_of(0.0, 18.0, widget.label_of(text, style.text.heading.size, style.ink))
 }
 
-fn note(text: string, style: controls.Style) -> widget.Widget {
+fn note(text: string, f: controls.Frame) -> widget.Widget {
+    val style = f.style
     return widget.fixed_of(0.0, 16.0, widget.label_of(text, style.text.caption.size, style.ink))
 }
 
@@ -415,17 +419,19 @@ pub fn canvas_signature(s: State) -> string {
     return snapshot(out)
 }
 
-pub fn view(s: State, style: controls.Style, m: widget.Metrics) -> widget.Widget {
+pub fn view(s: State, f: controls.Frame) -> widget.Widget {
+    val style = f.style
+    val m = f.metrics
     return widget.row_of(gap, [
         widget.fixed_of(panel_width, 0.0, widget.column_of(gap, [
-            heading("Components", style),
-            widget.expand(controls.list_widget(s.parts, style, m))
+            heading("Components", f),
+            widget.expand(controls.list_widget(s.parts, f))
         ])),
         // **A `flex` and not a box of its own.** The canvas is where the design is painted, and
         // the design is a separate tree: this reserves the room and names it, and nothing inside
         // it belongs to this tree.
         widget.expand(widget.column_of(gap, [
-            heading("Canvas", style),
+            heading("Canvas", f),
             widget.expand(widget.Widget.Group(widget.Stack {
                 direction: widget.Direction.Column,
                 spacing: 0.0,
@@ -437,40 +443,38 @@ pub fn view(s: State, style: controls.Style, m: widget.Metrics) -> widget.Widget
             }))
         ])),
         widget.fixed_of(inspector_width, 0.0, widget.column_of(gap, [
-            heading("Selected", style),
-            note(selection_line(s), style),
+            heading("Selected", f),
+            note(selection_line(s), f),
             widget.fixed_of(0.0, (source_rows as float) * row_height, controls.entry_widget(
                 s.source,
-                style,
-                m
+                f
             )),
             widget.fixed_of(0.0, row_height, widget.row_of(gap, [
-                controls.button_widget(s.apply, style),
-                controls.button_widget(s.revert, style),
+                controls.button_widget(s.apply, f),
+                controls.button_widget(s.revert, f),
                 widget.expand(widget.flex())
             ])),
-            heading("Add", style),
+            heading("Add", f),
             widget.fixed_of(0.0, (len(palette_items()) as float) * row_height, controls.list_widget(
                 s.palette,
-                style,
-                m
+                f
             )),
             widget.fixed_of(0.0, row_height, widget.row_of(gap, [
-                controls.button_widget(s.insert, style),
-                controls.button_widget(s.remove, style),
-                controls.button_widget(s.up, style),
-                controls.button_widget(s.down, style),
-                controls.button_widget(s.undo, style),
+                controls.button_widget(s.insert, f),
+                controls.button_widget(s.remove, f),
+                controls.button_widget(s.up, f),
+                controls.button_widget(s.down, f),
+                controls.button_widget(s.undo, f),
                 widget.expand(widget.flex())
             ])),
-            heading("Inputs", style),
+            heading("Inputs", f),
             widget.fixed_of(0.0, row_height, widget.row_of(gap, [
-                controls.button_widget(s.fewer, style),
-                controls.button_widget(s.more, style),
-                widget.expand(note(items_line(s), style))
+                controls.button_widget(s.fewer, f),
+                controls.button_widget(s.more, f),
+                widget.expand(note(items_line(s), f))
             ])),
-            widget.expand(controls.list_widget(s.inputs, style, m)),
-            note(s.status, style)
+            widget.expand(controls.list_widget(s.inputs, f)),
+            note(s.status, f)
         ]))
     ])
 }
@@ -495,7 +499,7 @@ pub struct Slot {
 // The nearest list **above** a node, and which of its items the node is inside.
 //
 // **It walks up, and the first version only looked one step.** A click lands on the deepest thing
-// it can -- `controls.button_widget(it.go, style)` -- whose parent is the `widget.fixed_of` that
+// it can -- `controls.button_widget(it.go, f)` -- whose parent is the `widget.fixed_of` that
 // wraps it, not the column's list. One step up finds a `Call` and gives up, so nothing inside a
 // wrapped child was ever a drop target, which is every child of every container in the file.
 //
@@ -1127,9 +1131,10 @@ pub fn step(
     input: controls.Input,
     laid: widget.Laid,
     shown: Shown,
-    style: controls.Style,
-    m: widget.Metrics
+    f: controls.Frame
 ) -> Step {
+    val style = f.style
+    val m = f.metrics
     // Tab moves the focus and reaches no control, which is why it is taken before anything is
     // routed: a field that saw Tab would type it.
     if is_tab(input) {
@@ -1158,7 +1163,7 @@ pub fn step(
         pressed: controls.pressed_after(s.pressed, input, name)
     }
     if name == "parts" {
-        val taken = controls.list_input(here.parts, input, style, bounds_of(laid, "parts"), m)
+        val taken = controls.list_input(here.parts, input, bounds_of(laid, "parts"), f)
         val moved = with here { parts: taken.list }
         if !taken.moved && !taken.activated {
             return kept(moved)
@@ -1179,7 +1184,7 @@ pub fn step(
         })
     }
     if name == "palette" {
-        val taken = controls.list_input(here.palette, input, style, bounds_of(laid, "palette"), m)
+        val taken = controls.list_input(here.palette, input, bounds_of(laid, "palette"), f)
         return kept(with here { palette: taken.list })
     }
     if name == "insert" {
@@ -1233,11 +1238,11 @@ pub fn step(
         return kept(pressed)
     }
     if name == "inputs" {
-        val taken = controls.list_input(here.inputs, input, style, bounds_of(laid, "inputs"), m)
+        val taken = controls.list_input(here.inputs, input, bounds_of(laid, "inputs"), f)
         return kept(with here { inputs: taken.list })
     }
     if name == "source" {
-        val taken = controls.entry_input(here.source, input, bounds_of(laid, "source"), style, m)
+        val taken = controls.entry_input(here.source, input, bounds_of(laid, "source"), f)
         return kept(with here { source: taken.entry })
     }
     if name == "apply" {

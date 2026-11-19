@@ -89,21 +89,20 @@ val pane_tabs = 2.0
 val editor_strip_width = tab_width * editor_tabs
 val pane_strip_width = tab_width * pane_tabs
 
-pub fn mono_label(text: string, size: float, style: controls.Style) -> widget.Widget {
-    return widget.label_of(text, size, style.ink)
+pub fn mono_label(text: string, size: float, f: controls.Frame) -> widget.Widget {
+    return widget.label_of(text, size, f.style.ink)
 }
 
 pub fn sidebar(
     filter: controls.Entry,
     tree: controls.Tree,
-    style: controls.Style,
-    m: widget.Metrics
+    f: controls.Frame
 ) -> widget.Widget {
     return widget.column_of(gap, [
         widget.fixed_of(0.0, gap, widget.flex()),
-        widget.fixed_of(0.0, heading_height, mono_label("Requests", style.text.heading.size, style)),
-        widget.fixed_of(0.0, row_height, controls.entry_widget(filter, style, m)),
-        widget.expand(controls.tree_widget(tree, style, m))
+        widget.fixed_of(0.0, heading_height, mono_label("Requests", f.style.text.heading.size, f)),
+        widget.fixed_of(0.0, row_height, controls.entry_widget(filter, f)),
+        widget.expand(controls.tree_widget(tree, f))
     ])
 }
 
@@ -113,15 +112,14 @@ pub fn bar(
     send: controls.Button,
     save: controls.Button,
     save_as: controls.Button,
-    style: controls.Style,
-    m: widget.Metrics
+    f: controls.Frame
 ) -> widget.Widget {
     return widget.row_of(gap, [
-        widget.fixed_of(field_width, 0.0, controls.combo_box_widget(method, style)),
-        widget.expand(controls.entry_widget(url, style, m)),
-        widget.fixed_of(field_width, 0.0, controls.button_widget(send, style)),
-        widget.fixed_of(field_width, 0.0, controls.button_widget(save, style)),
-        widget.fixed_of(field_width, 0.0, controls.button_widget(save_as, style))
+        widget.fixed_of(field_width, 0.0, controls.combo_box_widget(method, f)),
+        widget.expand(controls.entry_widget(url, f)),
+        widget.fixed_of(field_width, 0.0, controls.button_widget(send, f)),
+        widget.fixed_of(field_width, 0.0, controls.button_widget(save, f)),
+        widget.fixed_of(field_width, 0.0, controls.button_widget(save_as, f))
     ])
 }
 
@@ -136,27 +134,26 @@ pub fn editors(
     tabs: controls.Tabs,
     body: widget.Widget,
     env: controls.ComboBox,
-    style: controls.Style,
-    m: widget.Metrics
+    f: controls.Frame
 ) -> widget.Widget {
     return widget.padded_of(widget.insets_of(0.0, 0.0, 0.0, below_editors), widget.column_of(editor_gap, [
         widget.fixed_of(0.0, row_height, widget.row_of(gap, [
-            widget.fixed_of(editor_strip_width, 0.0, controls.tabs_widget(tabs, style)),
+            widget.fixed_of(editor_strip_width, 0.0, controls.tabs_widget(tabs, f)),
             widget.expand(widget.flex())
         ])),
         body,
         widget.fixed_of(0.0, row_height, widget.row_of(gap, [
-            widget.fixed_of(env_label_width, 0.0, mono_label("Environment", style.text.caption.size, style)),
-            widget.fixed_of(env_width, 0.0, controls.combo_box_widget(env, style)),
+            widget.fixed_of(env_label_width, 0.0, mono_label("Environment", f.style.text.caption.size, f)),
+            widget.fixed_of(env_width, 0.0, controls.combo_box_widget(env, f)),
             widget.expand(widget.flex())
         ]))
     ]))
 }
 
 // The Response/History switcher, which is the same shape with one tab strip and no slot.
-pub fn pane_switcher(panes: controls.Tabs, style: controls.Style) -> widget.Widget {
+pub fn pane_switcher(panes: controls.Tabs, f: controls.Frame) -> widget.Widget {
     return widget.fixed_of(0.0, row_height, widget.row_of(gap, [
-        widget.fixed_of(pane_strip_width, 0.0, controls.tabs_widget(panes, style)),
+        widget.fixed_of(pane_strip_width, 0.0, controls.tabs_widget(panes, f)),
         widget.expand(widget.flex())
     ]))
 }
@@ -202,15 +199,15 @@ pub struct Screen {
 // renaming the file is not a two-place change -- and it is what an editor opens and draws. Every
 // other `pub fn` here is a part it calls, which is how the nesting becomes visible to a tool: the
 // composition lives in the design file instead of in `view`, where an editor could not see it.
-pub fn screen(it: Screen, style: controls.Style, m: widget.Metrics) -> widget.Widget {
+pub fn screen(it: Screen, f: controls.Frame) -> widget.Widget {
     return widget.row_of(gap, [
         widget.fixed_of(gap, 0.0, widget.flex()),
         widget.expand(controls.split_pane_widget(
             it.split,
-            style,
             it.split_extent,
-            sidebar(it.filter, it.tree, style, m),
-            main_column(it, style, m)
+            sidebar(it.filter, it.tree, f),
+            main_column(it, f),
+            f
         )),
         widget.fixed_of(gap, 0.0, widget.flex())
     ])
@@ -218,14 +215,14 @@ pub fn screen(it: Screen, style: controls.Style, m: widget.Metrics) -> widget.Wi
 
 // The window's right-hand side, under its own name because a root reads better as four lines than
 // as eleven.
-pub fn main_column(it: Screen, style: controls.Style, m: widget.Metrics) -> widget.Widget {
+pub fn main_column(it: Screen, f: controls.Frame) -> widget.Widget {
     return widget.column_of(gap, [
         widget.fixed_of(0.0, gap, widget.flex()),
-        widget.fixed_of(0.0, row_height, bar(it.method, it.url, it.send, it.save, it.save_as, style, m)),
-        editors(it.editors, it.editor, it.env, style, m),
-        pane_switcher(it.panes, style),
+        widget.fixed_of(0.0, row_height, bar(it.method, it.url, it.send, it.save, it.save_as, f)),
+        editors(it.editors, it.editor, it.env, f),
+        pane_switcher(it.panes, f),
         widget.expand(it.lower),
-        widget.fixed_of(0.0, status_height, mono_label(it.status, style.text.caption.size, style)),
+        widget.fixed_of(0.0, status_height, mono_label(it.status, f.style.text.caption.size, f)),
         widget.fixed_of(0.0, gap, widget.flex())
     ])
 }
@@ -242,13 +239,12 @@ pub fn pair_row(
     name: controls.Entry,
     value: controls.Entry,
     remove: controls.Button,
-    style: controls.Style,
-    m: widget.Metrics
+    f: controls.Frame
 ) -> widget.Widget {
     return widget.fixed_of(0.0, row_height, widget.row_of(gap, [
-        widget.fixed_of(pair_name_width, 0.0, controls.entry_widget(name, style, m)),
-        widget.expand(controls.entry_widget(value, style, m)),
-        widget.fixed_of(pair_remove_width, 0.0, controls.button_widget(remove, style))
+        widget.fixed_of(pair_name_width, 0.0, controls.entry_widget(name, f)),
+        widget.expand(controls.entry_widget(value, f)),
+        widget.fixed_of(pair_remove_width, 0.0, controls.button_widget(remove, f))
     ]))
 }
 
@@ -257,11 +253,11 @@ pub fn pair_row(
 // **`rows` is a repeated slot**, which is the only new idea here: a slot was a widget, and it can
 // be a list of them. An editor draws a few placeholders and calls it repeated content, which is
 // what every editor already does with a list.
-pub fn pair_table(rows: [widget.Widget], add: controls.Button, style: controls.Style) -> widget.Widget {
+pub fn pair_table(rows: [widget.Widget], add: controls.Button, f: controls.Frame) -> widget.Widget {
     return widget.padded_of(widget.insets_of(0.0, 0.0, 0.0, below_rows), widget.column_of(table_gap, [
         widget.column_of(table_gap, rows),
         widget.fixed_of(0.0, row_height, widget.row_of(gap, [
-            widget.fixed_of(pair_add_width, 0.0, controls.button_widget(add, style)),
+            widget.fixed_of(pair_add_width, 0.0, controls.button_widget(add, f)),
             widget.expand(widget.flex())
         ]))
     ]))
@@ -273,20 +269,19 @@ pub fn pair_table(rows: [widget.Widget], add: controls.Button, style: controls.S
 pub fn field_row(
     label: string,
     field: controls.Entry,
-    style: controls.Style,
-    m: widget.Metrics
+    f: controls.Frame
 ) -> widget.Widget {
     return widget.fixed_of(0.0, row_height, widget.row_of(gap, [
-        widget.fixed_of(auth_label_width, 0.0, mono_label(label, style.text.caption.size, style)),
-        widget.expand(controls.entry_widget(field, style, m))
+        widget.fixed_of(auth_label_width, 0.0, mono_label(label, f.style.text.caption.size, f)),
+        widget.expand(controls.entry_widget(field, f))
     ]))
 }
 
 // A labelled row holding a picker, which takes its own width rather than the line's.
-pub fn picker_row(label: string, picker: controls.ComboBox, style: controls.Style) -> widget.Widget {
+pub fn picker_row(label: string, picker: controls.ComboBox, f: controls.Frame) -> widget.Widget {
     return widget.fixed_of(0.0, row_height, widget.row_of(gap, [
-        widget.fixed_of(auth_label_width, 0.0, mono_label(label, style.text.caption.size, style)),
-        widget.fixed_of(auth_picker_width, 0.0, controls.combo_box_widget(picker, style)),
+        widget.fixed_of(auth_label_width, 0.0, mono_label(label, f.style.text.caption.size, f)),
+        widget.fixed_of(auth_picker_width, 0.0, controls.combo_box_widget(picker, f)),
         widget.expand(widget.flex())
     ]))
 }
@@ -317,16 +312,15 @@ pub fn rule_row(
     source: controls.Entry,
     secret: controls.CheckBox,
     remove: controls.Button,
-    style: controls.Style,
-    m: widget.Metrics
+    f: controls.Frame
 ) -> widget.Widget {
     return widget.fixed_of(0.0, row_height, widget.row_of(gap, [
-        widget.fixed_of(rule_kind_width, 0.0, controls.combo_box_widget(kind, style)),
-        widget.fixed_of(rule_name_width, 0.0, controls.entry_widget(name, style, m)),
-        widget.fixed_of(rule_said_width, 0.0, mono_label(said, style.text.caption.size, style)),
-        widget.expand(controls.entry_widget(source, style, m)),
-        widget.fixed_of(rule_secret_width, 0.0, controls.check_box_widget(secret, style, m)),
-        widget.fixed_of(pair_remove_width, 0.0, controls.button_widget(remove, style))
+        widget.fixed_of(rule_kind_width, 0.0, controls.combo_box_widget(kind, f)),
+        widget.fixed_of(rule_name_width, 0.0, controls.entry_widget(name, f)),
+        widget.fixed_of(rule_said_width, 0.0, mono_label(said, f.style.text.caption.size, f)),
+        widget.expand(controls.entry_widget(source, f)),
+        widget.fixed_of(rule_secret_width, 0.0, controls.check_box_widget(secret, f)),
+        widget.fixed_of(pair_remove_width, 0.0, controls.button_widget(remove, f))
     ]))
 }
 
@@ -335,27 +329,26 @@ pub fn rule_row(
 pub fn dialog_field_row(
     label: string,
     field: controls.Entry,
-    style: controls.Style,
-    m: widget.Metrics
+    f: controls.Frame
 ) -> widget.Widget {
     return widget.fixed_of(0.0, row_height, widget.row_of(gap, [
-        widget.fixed_of(dialog_label_width, 0.0, mono_label(label, style.text.caption.size, style)),
-        widget.fixed_of(dialog_field_width, 0.0, controls.entry_widget(field, style, m))
+        widget.fixed_of(dialog_label_width, 0.0, mono_label(label, f.style.text.caption.size, f)),
+        widget.fixed_of(dialog_field_width, 0.0, controls.entry_widget(field, f))
     ]))
 }
 
-pub fn dialog_error_row(said: string, style: controls.Style) -> widget.Widget {
-    return widget.fixed_of(0.0, dialog_error_height, mono_label(said, style.text.caption.size, style))
+pub fn dialog_error_row(said: string, f: controls.Frame) -> widget.Widget {
+    return widget.fixed_of(0.0, dialog_error_height, mono_label(said, f.style.text.caption.size, f))
 }
 
 pub fn dialog_buttons(
     confirm: controls.Button,
     cancel: controls.Button,
-    style: controls.Style
+    f: controls.Frame
 ) -> widget.Widget {
     return widget.fixed_of(0.0, row_height, widget.row_of(gap, [
-        widget.fixed_of(dialog_label_width, 0.0, controls.button_widget(confirm, style)),
-        widget.fixed_of(dialog_label_width, 0.0, controls.button_widget(cancel, style))
+        widget.fixed_of(dialog_label_width, 0.0, controls.button_widget(confirm, f)),
+        widget.fixed_of(dialog_label_width, 0.0, controls.button_widget(cancel, f))
     ]))
 }
 

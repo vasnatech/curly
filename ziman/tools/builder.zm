@@ -83,9 +83,10 @@ fn painted(
     st: State,
     laid: widget.Laid,
     shown: Shown,
-    style: controls.Style,
-    m: widget.Metrics
+    f: controls.Frame
 ) -> scene.Scene {
+    val style = f.style
+    val m = f.metrics
     val base = widget.paint_focused(laid, m, st.focused, paint.rgb(0.15, 0.4, 0.85), 2.0)
     val ops = mutable_array_new<scene.Op>()
     for op in base.ops {
@@ -121,18 +122,19 @@ fn painted(
         }
         None { unit }
     }
-    return controls.paint_scroll_bars(laid, scene.with_ops(base, snapshot(ops)), style)
+    return controls.paint_scroll_bars(laid, scene.with_ops(base, snapshot(ops)), f)
 }
 
 pub fn run(path: string) -> Result<unit, string> {
-    val f = try load_font()
-    val m = try widget.metrics_for(f)
+    val face = try load_font()
+    val m = try widget.metrics_for(face)
     val style = with theme.plain() { collapsed_mark: ">", expanded_mark: "v" }
+    val resting = controls.frame_of(style, m)
     val opened = try builder_state.load(path)
     val density = chosen_density().density
     val scale = density.px_per_pt
     val options = with raster.options() {
-        fonts: [f],
+        fonts: [face],
         samples: 1,
         background: Option<paint.Color>.Some(paint.rgb(0.98, 0.98, 0.99)),
         max_pixels: ((8000000 as float) * scale * scale) as int,
@@ -152,14 +154,14 @@ pub fn run(path: string) -> Result<unit, string> {
             // Rendering a design parses a body, evaluates it and invents a placeholder for every
             // input, which is the expensive half of this program; the two strings below are what
             // says whether any of that could have changed its answer.
-            var canvas = builder_state.canvas_of(st, style, m)
+            var canvas = builder_state.canvas_of(st, resting)
             var drawn_from = st.text
             // **The component *and* the placeholder counts**, because changing a count changes
             // the picture and nothing else does: a signature of the text and the component alone
             // leaves the canvas stale until something unrelated moves it.
             var drawn_part = builder_state.canvas_signature(st)
             var laid = widget.layout(
-                builder_state.view(st, style, m),
+                builder_state.view(st, resting),
                 geom.rect_of(0.0, 0.0, width_pt, height_pt),
                 m
             )
@@ -171,12 +173,12 @@ pub fn run(path: string) -> Result<unit, string> {
             while !closing {
                 if dirty {
                     if st.text != drawn_from || builder_state.canvas_signature(st) != drawn_part {
-                        canvas = builder_state.canvas_of(st, style, m)
+                        canvas = builder_state.canvas_of(st, resting)
                         drawn_from = st.text
                         drawn_part = builder_state.canvas_signature(st)
                     }
                     val whole = geom.rect_of(0.0, 0.0, width_pt, height_pt)
-                    laid = widget.layout(builder_state.view(st, style, m), whole, m)
+                    laid = widget.layout(builder_state.view(st, resting), whole, m)
                     // **Laid out once and used for both halves**, the painting and the routing.
                     // Two layouts of the same tree could disagree, and a click would select the
                     // node that used to be under it.
@@ -191,7 +193,7 @@ pub fn run(path: string) -> Result<unit, string> {
                     val repainted = try desktop.repaint(
                         painter,
                         w,
-                        painted(st, laid, shown, style, m),
+                        painted(st, laid, shown, resting),
                         options
                     )
                     painter = repainted.next
@@ -212,7 +214,7 @@ pub fn run(path: string) -> Result<unit, string> {
                     }
                     if Some(input) = desktop.input_of(e, density) {
                         dirty = true
-                        val stepped = builder_state.step(st, input, laid, shown, style, m)
+                        val stepped = builder_state.step(st, input, laid, shown, resting)
                         st = stepped.state
                         // **The write is done here and nowhere else.** `step` decides and stays
                         // pure; this is the only line in the program that can lose someone's

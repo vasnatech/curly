@@ -9,16 +9,16 @@ val width = 90.0
 val count = 3.0
 val strip = width * count
 
-pub fn verify_notify(b: controls.Button, style: controls.Style) -> widget.Widget {
+pub fn verify_notify(b: controls.Button, f: controls.Frame) -> widget.Widget {
     // Names that contain keywords: verify, notify, interval, forward, available, evaluation.
     return widget.row_of(gap, [
-        widget.fixed_of(width, 0.0, controls.button_widget(b, style)),
+        widget.fixed_of(width, 0.0, controls.button_widget(b, f)),
         widget.expand(widget.flex())
     ])
 }
 
-pub fn with_strings(style: controls.Style) -> widget.Widget {
-    return widget.label_of("if you var a val, for while", 12.0, style.ink)
+pub fn with_strings(f: controls.Frame) -> widget.Widget {
+    return widget.label_of("if you var a val, for while", 12.0, f.style.ink)
 }
 
 // **A `widget.Stack` literal, which the dialect permits and this fixture exists to exercise.**
@@ -27,12 +27,12 @@ pub fn with_strings(style: controls.Style) -> widget.Widget {
 // default -- the two things lib/ui gained surfaces and alignment for. It is here because without
 // it no design file contains one, and a reader that stopped treating a struct's values as
 // children would pass every check.
-pub fn panel(child: widget.Widget, style: controls.Style) -> widget.Widget {
+pub fn panel(child: widget.Widget, f: controls.Frame) -> widget.Widget {
     return widget.Widget.Group(widget.Stack {
         direction: widget.Direction.Column,
         spacing: gap,
         padding: widget.insets_all(width),
-        surface: widget.edged(style.face, style.ink, 1.0, 4.0),
+        surface: widget.edged(f.style.face, f.style.ink, 1.0, 4.0),
         align: widget.centred(),
         name: "",
         children: [child]
@@ -43,12 +43,12 @@ pub fn panel(child: widget.Widget, style: controls.Style) -> widget.Widget {
 // all.** `Surface.fill` and `Surface.border` are `Option`s and this dialect has no syntax for one
 // -- `Option<paint.Color>.Some(...)` is three tokens outside it -- so a design could say a
 // container's padding and its alignment but not its border or its corners.
-pub fn ghost_panel(child: widget.Widget, style: controls.Style) -> widget.Widget {
+pub fn ghost_panel(child: widget.Widget, f: controls.Frame) -> widget.Widget {
     return widget.Widget.Group(widget.Stack {
         direction: widget.Direction.Column,
         spacing: gap,
         padding: widget.insets_all(width),
-        surface: widget.outlined(style.ink, 2.0, 6.0),
+        surface: widget.outlined(f.style.ink, 2.0, 6.0),
         align: widget.stretched(),
         name: "",
         children: [child]

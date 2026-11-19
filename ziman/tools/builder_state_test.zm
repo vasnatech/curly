@@ -30,6 +30,11 @@ fn style() -> controls.Style {
     return theme.plain()
 }
 
+// The resting frame these tests draw in.
+fn frame() -> controls.Frame {
+    return controls.frame_of(style(), metrics())
+}
+
 val window_box = geom.rect_of(0.0, 0.0, 1400.0, 900.0)
 
 // A design file in the dialect, small enough to reason about: one record, one part, one root.
@@ -47,17 +52,17 @@ fn fixture() -> string {
         "}",
         "",
         "pub fn field(name: controls.Entry, style: controls.Style, m: widget.Metrics) -> widget.Widget {",
-        "    return widget.row_of(gap, [controls.entry_widget(name, style, m), widget.flex()])",
+        "    return widget.row_of(gap, [controls.entry_widget(name, f), widget.flex()])",
         "}",
         "",
         "pub fn strip(tabs: controls.Tabs, style: controls.Style) -> widget.Widget {",
-        "    return controls.tabs_widget(tabs, style)",
+        "    return controls.tabs_widget(tabs, f)",
         "}",
         "",
         "pub fn screen(it: Screen, style: controls.Style, m: widget.Metrics) -> widget.Widget {",
         "    return widget.column_of(gap, [",
         "        widget.fixed_of(0.0, row_height, field(it.name, style, m)),",
-        "        widget.fixed_of(0.0, row_height, controls.button_widget(it.go, style)),",
+        "        widget.fixed_of(0.0, row_height, controls.button_widget(it.go, f)),",
         "        widget.expand(widget.flex())",
         "    ])",
         "}",
@@ -85,11 +90,11 @@ fn showing_part(s: builder_state.State, name: string) -> builder_state.State {
 }
 
 fn laid_of(s: builder_state.State) -> widget.Laid {
-    return widget.layout(builder_state.view(s, style(), metrics()), window_box, metrics())
+    return widget.layout(builder_state.view(s, frame()), window_box, metrics())
 }
 
 fn shown_of(s: builder_state.State, laid: widget.Laid) -> Shown {
-    val canvas = builder_state.canvas_of(s, style(), metrics())
+    val canvas = builder_state.canvas_of(s, frame())
     return Shown {
         laid: widget.layout(
             canvas.widget_,
@@ -102,7 +107,7 @@ fn shown_of(s: builder_state.State, laid: widget.Laid) -> Shown {
 
 fn acted(s: builder_state.State, input: controls.Input) -> builder_state.Step {
     val laid = laid_of(s)
-    return builder_state.step(s, input, laid, shown_of(s, laid), style(), metrics())
+    return builder_state.step(s, input, laid, shown_of(s, laid), frame())
 }
 
 // A press at the middle of a named box of the *design*, which is the only way a test can click
@@ -116,8 +121,7 @@ fn pressed_on_design(s: builder_state.State, name: string) -> builder_state.Step
         controls.Input.Press(geom.point_of(box.x + box.width / 2.0, box.y + box.height / 2.0)),
         laid,
         shown,
-        style(),
-        metrics()
+        frame()
     )
 }
 
@@ -184,7 +188,7 @@ fn nothing_in_the_design_can_take_the_focus() {
 #[test]
 fn a_press_on_the_canvas_selects_the_node_that_drew_it() {
     val step = pressed_on_design(opened(), "go")
-    test.assert_eq(step.state.source.editor.text, "controls.button_widget(it.go, style)")
+    test.assert_eq(step.state.source.editor.text, "controls.button_widget(it.go, f)")
     test.assert(contains(builder_state.selection_line(step.state), "1.1.2 of screen"))
     test.assert_false(step.write)
 }
@@ -194,7 +198,7 @@ fn a_press_on_the_canvas_selects_the_node_that_drew_it() {
 #[test]
 fn a_press_inside_a_part_reports_a_node_of_the_part() {
     val step = pressed_on_design(opened(), "name")
-    test.assert_eq(step.state.source.editor.text, "controls.entry_widget(name, style, m)")
+    test.assert_eq(step.state.source.editor.text, "controls.entry_widget(name, f)")
     test.assert(contains(builder_state.selection_line(step.state), "of field"))
 }
 
@@ -211,8 +215,7 @@ fn a_press_on_the_background_selects_the_root() {
         controls.Input.Press(low),
         laid,
         shown_of(opened(), laid),
-        style(),
-        metrics()
+        frame()
     )
     test.assert(Option.is_Some(step.state.picked))
     test.assert(contains(builder_state.selection_line(step.state), "root of screen"))
@@ -234,8 +237,7 @@ fn a_press_with_nothing_on_the_canvas_clears_the_selection() {
         controls.Input.Press(away),
         laid,
         shown_of(blank, laid),
-        style(),
-        metrics()
+        frame()
     )
     test.assert(Option.is_None(step.state.picked))
     test.assert_eq(step.state.source.editor.text, "")
@@ -261,14 +263,13 @@ fn applied(s: builder_state.State) -> builder_state.Step {
     val box = builder_state.bounds_of(laid, "apply")
     val at = geom.point_of(box.x + box.width / 2.0, box.y + box.height / 2.0)
     val shown = shown_of(s, laid)
-    val down = builder_state.step(s, controls.Input.Press(at), laid, shown, style(), metrics())
+    val down = builder_state.step(s, controls.Input.Press(at), laid, shown, frame())
     return builder_state.step(
         down.state,
         controls.Input.Release(at),
         laid,
         shown,
-        style(),
-        metrics()
+        frame()
     )
 }
 
@@ -279,12 +280,12 @@ fn apply_rewrites_the_span_and_leaves_every_other_byte_alone() {
     val step = applied(edited)
     test.assert(step.write)
     test.assert(contains(step.state.text, "widget.flex()"))
-    test.assert_false(contains(step.state.text, "controls.button_widget(it.go, style)"))
+    test.assert_false(contains(step.state.text, "controls.button_widget(it.go, f)"))
     // Everything else is still there, which is what a span rewrite promises and a regenerated
     // file does not.
     test.assert(contains(step.state.text, "val gap = 8.0"))
     test.assert(contains(step.state.text, "pub struct Screen {"))
-    test.assert(contains(step.state.text, "controls.entry_widget(name, style, m)"))
+    test.assert(contains(step.state.text, "controls.entry_widget(name, f)"))
     test.assert_eq(len(lines(step.state.text)), len(lines(fixture())))
 }
 
@@ -310,7 +311,7 @@ fn a_second_apply_lands_on_the_node_and_not_on_stale_bytes() {
     // there, so a second rewrite eats whatever follows -- and everything before the node is
     // untouched either way, which is why asserting on it passed against the defect.
     test.assert(contains(again.state.text, "widget.expand(widget.flex())"))
-    test.assert(contains(again.state.text, "controls.entry_widget(name, style, m)"))
+    test.assert(contains(again.state.text, "controls.entry_widget(name, f)"))
     test.assert(contains(again.state.text, "val gap = 8.0"))
     // And it still parses as the same file: two components, one record.
     test.assert_len(3, read_design.components_of(again.state.text))
@@ -333,16 +334,15 @@ fn revert_restores_what_the_file_says() {
     val box = builder_state.bounds_of(laid, "revert")
     val at = geom.point_of(box.x + box.width / 2.0, box.y + box.height / 2.0)
     val shown = shown_of(typed, laid)
-    val down = builder_state.step(typed, controls.Input.Press(at), laid, shown, style(), metrics())
+    val down = builder_state.step(typed, controls.Input.Press(at), laid, shown, frame())
     val up = builder_state.step(
         down.state,
         controls.Input.Release(at),
         laid,
         shown,
-        style(),
-        metrics()
+        frame()
     )
-    test.assert_eq(up.state.source.editor.text, "controls.button_widget(it.go, style)")
+    test.assert_eq(up.state.source.editor.text, "controls.button_widget(it.go, f)")
 }
 
 // ---- the keyboard
@@ -409,8 +409,7 @@ fn the_root_offers_no_slot() {
         controls.Input.Press(low),
         laid,
         shown_of(opened(), laid),
-        style(),
-        metrics()
+        frame()
     ).state
     test.assert_eq(slot_text(builder_state.slot_after_selection(s, shown_of(s, laid_of(s)))), "(none)")
 }
@@ -481,14 +480,13 @@ fn pressing(s: builder_state.State, name: string) -> builder_state.Step {
     val box = builder_state.bounds_of(laid, name)
     val at = geom.point_of(box.x + box.width / 2.0, box.y + box.height / 2.0)
     val shown = shown_of(s, laid)
-    val down = builder_state.step(s, controls.Input.Press(at), laid, shown, style(), metrics())
+    val down = builder_state.step(s, controls.Input.Press(at), laid, shown, frame())
     return builder_state.step(
         down.state,
         controls.Input.Release(at),
         laid,
         shown,
-        style(),
-        metrics()
+        frame()
     )
 }
 
@@ -694,7 +692,7 @@ fn down_moves_the_item_past_the_next_one() {
     test.assert(step.write)
     test.assert_eq(names_of(step.state.text), "widget.fixed_of widget.expand widget.fixed_of")
     // ...and the thing that moved is the one that was selected, not some other row.
-    test.assert(contains(step.state.text, "controls.button_widget(it.go, style)"))
+    test.assert(contains(step.state.text, "controls.button_widget(it.go, f)"))
     test.assert_len(3, read_design.components_of(step.state.text))
 }
 

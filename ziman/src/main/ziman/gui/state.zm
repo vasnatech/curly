@@ -912,24 +912,26 @@ fn drop_last_text(xs: MutableArray<string>) {
 // ---- building the view
 
 // The Save As dialog's contents: two fields and two buttons.
-fn naming_widget(n: Naming, ic: Icons, style: controls.Style, m: widget.Metrics) -> widget.Widget {
+fn naming_widget(n: Naming, ic: Icons, f: controls.Frame) -> widget.Widget {
+    val style = f.style
+    val m = f.metrics
     // **Every width is given, and none is `expand`.** A dialog is centred by its own natural size --
     // `dialog_layer` puts flexible space either side of it -- so a child that asks to fill its
     // parent is asking the box how big it is while the box is asking the child. The window's own
     // rows use `fixed_of(0.0, h, ...)` with an `expand` inside precisely because *there* the column
     // does know its width; here nothing does until this says so.
     val rows = mutable_array_new<widget.Widget>()
-    push(rows, request_ui.dialog_field_row("Collection", n.collection, style, m))
-    push(rows, request_ui.dialog_field_row("Name", n.path, style, m))
+    push(rows, request_ui.dialog_field_row("Collection", n.collection, f))
+    push(rows, request_ui.dialog_field_row("Name", n.path, f))
     if len(n.error) > 0 {
-        push(rows, request_ui.dialog_error_row(n.error, style))
+        push(rows, request_ui.dialog_error_row(n.error, f))
     }
     // A dialog's two buttons keep their words -- "Save" and "Cancel" are what a user reads before
     // committing something -- and take the icons beside them.
     push(rows, request_ui.dialog_buttons(
         with_icon(n.confirm, ic.save, n.confirm.label),
         with_icon(n.cancel, ic.close, n.cancel.label),
-        style
+        f
     ))
     return request_ui.naming_dialog(snapshot(rows))
 }
@@ -938,7 +940,9 @@ fn naming_widget(n: Naming, ic: Icons, style: controls.Style, m: widget.Metrics)
 // **The loop, and nothing else.** A table is a repeat over data and a design file has no loops,
 // so what is left here is the iteration: the row's layout and the table's arrangement both live
 // in `request_ui`, and this calls the row template once per row.
-fn table_widget(t: PairTable, ic: Icons, style: controls.Style, m: widget.Metrics) -> widget.Widget {
+fn table_widget(t: PairTable, ic: Icons, f: controls.Frame) -> widget.Widget {
+    val style = f.style
+    val m = f.metrics
     val rows = mutable_array_new<widget.Widget>()
     var at = 0
     for row in t.rows {
@@ -948,12 +952,11 @@ fn table_widget(t: PairTable, ic: Icons, style: controls.Style, m: widget.Metric
             row.name,
             row.value,
             with_row_icon(row.remove, ic.remove, removes(row.name.editor.text, t.title, at)),
-            style,
-            m
+            f
         ))
         at = at + 1
     }
-    return request_ui.pair_table(snapshot(rows), with_icon(t.add, ic.add, shortened(t.add.label)), style)
+    return request_ui.pair_table(snapshot(rows), with_icon(t.add, ic.add, shortened(t.add.label)), f)
 }
 
 // The authorization editor: a picker, and the fields the picked kind needs.
@@ -966,32 +969,35 @@ fn table_widget(t: PairTable, ic: Icons, style: controls.Style, m: widget.Metric
 // the editor shows depend on the kind picked -- and that choice is the only thing left here. The
 // row layouts live in `request_ui`, and the conditional supplies a list exactly as the table's
 // loop does.
-fn auth_widget(a: AuthEditors, style: controls.Style, m: widget.Metrics) -> widget.Widget {
+fn auth_widget(a: AuthEditors, f: controls.Frame) -> widget.Widget {
+    val style = f.style
+    val m = f.metrics
     val rows = mutable_array_new<widget.Widget>()
-    push(rows, request_ui.picker_row("Authorization", a.kind, style))
+    push(rows, request_ui.picker_row("Authorization", a.kind, f))
     if a.kind.items.selected == auth_basic {
-        push(rows, request_ui.field_row("Username", a.user, style, m))
+        push(rows, request_ui.field_row("Username", a.user, f))
     }
     if a.kind.items.selected != auth_none {
         push(rows, request_ui.field_row(
             secret_label(a),
             with a.secret { label: secret_label(a) },
-            style,
-            m
+            f
         ))
     }
     return request_ui.rows_panel(snapshot(rows))
 }
 
 // The extraction rules: one row of five controls per rule, and a button that adds one.
-fn rules_widget(t: RuleTable, ic: Icons, style: controls.Style, m: widget.Metrics) -> widget.Widget {
+fn rules_widget(t: RuleTable, ic: Icons, f: controls.Frame) -> widget.Widget {
+    val style = f.style
+    val m = f.metrics
     val rows = mutable_array_new<widget.Widget>()
     var at = 0
     for row in t.rows {
-        rows_push_rule(rows, row, ic, at, style, m)
+        rows_push_rule(rows, row, ic, at, f)
         at = at + 1
     }
-    return request_ui.pair_table(snapshot(rows), with_icon(t.add, ic.add, shortened(t.add.label)), style)
+    return request_ui.pair_table(snapshot(rows), with_icon(t.add, ic.add, shortened(t.add.label)), f)
 }
 
 fn rows_push_rule(
@@ -999,9 +1005,10 @@ fn rows_push_rule(
     row: RuleRow,
     ic: Icons,
     at: int,
-    style: controls.Style,
-    m: widget.Metrics
+    f: controls.Frame
 ) {
+    val style = f.style
+    val m = f.metrics
     // **The word is drawn as well as declared**, which a column header could not do: every row
     // picks its own kind, so the third box is a JSON path on one line and a header name on the
     // next. Declaring it only to the accessibility tree would have left a sighted user looking at
@@ -1018,29 +1025,30 @@ fn rows_push_rule(
         with row.source { label: said },
         row.secret,
         with_row_icon(row.remove, ic.remove, removes(row.name.editor.text, "rule", at)),
-        style,
-        m
+        f
     ))
 }
 
-pub fn view(s: State, style: controls.Style, m: widget.Metrics) -> widget.Widget {
+pub fn view(s: State, f: controls.Frame) -> widget.Widget {
+    val style = f.style
+    val m = f.metrics
     val body_height = (body_rows as float) * 17.0 + 8.0
     // **One editor at a time.** Headers, query parameters and a body stacked between the URL and
     // the response left the response a sliver, and a request with eight headers pushed it off the
     // window entirely. The strip costs one row and the shown editor gets its natural height.
     val chosen_editor = if s.editors.selected == query_editor {
-        table_widget(s.query, s.icons, style, m)
+        table_widget(s.query, s.icons, f)
     } else {
         if s.editors.selected == auth_editor {
-            auth_widget(s.auth, style, m)
+            auth_widget(s.auth, f)
         } else {
             if s.editors.selected == extract_editor {
-                rules_widget(s.rules, s.icons, style, m)
+                rules_widget(s.rules, s.icons, f)
             } else {
                 if s.editors.selected == body_editor {
-                    widget.fixed_of(0.0, body_height, controls.entry_widget(s.body, style, m))
+                    widget.fixed_of(0.0, body_height, controls.entry_widget(s.body, f))
                 } else {
-                    table_widget(s.headers, s.icons, style, m)
+                    table_widget(s.headers, s.icons, f)
                 }
             }
         }
@@ -1058,36 +1066,39 @@ pub fn view(s: State, style: controls.Style, m: widget.Metrics) -> widget.Widget
             // fill 600 points is a wall of blur rather than a preview of anything.
             switch s.preview {
                 Some(it) { widget.picture_shrunk(0, it.width, it.height, it.alt) }
-                None { controls.entry_widget(s.response, style, m) }
+                None { controls.entry_widget(s.response, f) }
             }
         }
-        History { controls.table_widget(s.history, style, m) }
+        History { controls.table_widget(s.history, f) }
     }
     // **The whole arrangement lives in the design file now**, so what is left here is the data it
     // draws itself from: the two slots a conditional picks, the one height a slot cannot know, and
     // the bindings.
-    val body = request_ui.screen(request_ui.Screen {
-        split: s.split,
-        // **The window's width less what the frame takes**, which is the one number the design
-        // file cannot work out for itself. `frame_width` is its own token over there, so this is
-        // one subtraction here and no layout arithmetic duplicated.
-        split_extent: s.window_width - frame_width,
-        filter: s.filter,
-        tree: s.sidebar.tree,
-        method: s.method,
-        url: s.url,
-        // The words stay on these three: a toolbar button with a name is not the same control as
-        // a row's `x`, and "Send" is what a user looks for.
-        send: with_icon(s.send, s.icons.send, s.send.label),
-        save: with_icon(s.save, s.icons.save, s.save.label),
-        save_as: with_icon(s.save_as, s.icons.save_as, s.save_as.label),
-        editors: s.editors,
-        editor: chosen_editor,
-        env: s.env,
-        panes: s.panes,
-        lower: lower,
-        status: s.status
-    }, style, m)
+    val body = request_ui.screen(
+        request_ui.Screen {
+            split: s.split,
+            // **The window's width less what the frame takes**, which is the one number the design
+            // file cannot work out for itself. `frame_width` is its own token over there, so this is
+            // one subtraction here and no layout arithmetic duplicated.
+            split_extent: s.window_width - frame_width,
+            filter: s.filter,
+            tree: s.sidebar.tree,
+            method: s.method,
+            url: s.url,
+            // The words stay on these three: a toolbar button with a name is not the same control as
+            // a row's `x`, and "Send" is what a user looks for.
+            send: with_icon(s.send, s.icons.send, s.send.label),
+            save: with_icon(s.save, s.icons.save, s.save.label),
+            save_as: with_icon(s.save_as, s.icons.save_as, s.save_as.label),
+            editors: s.editors,
+            editor: chosen_editor,
+            env: s.env,
+            panes: s.panes,
+            lower: lower,
+            status: s.status
+        },
+        f
+    )
     // **A modal layer, which is what `dialog_layer` is for**: it takes the keys, so Tab cannot walk
     // out of the dialog into the window behind it. `widget.keyboard_children` holds that rule once
     // for both the focus and the accessibility tree, so a reader is told about the dialog's
@@ -1096,7 +1107,7 @@ pub fn view(s: State, style: controls.Style, m: widget.Metrics) -> widget.Widget
         Some(n) {
             widget.layered_of([
                 widget.base_layer(body),
-                controls.dialog_layer("save-as", "Save Request As", naming_widget(n, s.icons, style, m), style)
+                controls.dialog_layer("save-as", "Save Request As", naming_widget(n, s.icons, f), f)
             ])
         }
         None { body }
@@ -1164,9 +1175,10 @@ fn rules_input(
     name: string,
     input: controls.Input,
     laid: widget.Laid,
-    style: controls.Style,
-    m: widget.Metrics
+    f: controls.Frame
 ) -> RuleStep {
+    val style = f.style
+    val m = f.metrics
     if name == "rule-add" {
         val taken = controls.button_input(t.add, input, bounds_of(laid, name))
         val rows = mutable_array_new<RuleRow>()
@@ -1208,20 +1220,18 @@ fn rules_input(
             val taken = controls.combo_box_input(
                 t.rows[at].kind,
                 input,
-                style,
                 bounds_of(laid, concat(tag, "kind")),
-                bounds_of(laid, concat(tag, "kind/items"))
-                ,
-                m
+                bounds_of(laid, concat(tag, "kind/items")),
+                f
             )
             return rule_held(t, at, with t.rows[at] { kind: taken.combo })
         }
         if name == concat(tag, "name") {
-            val taken = controls.entry_input(t.rows[at].name, input, bounds_of(laid, name), style, m)
+            val taken = controls.entry_input(t.rows[at].name, input, bounds_of(laid, name), f)
             return rule_held(t, at, with t.rows[at] { name: taken.entry })
         }
         if name == concat(tag, "source") {
-            val taken = controls.entry_input(t.rows[at].source, input, bounds_of(laid, name), style, m)
+            val taken = controls.entry_input(t.rows[at].source, input, bounds_of(laid, name), f)
             return rule_held(t, at, with t.rows[at] { source: taken.entry })
         }
         if name == concat(tag, "secret") {
@@ -1490,9 +1500,10 @@ fn table_input(
     name: string,
     input: controls.Input,
     laid: widget.Laid,
-    style: controls.Style,
-    m: widget.Metrics
+    f: controls.Frame
 ) -> TableStep {
+    val style = f.style
+    val m = f.metrics
     if name == concat(t.kind, "-add") {
         val taken = controls.button_input(t.add, input, bounds_of(laid, name))
         val rows = mutable_array_new<PairRow>()
@@ -1543,7 +1554,7 @@ fn table_input(
             val editing_name = name == name_field
             val current = t.rows[row]
             val target = if editing_name { current.name } else { current.value }
-            val taken = controls.entry_input(target, input, bounds_of(laid, name), style, m)
+            val taken = controls.entry_input(target, input, bounds_of(laid, name), f)
             val replaced = if editing_name {
                 with current { name: taken.entry }
             } else {
@@ -1633,9 +1644,10 @@ fn naming_step(
     n: Naming,
     input: controls.Input,
     laid: widget.Laid,
-    style: controls.Style,
-    m: widget.Metrics
+    f: controls.Frame
 ) -> Step {
+    val style = f.style
+    val m = f.metrics
     val answer = controls.dialog_keys(input)
     if controls.DialogAnswer.is_Cancel(answer) {
         return kept(with s { naming: Option<Naming>.None })
@@ -1645,11 +1657,11 @@ fn naming_step(
     }
     val name = controls.target(laid, input, s.focused, s.pressed)
     if name == "save-collection" {
-        val taken = controls.entry_input(n.collection, input, bounds_of(laid, name), style, m)
+        val taken = controls.entry_input(n.collection, input, bounds_of(laid, name), f)
         return kept(with s { naming: Option<Naming>.Some(with n { collection: taken.entry }) })
     }
     if name == "save-path" {
-        val taken = controls.entry_input(n.path, input, bounds_of(laid, name), style, m)
+        val taken = controls.entry_input(n.path, input, bounds_of(laid, name), f)
         return kept(with s { naming: Option<Naming>.Some(with n { path: taken.entry }) })
     }
     if name == "save-confirm" {
@@ -1841,9 +1853,11 @@ pub fn composition_dropped(s: State) -> State {
     })
 }
 
-pub fn step(s: State, input: controls.Input, laid: widget.Laid, style: controls.Style, m: widget.Metrics) -> Step {
+pub fn step(s: State, input: controls.Input, laid: widget.Laid, f: controls.Frame) -> Step {
+    val style = f.style
+    val m = f.metrics
     if Some(n) = s.naming {
-        return naming_step(s, n, input, laid, style, m)
+        return naming_step(s, n, input, laid, f)
     }
     // Tab moves the focus and reaches no control, which is why it is taken before `target`: a field
     // that saw Tab would type it.
@@ -1869,7 +1883,7 @@ pub fn step(s: State, input: controls.Input, laid: widget.Laid, style: controls.
         pressed: controls.pressed_after(s.pressed, input, name)
     }
     if name == "filter" {
-        val taken = controls.entry_input(after_click.filter, input, bounds_of(laid, name), style, m)
+        val taken = controls.entry_input(after_click.filter, input, bounds_of(laid, name), f)
         val typed = with after_click { filter: taken.entry }
         if !taken.changed {
             return kept(typed)
@@ -1888,7 +1902,7 @@ pub fn step(s: State, input: controls.Input, laid: widget.Laid, style: controls.
         })
     }
     if name == "requests" {
-        val taken = controls.tree_input(after_click.sidebar.tree, input, style, bounds_of(laid, "requests"), m)
+        val taken = controls.tree_input(after_click.sidebar.tree, input, bounds_of(laid, "requests"), f)
         val moved_to = with after_click { sidebar: with after_click.sidebar { tree: taken.tree } }
         // **A moved selection loads the request, not only an activated one.** `TreeStep` keeps
         // the two apart on purpose -- selecting and opening are different intentions -- but for a
@@ -1912,20 +1926,18 @@ pub fn step(s: State, input: controls.Input, laid: widget.Laid, style: controls.
         val taken = controls.combo_box_input(
             after_click.method,
             input,
-            style,
             bounds_of(laid, "method"),
-            bounds_of(laid, "method/items")
-            ,
-            m
+            bounds_of(laid, "method/items"),
+            f
         )
         return kept(with after_click { method: taken.combo })
     }
     if name == "url" {
-        val taken = controls.entry_input(after_click.url, input, bounds_of(laid, "url"), style, m)
+        val taken = controls.entry_input(after_click.url, input, bounds_of(laid, "url"), f)
         return kept(with after_click { url: taken.entry })
     }
     if name == "body" {
-        val taken = controls.entry_input(after_click.body, input, bounds_of(laid, "body"), style, m)
+        val taken = controls.entry_input(after_click.body, input, bounds_of(laid, "body"), f)
         return kept(with after_click { body: taken.entry })
     }
     if name == "env" || name == "env/items" {
@@ -1934,11 +1946,9 @@ pub fn step(s: State, input: controls.Input, laid: widget.Laid, style: controls.
         val taken = controls.combo_box_input(
             after_click.env,
             input,
-            style,
             bounds_of(laid, "env"),
-            bounds_of(laid, "env/items")
-            ,
-            m
+            bounds_of(laid, "env/items"),
+            f
         )
         return kept(with after_click { env: taken.combo })
     }
@@ -1976,17 +1986,17 @@ pub fn step(s: State, input: controls.Input, laid: widget.Laid, style: controls.
             open_history: false
         }
     }
-    val in_headers = table_input(after_click.headers, name, input, laid, style, m)
+    val in_headers = table_input(after_click.headers, name, input, laid, f)
     if in_headers.handled {
         val next = with after_click { headers: in_headers.table }
         return kept(if in_headers.dropped { with next { focused: "requests" } } else { next })
     }
-    val in_query = table_input(after_click.query, name, input, laid, style, m)
+    val in_query = table_input(after_click.query, name, input, laid, f)
     if in_query.handled {
         val next = with after_click { query: in_query.table }
         return kept(if in_query.dropped { with next { focused: "requests" } } else { next })
     }
-    val in_rules = rules_input(after_click.rules, name, input, laid, style, m)
+    val in_rules = rules_input(after_click.rules, name, input, laid, f)
     if in_rules.handled {
         val next = with after_click { rules: in_rules.table }
         return kept(if in_rules.dropped { with next { focused: "requests" } } else { next })
@@ -1995,20 +2005,18 @@ pub fn step(s: State, input: controls.Input, laid: widget.Laid, style: controls.
         val taken = controls.combo_box_input(
             after_click.auth.kind,
             input,
-            style,
             bounds_of(laid, "auth-kind"),
-            bounds_of(laid, "auth-kind/items")
-            ,
-            m
+            bounds_of(laid, "auth-kind/items"),
+            f
         )
         return kept(with after_click { auth: with after_click.auth { kind: taken.combo } })
     }
     if name == "auth-user" {
-        val taken = controls.entry_input(after_click.auth.user, input, bounds_of(laid, name), style, m)
+        val taken = controls.entry_input(after_click.auth.user, input, bounds_of(laid, name), f)
         return kept(with after_click { auth: with after_click.auth { user: taken.entry } })
     }
     if name == "auth-secret" {
-        val taken = controls.entry_input(after_click.auth.secret, input, bounds_of(laid, name), style, m)
+        val taken = controls.entry_input(after_click.auth.secret, input, bounds_of(laid, name), f)
         return kept(with after_click { auth: with after_click.auth { secret: taken.entry } })
     }
     if name == "editors" {
@@ -2033,11 +2041,11 @@ pub fn step(s: State, input: controls.Input, laid: widget.Laid, style: controls.
         // **The pane's own box, not the divider's.** A split pane is asked about the room it has
         // and works out where its divider is from that -- which is why `split_at` exists -- so
         // handing it the divider's six points would have it drag inside its own handle.
-        val taken = controls.split_pane_input(after_click.split, input, style, bounds_of(laid, "layout"))
+        val taken = controls.split_pane_input(after_click.split, input, bounds_of(laid, "layout"), f)
         return kept(with after_click { split: taken.split })
     }
     if name == "history" {
-        val taken = controls.table_input(after_click.history, input, style, bounds_of(laid, "history"), m)
+        val taken = controls.table_input(after_click.history, input, bounds_of(laid, "history"), f)
         val with_list = with after_click { history: taken.table }
         val at = taken.table.selected
         if (taken.moved || taken.activated) && at >= 0 && at < len(with_list.past) {
@@ -2066,7 +2074,7 @@ pub fn step(s: State, input: controls.Input, laid: widget.Laid, style: controls.
         // `readonly` keeps the caret moving while refusing every edit, and the control scrolls to
         // follow it. That is the whole reason the response is a field and not a column of labels --
         // labels cannot be focused, so Tab could not reach it and a reader had no way to be on it.
-        val taken = controls.entry_input(after_click.response, input, bounds_of(laid, "response"), style, m)
+        val taken = controls.entry_input(after_click.response, input, bounds_of(laid, "response"), f)
         return kept(with after_click { response: taken.entry })
     }
     // The wheel over anything else scrolls the response, which is the only scrollable thing here.

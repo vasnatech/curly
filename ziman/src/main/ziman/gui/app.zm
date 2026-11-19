@@ -221,6 +221,16 @@ fn font_candidates() -> [string] {
     return snapshot(out)
 }
 
+// The resting frame with this frame's names filled in.
+//
+// **One place, so a paint and an input cannot disagree about what is focused.** curly tracks the
+// focus and the press and not the pointer, so `hovered` stays empty here: no control in this
+// window has a hovered state to select, which is a fact about this application rather than about
+// the library.
+fn frame_at(resting: controls.Frame, s: State) -> controls.Frame {
+    return with resting { pressed: s.pressed, focused: s.focused }
+}
+
 fn load_font() -> Result<font.FontRef, string> {
     val tried = mutable_array_new<string>()
     for path in font_candidates() {
@@ -422,8 +432,8 @@ fn asked_scale() -> Option<float> {
 }
 
 pub fn run(store: Storage) -> Result<unit, string> {
-    val f = try load_font()
-    val m = try widget.metrics_for(f)
+    val face = try load_font()
+    val m = try widget.metrics_for(face)
     // **The tree's marks have to be characters this font has.** `lib/ui` defaults to triangles,
     // which is the right default for a toolkit and wrong for this application: the face vendored
     // here is Caladea, a text face with no U+25B8. It used to be worse than wrong -- the first
@@ -432,6 +442,10 @@ pub fn run(store: Storage) -> Result<unit, string> {
     // own `.notdef`, which has no outline, so every folder would look identical and nothing would
     // say which was open. That the field exists in `Style` is why this is two lines.
     val style = with theme.plain() { collapsed_mark: ">", expanded_mark: "v" }
+    // **The frame every control here is drawn in**: the look, this window's measurements, and the
+    // names the window holds. `frame_at` fills the names in per frame; the look and the metrics do
+    // not change while the window is open. See `controls.Frame` and D19.
+    val resting = controls.frame_of(style, m)
     val loaded = try load_sidebar(store)
     // The environments on disk, with the absence of one first. Read once: a window that re-read
     // them every frame would be asking the filesystem sixty times a second for an answer that
@@ -450,7 +464,7 @@ pub fn run(store: Storage) -> Result<unit, string> {
     val density = chosen_density().density
     val scale = density.px_per_pt
     val options = with raster.options() {
-        fonts: [f],
+        fonts: [face],
         samples: 1,
         // **The look's own colour.** `Style.window` holds what the window is cleared to, so that
         // a look and feel owns the largest area in the window rather than leaving it to whichever
@@ -504,7 +518,7 @@ pub fn run(store: Storage) -> Result<unit, string> {
             // follow may not make one: it is both what is drawn and what an input is routed by,
             // and an idle window needs the second long after it has stopped needing the first.
             var laid = widget.layout(
-                view(st, style, m),
+                view(st, frame_at(resting, st)),
                 geom.rect_of(0.0, 0.0, width_pt, height_pt),
                 m
             )
@@ -528,7 +542,8 @@ pub fn run(store: Storage) -> Result<unit, string> {
                     // Computing the position from the layout arithmetic instead would be a second copy
                     // of the layout, in a comment, drifting.
                     val whole = geom.rect_of(0.0, 0.0, width_pt, height_pt)
-                    val base = view(st, style, m)
+                    val f = frame_at(resting, st)
+                    val base = view(st, f)
                     val first = widget.layout(base, whole, m)
                     laid = switch open_picker(st) {
                         Some(menu) {
@@ -539,9 +554,8 @@ pub fn run(store: Storage) -> Result<unit, string> {
                                     widget.base_layer(base),
                                     controls.combo_box_popup_layer(
                                         menu,
-                                        style,
                                         geom.rect_of(at.x, at.y + at.height, at.width, rows),
-                                        m
+                                        f
                                     )
                                 ]),
                                 whole,
@@ -560,7 +574,7 @@ pub fn run(store: Storage) -> Result<unit, string> {
                     // viewport turned out to be** -- and a thumb's length is the view's share of
                     // the content. The alternative was to lay the window out, read the extents and
                     // lay it out again, which measured at 5 ms a frame over 200 rows.
-                    val scene_now = controls.paint_scroll_bars(laid, with_focus, style)
+                    val scene_now = controls.paint_scroll_bars(laid, with_focus, f)
                     // **The images table is per frame, and it costs nothing to rebuild.** `repaint`
                     // compares the scene against the last one and the scale against the painter's;
                     // it does not compare the options by value, so handing it a different `images`
@@ -692,7 +706,7 @@ pub fn run(store: Storage) -> Result<unit, string> {
                         // outside which happened. The cheap wrong answer here is a wasted frame;
                         // the expensive one is a frozen window.
                         dirty = true
-                        val stepped = step(st, input, laid, style, m)
+                        val stepped = step(st, input, laid, frame_at(resting, st))
                         st = stepped.state
                         if stepped.send {
                             switch send_now(store, st) {

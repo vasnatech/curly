@@ -287,6 +287,7 @@ fn is_close(e: window.Event) -> bool {
         Resize(_) { false }
         FocusIn { false }
         FocusOut { false }
+        SchemeChanged(_) { false }
         Exposed { false }
     }
 }
@@ -305,6 +306,7 @@ fn is_exposed(e: window.Event) -> bool {
         Resize(_) { false }
         FocusIn { false }
         FocusOut { false }
+        SchemeChanged(_) { false }
     }
 }
 
@@ -315,6 +317,7 @@ fn focus_change(e: window.Event) -> Option<bool> {
     return switch e {
         FocusIn { Option<bool>.Some(true) }
         FocusOut { Option<bool>.Some(false) }
+        SchemeChanged(_) { Option<bool>.Some(false) }
         Resize(_) { Option<bool>.None }
         Exposed { Option<bool>.None }
         Close { Option<bool>.None }
@@ -337,6 +340,7 @@ fn key_down_of(e: window.Event) -> Option<window.KeyPress> {
         KeyUp(_) { Option<window.KeyPress>.None }
         FocusIn { Option<window.KeyPress>.None }
         FocusOut { Option<window.KeyPress>.None }
+        SchemeChanged(_) { Option<window.KeyPress>.None }
         Resize(_) { Option<window.KeyPress>.None }
         Exposed { Option<window.KeyPress>.None }
         Close { Option<window.KeyPress>.None }
@@ -354,6 +358,7 @@ fn key_up_of(e: window.Event) -> Option<window.KeyPress> {
         KeyDown(_) { Option<window.KeyPress>.None }
         FocusIn { Option<window.KeyPress>.None }
         FocusOut { Option<window.KeyPress>.None }
+        SchemeChanged(_) { Option<window.KeyPress>.None }
         Resize(_) { Option<window.KeyPress>.None }
         Exposed { Option<window.KeyPress>.None }
         Close { Option<window.KeyPress>.None }
@@ -394,6 +399,7 @@ fn resized_to(e: window.Event) -> Option<window.Size> {
         Scroll(_) { Option<window.Size>.None }
         FocusIn { Option<window.Size>.None }
         FocusOut { Option<window.Size>.None }
+        SchemeChanged(_) { Option<window.Size>.None }
     }
 }
 

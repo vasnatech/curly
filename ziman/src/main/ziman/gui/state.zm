@@ -1295,6 +1295,7 @@ fn is_press(input: controls.Input) -> bool {
         KeyUp(_) { false }
         Text(_) { false }
         Paste(_) { false }
+        SecondaryPress(_) { false }
     }
 }
 
@@ -1687,6 +1688,7 @@ fn naming_step(
         KeyUp(_) { kept(s) }
         Text(_) { kept(s) }
         Paste(_) { kept(s) }
+        SecondaryPress(_) { kept(s) }
     }
 }
 
@@ -1876,6 +1878,11 @@ pub fn step(s: State, input: controls.Input, laid: widget.Laid, f: controls.Fram
         KeyUp(_) { s.focused }
         Text(_) { s.focused }
         Paste(_) { s.focused }
+        // **The focus stays where it is**, which is the opposite of what the gallery does and
+        // right for the same reason: a secondary press moves the focus so that a context menu
+        // offers the focused thing's commands, and curly offers none. Moving the focus on a
+        // click that then does nothing is a surprise with no payoff.
+        SecondaryPress(_) { s.focused }
     }
     val name = controls.target(laid, input, focused_now, s.pressed)
     val after_click = with dismiss_other_menus(s, name, input) {
@@ -2087,6 +2094,7 @@ pub fn step(s: State, input: controls.Input, laid: widget.Laid, f: controls.Fram
         KeyUp(_) { kept(after_click) }
         Text(_) { kept(after_click) }
         Paste(_) { kept(after_click) }
+        SecondaryPress(_) { kept(after_click) }
     }
 }
 
@@ -2114,6 +2122,7 @@ fn is_tab(input: controls.Input) -> bool {
         Release(_) { false }
         Move(_) { false }
         Wheel(_) { false }
+        SecondaryPress(_) { false }
     }
 }
 
@@ -2127,6 +2136,7 @@ fn shift_held(input: controls.Input) -> bool {
         Release(_) { false }
         Move(_) { false }
         Wheel(_) { false }
+        SecondaryPress(_) { false }
     }
 }
 

@@ -838,6 +838,7 @@ fn is_tab(input: controls.Input) -> bool {
         Release(_) { false }
         Move(_) { false }
         Wheel(_) { false }
+        SecondaryPress(_) { false }
     }
 }
 
@@ -851,6 +852,7 @@ fn shift_held(input: controls.Input) -> bool {
         Release(_) { false }
         Move(_) { false }
         Wheel(_) { false }
+        SecondaryPress(_) { false }
     }
 }
 
@@ -864,6 +866,7 @@ fn pressed_at(input: controls.Input) -> Option<geom.Point> {
         Release(_) { Option<geom.Point>.None }
         Move(_) { Option<geom.Point>.None }
         Wheel(_) { Option<geom.Point>.None }
+        SecondaryPress(_) { Option<geom.Point>.None }
     }
 }
 

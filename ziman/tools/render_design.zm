@@ -653,6 +653,8 @@ fn own_name(w: widget.Widget) -> string {
         Sized(it) { it.name }
         Scroll(it) { it.name }
         Layered(it) { it.name }
+        Grid(it) { it.name }
+        Flow(it) { it.name }
         Text(it) { it.name }
         // A picture is a box with a name, like a drawing: a click on it finds the node that
         // placed it. Its `alt` is for a screen reader, not for this.
@@ -676,6 +678,8 @@ fn with_name(w: widget.Widget, tag: string) -> widget.Widget {
         Sized(it) { widget.Widget.Sized(with it { name: tag }) }
         Scroll(it) { widget.Widget.Scroll(with it { name: tag }) }
         Layered(it) { widget.Widget.Layered(with it { name: tag }) }
+        Grid(it) { widget.Widget.Grid(with it { name: tag }) }
+        Flow(it) { widget.Widget.Flow(with it { name: tag }) }
         Text(it) { widget.Widget.Text(with it { name: tag }) }
         Picture(it) { widget.Widget.Picture(with it { name: tag }) }
         Control(_) { w }

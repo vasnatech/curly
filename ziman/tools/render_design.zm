@@ -650,6 +650,7 @@ fn own_name(w: widget.Widget) -> string {
         // A drawn mark is named like anything else, so a click on an icon can find the node
         // that put it there.
         Drawing(it) { it.name }
+        Canvas(it) { it.name }
         Sized(it) { it.name }
         Scroll(it) { it.name }
         Layered(it) { it.name }
@@ -675,6 +676,7 @@ fn with_name(w: widget.Widget, tag: string) -> widget.Widget {
     return switch w {
         Group(it) { widget.Widget.Group(with it { name: tag }) }
         Drawing(it) { widget.Widget.Drawing(with it { name: tag }) }
+        Canvas(it) { widget.Widget.Canvas(with it { name: tag }) }
         Sized(it) { widget.Widget.Sized(with it { name: tag }) }
         Scroll(it) { widget.Widget.Scroll(with it { name: tag }) }
         Layered(it) { widget.Widget.Layered(with it { name: tag }) }

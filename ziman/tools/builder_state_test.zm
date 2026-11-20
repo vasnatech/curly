@@ -78,7 +78,7 @@ fn opened() -> builder_state.State {
 fn showing_part(s: builder_state.State, name: string) -> builder_state.State {
     var at = 0
     for one in s.parts.items {
-        if one == name {
+        if controls.value_text(one, s.parts.locale) == name {
             // Landed on by moving, so `step` rebuilds the inputs the way a user's press does.
             val moved = with s { parts: with s.parts { selected: at - 1 } }
             return acted(moved, controls.Input.KeyDown(controls.keystroke_of(controls.Key.Down))).state
@@ -132,7 +132,7 @@ fn pressed_on_design(s: builder_state.State, name: string) -> builder_state.Step
 #[test]
 fn it_opens_on_the_root_and_not_the_first_part() {
     test.assert_eq(builder_state.showing(opened()), "screen")
-    test.assert_eq(opened().parts.items[0], "field")
+    test.assert_eq(controls.list_text_at(opened().parts, 0), "field")
 }
 
 // **The inputs follow what is on the canvas**, which is the whole point of listing them: the
@@ -145,21 +145,23 @@ fn the_inputs_follow_the_component_on_the_canvas() {
     val s = opened()
     test.assert_eq(builder_state.showing(s), "screen")
     test.assert_len(2, s.inputs.items)
-    test.assert_eq(s.inputs.items[0], "name: controls.Entry")
-    test.assert_eq(s.inputs.items[1], "go: controls.Button")
+    test.assert_eq(controls.list_text_at(s.inputs, 0), "name: controls.Entry")
+    test.assert_eq(controls.list_text_at(s.inputs, 1), "go: controls.Button")
 
     val on_strip = showing_part(s, "strip")
     test.assert_len(1, on_strip.inputs.items)
-    test.assert_eq(on_strip.inputs.items[0], "tabs: controls.Tabs")
+    test.assert_eq(controls.list_text_at(on_strip.inputs, 0), "tabs: controls.Tabs")
 }
 
 // `style` and `m` are ambient -- every component takes them and none of them chooses them -- so
 // they are not inputs and do not appear.
 #[test]
 fn the_ambient_parameters_are_not_inputs() {
-    for row in opened().inputs.items {
-        test.assert_false(contains(row, "controls.Style"))
-        test.assert_false(contains(row, "widget.Metrics"))
+    val inputs = opened().inputs
+    for row in inputs.items {
+        val words = controls.value_text(row, inputs.locale)
+        test.assert_false(contains(words, "controls.Style"))
+        test.assert_false(contains(words, "widget.Metrics"))
     }
 }
 

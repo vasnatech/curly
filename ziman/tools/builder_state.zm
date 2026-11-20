@@ -112,11 +112,10 @@ fn palette_labels() -> [string] {
     return snapshot(out)
 }
 
+// **`list_text_at` and not `items[i]`.** A `controls.List` holds `controls.Value` rather than
+// text, the way a `Table` does, so a row has a value and a spelling and this wants the spelling.
 pub fn showing(s: State) -> string {
-    if s.parts.selected < 0 || s.parts.selected >= len(s.parts.items) {
-        return ""
-    }
-    return s.parts.items[s.parts.selected]
+    return controls.list_text_at(s.parts, s.parts.selected)
 }
 
 fn component_named(name: string, all: [Component]) -> Option<Component> {
